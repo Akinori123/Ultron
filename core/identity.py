@@ -23,7 +23,7 @@ class IdentityService:
             },
             "assistant": {
                 "name": "Brahma",
-                "application_name": "Brahma Echo",
+                "application_name": "ULTRON",
                 "title": "Personal AI Assistant"
             },
             "behavior": {
@@ -71,7 +71,7 @@ class IdentityService:
         self.save()
 
     def get_application_name(self) -> str:
-        return self.data["assistant"].get("application_name", "Brahma Echo")
+        return self.data["assistant"].get("application_name", "ULTRON")
         
     def set_application_name(self, name: str):
         self.data["assistant"]["application_name"] = name

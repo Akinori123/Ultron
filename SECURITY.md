@@ -16,9 +16,9 @@ Please report security concerns through a private channel or repository owner co
 - Revoke any exposed credentials immediately.
 - Update local configuration files after rotating secrets.
 
-## Brahma Echo Security Overview
+## ULTRON Security Overview
 
-This repository includes a security overview for Brahma Echo's current runtime model, gateway exposure, and authentication flow.
+This repository includes a security overview for ULTRON's current runtime model, gateway exposure, and authentication flow.
 
 ### Local credential handling
 
@@ -29,13 +29,13 @@ This repository includes a security overview for Brahma Echo's current runtime m
 
 ### AI provider access
 
-- Brahma Echo uses Gemini as the primary AI provider and OpenRouter as a fallback.
+- ULTRON uses Gemini as the primary AI provider and OpenRouter as a fallback.
 - Both API keys are loaded from the local config file and sent to the respective service clients.
 - `config/api_keys.json` is plaintext JSON and is not encrypted by the application.
 
-### Brahma Connect gateway exposure
+### Ultron Connect gateway exposure
 
-Brahma Connect is the local device gateway layer for Brahma Echo.
+Ultron Connect is the local device gateway layer for ULTRON.
 
 #### Configuration
 
@@ -123,8 +123,8 @@ Because the gateway binds to `0.0.0.0`, it is reachable from any interface on th
 ### Recommendations
 
 - Keep `config/api_keys.json` private and out of version control.
-- Use OS firewall rules to restrict access to port `8765` when Brahma Connect is enabled.
+- Use OS firewall rules to restrict access to port `8765` when Ultron Connect is enabled.
 - Disable `advertise` in `config/brahma_connect.json` unless discovery is needed.
 - Revoke lost or untrusted devices using `/gateway/devices/{device_id}/revoke`.
-- Run Brahma Echo on a trusted local network.
+- Run ULTRON on a trusted local network.
 - Consider adding HTTPS/TLS support for the gateway websocket and admin REST endpoints for secure remote access.

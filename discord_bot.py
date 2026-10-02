@@ -180,7 +180,7 @@ class DiscordBotService:
             except Exception as exc:
                 logger.warning("Discord channel resolve failed: %s", exc)
                 return
-        prefix = "Brahma Echo" if role == "assistant" else "You" if role == "user" else "System"
+        prefix = "ULTRON" if role == "assistant" else "You" if role == "user" else "System"
         payload = f"**{prefix}**: {text}"
         try:
             if len(payload) <= 1900:
@@ -263,7 +263,7 @@ class DiscordBotService:
                             status=discord.Status.online,
                             activity=discord.Activity(
                                 type=discord.ActivityType.listening,
-                                name="Brahma Echo commands",
+                                name="ULTRON commands",
                             ),
                         )
                     except Exception:
@@ -303,7 +303,7 @@ class DiscordBotService:
                         if self._pending_channels:
                             self._pending_channels.pop()
                         await message.reply(
-                            "I couldn’t hand that command to Brahma Echo.",
+                            "I couldn’t hand that command to ULTRON.",
                             mention_author=False,
                             allowed_mentions=discord.AllowedMentions.none(),
                         )
@@ -394,13 +394,13 @@ class DiscordBotService:
     def _generate_reply(self, prompt: str) -> str:
         prompt = (prompt or "").strip()
         if not prompt:
-            return "Tell me what you need help with."
+            return "Diga com o que você precisa de ajuda."
 
         keys = _load_api_keys()
         gemini_key = (keys.get("gemini_api_key") or "").strip()
         openrouter_key = (keys.get("openrouter_api_key") or "").strip()
         system_prompt = (
-            "You are Brahma Echo inside Discord. "
+            "You are ULTRON inside Discord. "
             "Be concise, accurate, and helpful. "
             "Keep replies friendly and under 250 words unless the user asks for detail."
         )
@@ -412,7 +412,7 @@ class DiscordBotService:
                     http_options={"api_version": "v1beta"},
                 )
                 response = client.models.generate_content(
-                    model="gemini-2.5-flash",
+                    model="gemini-3.6-flash",
                     contents=f"{system_prompt}\n\nUser: {prompt}",
                     config={"temperature": 0.5},
                 )
@@ -434,4 +434,4 @@ class DiscordBotService:
             except Exception as exc:
                 logger.warning("OpenRouter Discord reply failed: %s", exc)
 
-        return "I couldn’t reach the AI providers right now."
+        return "Não consegui alcançar os provedores de IA no momento."

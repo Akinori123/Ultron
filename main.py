@@ -1,3 +1,11 @@
+from core import undo as undo_stack
+from core import audio_devices
+from core.echo import EchoGuard
+from core.hotkey import PushToTalk
+from memory import config_manager
+from memory.memory_manager import search_memory
+
+import core.boot_sentry
 import asyncio
 import threading
 import json
@@ -7,7 +15,6 @@ import socket
 import subprocess
 import sys
 import time
-import random
 import traceback
 import os
 import pyperclip
@@ -25,7 +32,7 @@ from google.genai import types
 from ui import BrahmaUI
 from memory.memory_manager import (
     load_memory, update_memory, format_memory_for_prompt,
-    should_extract_memory, extract_memory
+    should_extract_memory, extract_memory, auto_learn_interaction
 )
 
 from actions.file_processor import file_processor
@@ -41,7 +48,6 @@ from actions.youtube_video     import youtube_video
 from actions.desktop           import desktop_control
 from actions.browser_control   import browser_control
 from actions.file_controller   import file_controller
-from actions.website_builder   import website_builder
 from actions.office_builder     import create_presentation, create_spreadsheet
 from actions.docx_tools        import word_document
 from actions.pdf_tools         import create_pdf
@@ -53,7 +59,6 @@ from actions.brahma_connect    import (
     connect_pair_device,
     connect_disconnect_device,
 )
-from PyQt6.QtCore import QTimer
 from actions.web_search        import web_search as web_search_action
 from actions.computer_control  import computer_control
 from actions.game_updater      import game_updater
@@ -71,9 +76,12 @@ except Exception:
     DashboardServer = None
 
 try:
-    from actions.instagram_chat import start_daemon as start_ig_daemon, set_ig_prompt_callback
+    from actions.instagram_mcp import start_daemon as start_ig_daemon, set_ig_prompt_callback
 except ImportError:
-    start_ig_daemon = None
+    try:
+        from actions.instagram_chat import start_daemon as start_ig_daemon, set_ig_prompt_callback
+    except ImportError:
+        start_ig_daemon = None
 
 try:
     from brahma_connect.service import get_service as get_brahma_connect_service
@@ -90,7 +98,7 @@ def get_base_dir():
 BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
-STARTUP_LOG     = Path(os.environ.get("LOCALAPPDATA", str(BASE_DIR))) / "Brahma Echo" / "startup.log"
+STARTUP_LOG     = Path(os.environ.get("LOCALAPPDATA", str(BASE_DIR))) / "ULTRON" / "startup.log"
 LIVE_MODEL          = "models/gemini-2.5-flash-native-audio-preview-12-2025"
 CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
@@ -102,6 +110,13 @@ LIVE_CONNECT_TIMEOUT = 12
 def _get_api_key() -> str:
     with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
         return json.load(f)["gemini_api_key"]
+
+# True once the live Gemini voice session is connected and can speak.
+_LIVE_READY = threading.Event()
+
+
+def get_live_ready() -> bool:
+    return _LIVE_READY.is_set()
 
 
 def _is_port_in_use(port: int, host: str = "127.0.0.1") -> bool:
@@ -136,9 +151,9 @@ def _ensure_desktop_shortcut() -> None:
             desktop_dir = Path(os.path.expandvars(desktop_raw))
         except Exception:
             desktop_dir = Path(os.path.expanduser("~")) / "Desktop"
-            
+
         desktop_dir.mkdir(parents=True, exist_ok=True)
-        shortcut_path = desktop_dir / "Brahma Echo.lnk"
+        shortcut_path = desktop_dir / "ULTRON.lnk"
         script_path = BASE_DIR / "main.py"
         icon_path = BASE_DIR / "assets" / "Brahma_Lite_Logo.ico"
 
@@ -171,7 +186,7 @@ def _ensure_desktop_shortcut() -> None:
             f"$Shortcut.Arguments = '{_ps_escape(shortcut_args)}'",
             f"$Shortcut.WorkingDirectory = '{_ps_escape(str(BASE_DIR))}'",
             "$Shortcut.WindowStyle = 7",
-            "$Shortcut.Description = 'Launch Brahma Echo'",
+            "$Shortcut.Description = 'Launch ULTRON'",
             f"if ('{_ps_escape(icon_value)}') {{ $Shortcut.IconLocation = '{_ps_escape(icon_value)},0' }}",
             "$Shortcut.Save()",
         ])
@@ -194,34 +209,50 @@ def _load_system_prompt() -> str:
         base_prompt = PROMPT_PATH.read_text(encoding="utf-8")
     except Exception:
         base_prompt = (
-            "You are Brahma Echo, a calm, direct, and professional AI assistant. "
+            "You are ULTRON, a calm, direct, and professional AI assistant. "
             "Be concise, direct, and always use the provided tools to complete tasks. "
             "Never simulate or guess results — always call the appropriate tool. "
             "If the user asks to create, build, launch, or open a website, always use the selected workspace folder."
         )
-        
+
     try:
         from core.identity import identity
-        ast_name = identity.get_assistant_name() or "Brahma Echo"
+        ast_name = identity.get_assistant_name() or "ULTRON"
         own_name = identity.get_owner_name() or "the user"
         role = identity.get_owner_role()
         mode = identity.get_behavior_mode()
-        
+
         identity_str = f"You are {ast_name}. You are assisting {own_name}"
         if role:
             identity_str += f" (Role: {role}).\n"
         else:
             identity_str += ".\n"
-            
+
         identity_str += f"Your current behavior mode is: {mode}.\n"
-        
+
         custom = identity.get_custom_instructions()
         if custom:
             identity_str += f"Custom Instructions: {custom}\n\n"
-            
+
+        # Inject continuously learned rules and behavioral directives
+        try:
+            from core.learned_rules import LearnedRulesEngine
+            learned_directives = LearnedRulesEngine.get_prompt_injections()
+            if learned_directives:
+                identity_str += f"{learned_directives}\n\n"
+        except Exception as e_rules:
+            print(f"[LearnedRules] Error injecting rules into prompt: {e_rules}")
+
         return identity_str + base_prompt
     except Exception as e:
         print(f"Error injecting identity: {e}")
+        try:
+            from core.learned_rules import LearnedRulesEngine
+            learned_directives = LearnedRulesEngine.get_prompt_injections()
+            if learned_directives:
+                return f"{learned_directives}\n\n" + base_prompt
+        except Exception:
+            pass
         return base_prompt
 
 
@@ -229,16 +260,29 @@ def _speak_daily_briefing(ui=None) -> None:
     if ui and getattr(ui, "_overlay", None) and ui._overlay.isVisible():
         return
     try:
-        from actions.daily_briefing import compile_daily_briefing
-        from actions.attention_monitor import speak_native
-        text = compile_daily_briefing()
+        from actions.daily_briefing import compile_unified_briefing
+        from actions.attention_monitor import speak_native, has_speech_sink
+        data, narrative = compile_unified_briefing()
         if ui:
-            ui.show_daily_briefing(text)
-            ui.write_log(f"Brahma Echo: {text}")
-        speak_native(text)
+            ui.show_daily_briefing(data)
+            # Do NOT also write the narrative to the chat here: it is spoken
+            # right below, and the live model transcribes its own speech into the
+            # chat. Logging it too produced the duplicated greeting line.
+        # Wait until the LIVE Gemini voice channel is actually connected, so the
+        # briefing is spoken through the exact same voice as every other reply.
+        # Speaking it earlier falls back to a second TTS engine, which is why the
+        # greeting sounded different from normal speech ("two voices").
+        for _ in range(60):  # up to ~30s
+            try:
+                if has_speech_sink() and get_live_ready():
+                    break
+            except Exception:
+                pass
+            time.sleep(0.5)
+        speak_native(narrative)
     except Exception as e:
         print(f"[DailyBriefing] Error: {e}")
-    
+
 def _extract_gemini_text(response) -> str:
     text_parts: list[str] = []
     try:
@@ -269,11 +313,11 @@ def _gemini_text_reply(prompt: str) -> str:
         http_options={"api_version": "v1beta"},
     )
     system_prompt = (
-        "You are Brahma Echo, a concise, helpful desktop assistant. "
+        "You are ULTRON, a concise, helpful desktop assistant. "
         "Reply naturally and briefly. Do not mention internal implementation details."
     )
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.6-flash",
         contents=f"{system_prompt}\n\nUser: {prompt}",
         config={"temperature": 0.6},
     )
@@ -282,20 +326,20 @@ def _gemini_text_reply(prompt: str) -> str:
 
 def _ig_gemini_reply(username: str, text: str) -> str:
     system_prompt = (
-        "You are Brahma Echo, an AI personal assistant acting on behalf of your user. "
+        "You are ULTRON, an AI personal assistant acting on behalf of your user. "
         "You have taken over their Instagram chat with the user's permission. "
         "Reply naturally, briefly, and conversationally to the incoming message. "
         "Do not sound like a bot. Keep your replies under 2 sentences."
     )
     prompt = f"Instagram DM from {username}: {text}"
-    
+
     try:
         client = genai.Client(
             api_key=_get_api_key(),
             http_options={"api_version": "v1beta"},
         )
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.6-flash",
             contents=f"{system_prompt}\n\nUser: {prompt}",
             config={"temperature": 0.6},
         )
@@ -308,14 +352,14 @@ def _ig_gemini_reply(username: str, text: str) -> str:
                 return openrouter_client.chat(prompt, system=system_prompt)
             except Exception as or_e:
                 print(f"[InstagramChat] OpenRouter fallback failed: {or_e}")
-                return "Hey, I'm currently busy. I will get back to you later!"
+                return "Olá, estou ocupado no momento. Falo com você mais tarde!"
         print(f"[InstagramChat] Gemini Reply Error: {e}")
-        return "Hey, I'm currently busy. I will get back to you later!"
+        return "Olá, estou ocupado no momento. Falo com você mais tarde!"
 
 
 def _clipboard_gemini_reply(text: str) -> str:
     system_prompt = (
-        "You are Brahma Echo, a witty and helpful AI assistant. "
+        "You are ULTRON, a witty and helpful AI assistant. "
         "The user just copied the following text to their clipboard. "
         "Make a very short, interesting, or helpful 1-sentence comment or question about it. "
         "Do not offer to 'help' or ask 'how can I help'. Just make a standalone witty observation or summary."
@@ -327,7 +371,7 @@ def _clipboard_gemini_reply(text: str) -> str:
             http_options={"api_version": "v1beta"},
         )
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.6-flash",
             contents=f"{system_prompt}\n\nClipboard Text: {prompt}",
             config={"temperature": 0.8},
         )
@@ -339,7 +383,7 @@ def _clipboard_gemini_reply(text: str) -> str:
                 return openrouter_client.chat(prompt, system=system_prompt)
             except Exception:
                 pass
-        return "Interesting stuff you copied there!"
+        return "Que coisa interessante você copiou aí!"
 
 
 def _looks_like_code_request(text: str) -> bool:
@@ -357,6 +401,8 @@ def _looks_like_website_request(text: str) -> bool:
     website_words = (
         "website",
         "web site",
+        "webpage",
+        "web page",
         "landing page",
         "homepage",
         "home page",
@@ -367,8 +413,38 @@ def _looks_like_website_request(text: str) -> bool:
         "web app",
         "frontend",
         "site",
+        "html",
+        "react",
+        "web",
     )
-    return any(word in low for word in website_words)
+    action_words = ("make", "create", "build", "design", "develop", "generate", "code", "edit", "update", "fix")
+    has_web = any(re.search(rf"\b{re.escape(w)}\b", low) for w in website_words)
+    has_action = any(re.search(rf"\b{re.escape(a)}\b", low) for a in action_words)
+    return has_web and (has_action or any(w in low for w in ("landing page", "homepage", "portfolio", "website", "web app", "web page")))
+
+
+def _looks_like_presentation_request(text: str) -> bool:
+    low = (text or "").lower()
+    ppt_keywords = (
+        "presentation", "powerpoint", "slideshow", "slides", "slide deck",
+        "pitch deck", "deck", "ppt", "pptx"
+    )
+    action_words = ("make", "create", "build", "design", "develop", "generate", "draft", "prepare")
+    has_keyword = any(re.search(rf"\b{re.escape(k)}\b", low) for k in ppt_keywords)
+    has_action = any(re.search(rf"\b{re.escape(a)}\b", low) for a in action_words)
+    return has_keyword and (has_action or any(k in low for k in ("slide deck", "pitch deck", "powerpoint", "pptx", "ppt")))
+
+
+def _looks_like_spreadsheet_request(text: str) -> bool:
+    low = (text or "").lower()
+    sheet_keywords = (
+        "spreadsheet", "excel", "sheet", "sheets", "workbook", "xlsx",
+        "tracker", "expense tracker", "budget sheet"
+    )
+    action_words = ("make", "create", "build", "design", "develop", "generate", "draft", "prepare")
+    has_keyword = any(re.search(rf"\b{re.escape(k)}\b", low) for k in sheet_keywords)
+    has_action = any(re.search(rf"\b{re.escape(a)}\b", low) for a in action_words)
+    return has_keyword and (has_action or any(k in low for k in ("spreadsheet", "excel sheet", "expense tracker", "budget sheet", "xlsx")))
 
 
 def _is_gemini_limit_error(exc: Exception) -> bool:
@@ -394,6 +470,7 @@ def _looks_like_screen_request(text: str) -> bool:
         "what's on my screen",
         "whats on my screen",
         "what is on my screen",
+        "what's on screen",
         "check my screen",
         "look at my screen",
         "analyze my screen",
@@ -402,11 +479,19 @@ def _looks_like_screen_request(text: str) -> bool:
         "tell me what is on my screen",
         "read my screen",
         "what does my screen say",
+        "explain this error",
+        "what's this error",
+        "what is this error",
+        "explain the error",
+        "look at this error",
+        "explain what's on my screen",
+        "inspect my screen",
+        "what am i looking at",
     )
     if any(p in t for p in direct_phrases):
         return True
     screen_words = ("screen", "display", "monitor", "window")
-    request_words = ("what", "check", "look", "analy", "analyse", "analyze", "read", "tell", "answer", "see")
+    request_words = ("what", "check", "look", "analy", "analyse", "analyze", "read", "tell", "answer", "see", "explain")
     return any(sw in t for sw in screen_words) and any(rw in t for rw in request_words)
 
 
@@ -416,6 +501,10 @@ def _wakeword_detected(text: str) -> bool:
     if not words:
         return False
     phrases = (
+        "ultron",
+        "hey ultron",
+        "hi ultron",
+        "hello ultron",
         "brahma echo",
         "hey brahma echo",
         "hi brahma echo",
@@ -427,7 +516,7 @@ def _wakeword_detected(text: str) -> bool:
     compact = " ".join(words)
     if compact in phrases or any(p in compact for p in phrases):
         return True
-    return any(word in {"brahma echo", "hey", "hi", "hello"} for word in words)
+    return any(word in {"ultron", "brahma echo", "hey", "hi", "hello"} for word in words)
 
 
 def _build_task_plan(text: str) -> list[str]:
@@ -497,9 +586,17 @@ def _update_memory_async(user_text: str, brahma_text: str) -> None:
     user_text   = (user_text   or "").strip()
     brahma_text = (brahma_text or "").strip()
 
-    if len(user_text) < 5 or user_text == _last_memory_input:
+    if len(user_text) < 4 or user_text == _last_memory_input:
         return
     _last_memory_input = user_text
+
+    # Fast deterministic heuristic extraction (Pillar 5 - Living Knowledge Graph)
+    try:
+        learned = auto_learn_interaction(user_text, brahma_text)
+        if learned:
+            print(f"[Memory] 🧠 Auto-learned: {list(learned.keys())}")
+    except Exception as exc:
+        print(f"[Memory] ⚠️ Auto-learn error: {exc}")
 
     try:
         api_key = _get_api_key()
@@ -522,34 +619,41 @@ def _memory_context_for_request(text: str) -> str:
 
 TOOL_DECLARATIONS = [
     {
-        "name": "computer_settings",
+        "name": "undo",
         "description": (
-            "Controls the computer's OS-level settings and hardware. Use this to change brightness, "
-            "toggle Wi-Fi, change volume, lock the screen, sleep the display, or shut down/restart the computer. "
-            "Also handles keyboard inputs (scrolling, typing, taking screenshots, window snapping)."
+            "Roll back the last change made to the computer — reversing a file move, "
+            "copy, create, or edit, a desktop organization, a volume or brightness change, "
+            "or a Wi-Fi toggle. Call this whenever the user says undo, revert, take it back, "
+            "put it back, restore, or says they made a mistake. "
+            "Use action='list' when they ask what can be undone."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
                 "action": {
                     "type": "STRING",
-                    "description": "Specific action if known (e.g., 'volume_up', 'volume_set', 'brightness_down', 'lock_screen', 'shutdown')"
+                    "description": "undo (default) — reverse the last change | list — show what can be undone",
                 },
-                "description": {
-                    "type": "STRING",
-                    "description": "Natural language description of what to do (e.g., 'turn the volume to 50%', 'put the computer to sleep')"
-                },
-                "value": {
-                    "type": "STRING",
-                    "description": "Any value associated with the action (e.g., '50' for volume level)"
-                },
-                "confirmed": {
-                    "type": "STRING",
-                    "description": "Pass 'yes' if the user explicitly confirmed a dangerous action like 'shutdown' or 'restart'."
-                }
             },
-            "required": []
-        }
+        },
+    },
+    {
+        "name": "recall_memory",
+        "description": (
+            "Search long-term memory for stored facts, preferences, user info, projects, or history. "
+            "Use this when the user asks 'do you remember', 'what is my...', or when context about "
+            "past instructions or preferences is needed."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "query": {
+                    "type": "STRING",
+                    "description": "Keyword or topic to search for in memory (e.g. 'project', 'coffee', 'birthday', 'preference')",
+                },
+            },
+            "required": ["query"],
+        },
     },
     {
         "name": "dev_agent",
@@ -682,6 +786,90 @@ TOOL_DECLARATIONS = [
         }
     },
     {
+        "name": "instagram_send_dm",
+        "description": "Sends an Instagram direct message to a username or conversation thread, and automatically opens the chat in your browser.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "recipient": {
+                    "type": "STRING",
+                    "description": "The Instagram username (e.g. 'john_doe') or numeric thread ID."
+                },
+                "message": {
+                    "type": "STRING",
+                    "description": "The message text to send."
+                },
+                "open_in_browser": {
+                    "type": "BOOLEAN",
+                    "description": "Whether to auto-open the chat thread in your browser (default: true)."
+                }
+            },
+            "required": ["recipient", "message"]
+        }
+    },
+    {
+        "name": "instagram_post_photo",
+        "description": "Publishes a photo directly to your Instagram feed and automatically opens the live post in your browser.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "image_path": {
+                    "type": "STRING",
+                    "description": "Absolute path to the JPG or PNG image file to publish."
+                },
+                "caption": {
+                    "type": "STRING",
+                    "description": "The caption text with optional hashtags for the post."
+                },
+                "open_in_browser": {
+                    "type": "BOOLEAN",
+                    "description": "Whether to auto-open the published post in your browser (default: true)."
+                }
+            },
+            "required": ["image_path"]
+        }
+    },
+    {
+        "name": "instagram_post_reel",
+        "description": "Publishes a video or Reel directly to your Instagram account and automatically opens the live Reel in your browser.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "video_path": {
+                    "type": "STRING",
+                    "description": "Absolute path to the MP4 video file to publish."
+                },
+                "caption": {
+                    "type": "STRING",
+                    "description": "The caption text with optional hashtags."
+                },
+                "thumbnail_path": {
+                    "type": "STRING",
+                    "description": "Optional path to cover image."
+                },
+                "open_in_browser": {
+                    "type": "BOOLEAN",
+                    "description": "Whether to auto-open the published Reel in your browser (default: true)."
+                }
+            },
+            "required": ["video_path"]
+        }
+    },
+    {
+        "name": "instagram_get_user_info",
+        "description": "Looks up profile details, bio, follower count, following count, and verified badge for any Instagram handle.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "username": {
+                    "type": "STRING",
+                    "description": "The Instagram username to look up (e.g. 'natgeo' or 'openai')."
+                }
+            },
+            "required": ["username"]
+        }
+    },
+    {
         "name": "open_app",
         "description": (
             "Opens any application on the Windows computer. "
@@ -801,7 +989,8 @@ TOOL_DECLARATIONS = [
             "properties": {
                 "action":      {"type": "STRING", "description": "The action to perform"},
                 "description": {"type": "STRING", "description": "Natural language description of what to do"},
-                "value":       {"type": "STRING", "description": "Optional value: volume level, text to type, etc."}
+                "value":       {"type": "STRING", "description": "Optional value: volume level, text to type, etc."},
+                "confirmed":   {"type": "STRING", "description": "Pass 'yes' if the user explicitly confirmed a dangerous action like 'shutdown' or 'restart'."}
             },
             "required": []
         }
@@ -940,23 +1129,26 @@ TOOL_DECLARATIONS = [
     {
         "name": "browser_control",
         "description": (
-            "Controls the web browser. Use for: opening websites, searching the web, "
-            "navigating pages, clicking elements, filling forms, scrolling, tabs, back/forward, "
-            "refreshing, and any web-based task."
+            "Complete browser automation powered by Microsoft Playwright MCP. "
+            "Use for: opening websites, web searching, navigating, semantic accessibility snapshots, "
+            "clicking elements or snapshot references, typing, form filling, hovering, executing JavaScript, "
+            "taking screenshots, managing tabs, and any web-based task."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":      {"type": "STRING", "description": "go_to | navigate | search | click | type | scroll | fill_form | smart_click | smart_type | get_text | press | back | forward | refresh | open_tab | new_tab | switch_tab | list_tabs | close"},
-                "url":         {"type": "STRING", "description": "URL for go_to action"},
-                "query":       {"type": "STRING", "description": "Search query for search action"},
-                "selector":    {"type": "STRING", "description": "CSS selector for click/type"},
-                "text":        {"type": "STRING", "description": "Text to click or type"},
-                "description": {"type": "STRING", "description": "Element description for smart_click/smart_type"},
+                "action":      {"type": "STRING", "description": "go_to | navigate | search | click | hover | type | scroll | fill_form | snapshot | find | evaluate | screenshot | press | back | forward | refresh | open_tab | new_tab | switch_tab | list_tabs | wait_for | select_option | upload | console | network | close"},
+                "url":         {"type": "STRING", "description": "URL for go_to/navigate"},
+                "query":       {"type": "STRING", "description": "Search query or search term for find"},
+                "selector":    {"type": "STRING", "description": "CSS selector for click/type/hover"},
+                "element":     {"type": "STRING", "description": "Snapshot element reference (e.g. e2)"},
+                "text":        {"type": "STRING", "description": "Text to click, type, or wait for"},
+                "description": {"type": "STRING", "description": "Element description for smart targeting"},
                 "direction":   {"type": "STRING", "description": "up or down for scroll"},
-                "key":         {"type": "STRING", "description": "Key name for press action"},
+                "key":         {"type": "STRING", "description": "Key name for press action (Enter, Tab, Escape, etc.)"},
+                "expression":  {"type": "STRING", "description": "JavaScript expression to evaluate in page"},
+                "path":        {"type": "STRING", "description": "File path for screenshot or upload"},
                 "tab":         {"type": "INTEGER", "description": "1-based tab index for switch_tab"},
-                "incognito":   {"type": "BOOLEAN", "description": "Open in private/incognito mode"},
             },
             "required": ["action"]
         }
@@ -985,12 +1177,30 @@ TOOL_DECLARATIONS = [
         }
     },
     {
-        "name": "desktop_control",
-        "description": "Controls the desktop: wallpaper, organize, clean, list, stats.",
+        "name": "smart_organizer",
+        "description": (
+            "Smart Desktop & Downloads Organizer MCP with safe transaction rollback (undo), "
+            "dry-run previews, duplicate file detection, empty folder cleanup, and archiving. "
+            "Use when the user asks to organize, preview, declutter, clean, or find duplicate files on the desktop, downloads, or any folder."
+        ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action": {"type": "STRING", "description": "wallpaper | wallpaper_url | organize | clean | list | stats | task"},
+                "action": {"type": "STRING", "description": "preview | organize | undo | find_duplicates | clean_empty_folders | archive_old"},
+                "target": {"type": "STRING", "description": "Target folder: 'desktop' | 'downloads' | 'documents' | 'pictures' or a custom directory path"},
+                "mode":   {"type": "STRING", "description": "by_type (categorizes into Documents, Images/Screenshots, Installers, Code, Archives, etc.) or by_date (YYYY-MM)"},
+                "days":   {"type": "INTEGER", "description": "Number of days for archive_old (default: 30)"}
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "desktop_control",
+        "description": "Controls the desktop: wallpaper, organize, preview, clean, undo, find_duplicates, list, stats.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {"type": "STRING", "description": "wallpaper | wallpaper_url | organize | preview | clean | undo | find_duplicates | list | stats | task"},
                 "path":   {"type": "STRING", "description": "Image path for wallpaper"},
                 "url":    {"type": "STRING", "description": "Image URL for wallpaper_url"},
                 "mode":   {"type": "STRING", "description": "by_type or by_date for organize"},
@@ -1150,7 +1360,7 @@ TOOL_DECLARATIONS = [
         "name": "presentation_builder",
         "description": (
             "Creates editable PowerPoint presentations (.pptx) from a structured slide outline. "
-            "Brahma Echo automatically infers the best visual style from the topic, searches for a matching online template when available, "
+            "ULTRON automatically infers the best visual style from the topic, searches for a matching online template when available, "
             "reuses cached templates, and falls back to the built-in designer if no suitable template is found. "
             "Use when the user asks for a deck, slideshow, presentation, pitch deck, or report slides."
         ),
@@ -1161,7 +1371,7 @@ TOOL_DECLARATIONS = [
                 "subtitle": {"type": "STRING", "description": "Optional subtitle or audience line"},
                 "theme": {
                     "type": "STRING",
-                    "description": "Optional presentation theme or visual direction such as neon, corporate, luxury, academic, sunset, or creative. If omitted, Brahma Echo infers the best style automatically."
+                    "description": "Optional presentation theme or visual direction such as neon, corporate, luxury, academic, sunset, or creative. If omitted, ULTRON infers the best style automatically."
                 },
                 "outline": {
                     "type": "STRING",
@@ -1321,7 +1531,7 @@ TOOL_DECLARATIONS = [
         "description": (
             "Shuts down the assistant completely. "
         "Call this when the user expresses intent to end the conversation, "
-        "close the assistant, say goodbye, or stop Brahma Echo. "
+        "close the assistant, say goodbye, or stop ULTRON. "
         "The user can say this in ANY language."
     ),
     "parameters": {
@@ -1443,6 +1653,221 @@ TOOL_DECLARATIONS = [
             "required": []
         }
     },
+    {
+        "name": "google_workspace",
+        "description": (
+            "Full Google Workspace MCP for Gmail, Calendar, and Google Drive automation. "
+            "Supports: reading unread emails, listing inbox, searching emails, sending emails; "
+            "listing calendar events, adding calendar events; "
+            "searching Drive files, reading Drive files, and uploading files to Google Drive."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "service": {
+                    "type": "STRING",
+                    "description": "gmail | calendar | drive"
+                },
+                "action": {
+                    "type": "STRING",
+                    "description": "gmail actions: 'list', 'unread', 'read', 'search', 'send' | calendar actions: 'list', 'add' | drive actions: 'list', 'search', 'read', 'upload'"
+                },
+                "to": {
+                    "type": "STRING",
+                    "description": "Recipient email address for sending emails"
+                },
+                "subject": {
+                    "type": "STRING",
+                    "description": "Subject for sending or searching emails"
+                },
+                "body": {
+                    "type": "STRING",
+                    "description": "Body message for email"
+                },
+                "query": {
+                    "type": "STRING",
+                    "description": "Search query for Gmail or Drive"
+                },
+                "email_id": {
+                    "type": "STRING",
+                    "description": "ID of email to read"
+                },
+                "title": {
+                    "type": "STRING",
+                    "description": "Title/summary for calendar event"
+                },
+                "date": {
+                    "type": "STRING",
+                    "description": "Date for calendar event (YYYY-MM-DD or today/tomorrow)"
+                },
+                "time": {
+                    "type": "STRING",
+                    "description": "Time for calendar event (HH:MM)"
+                },
+                "duration_minutes": {
+                    "type": "NUMBER",
+                    "description": "Duration in minutes"
+                },
+                "file_path": {
+                    "type": "STRING",
+                    "description": "Local file path or name for Drive upload/read"
+                }
+            },
+            "required": ["service", "action"]
+        }
+    },
+    {
+        "name": "system_diagnostics",
+        "description": (
+            "Local OS Hardware and System Diagnostics MCP. "
+            "Checks battery health, power status, CPU usage and thermals, RAM utilization and top memory/CPU hogs, "
+            "storage drive space, and controls multi-monitor display brightness. Can safely terminate frozen apps."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {
+                    "type": "STRING",
+                    "description": "status | ram_hogs | cpu_hogs | kill | brightness | battery | disk"
+                },
+                "target": {
+                    "type": "STRING",
+                    "description": "Application name (e.g. 'chrome', 'notepad') or numerical PID to terminate"
+                },
+                "level": {
+                    "type": "NUMBER",
+                    "description": "Display brightness level from 0 to 100"
+                },
+                "monitor": {
+                    "type": "STRING",
+                    "description": "Optional target monitor name or index"
+                },
+                "relative": {
+                    "type": "BOOLEAN",
+                    "description": "Whether brightness level is relative (+10, -10)"
+                },
+                "limit": {
+                    "type": "NUMBER",
+                    "description": "Maximum number of processes to return (default: 5)"
+                }
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "auto_heal",
+        "description": (
+            "Autonomous Self-Healing and Continuous Self-Improvement System. "
+            "Analyzes tracebacks/exceptions in first-party codebase, synthesizes surgical code hotfixes, "
+            "validates AST syntax in safety sandbox, applies hotfixes with atomic backup, or rolls back changes. "
+            "Also manages learned behavioral rules and persistent user directives."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {
+                    "type": "STRING",
+                    "description": "status | heal | history | rollback | learn_rule | list_rules"
+                },
+                "error_traceback": {
+                    "type": "STRING",
+                    "description": "The exact exception traceback or error message to heal"
+                },
+                "rule_text": {
+                    "type": "STRING",
+                    "description": "The user preference, habit, or behavioral directive to remember permanently"
+                },
+                "category": {
+                    "type": "STRING",
+                    "description": "Category for learned rule (general, formatting, workflow, habit)"
+                },
+                "patch_id": {
+                    "type": "STRING",
+                    "description": "Specific patch ID to rollback (default: latest)"
+                }
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "calorie_counter",
+        "description": (
+            "Analyzes food and meals to report calories, macronutrients (protein, carbs, fat, fiber), "
+            "and dietary advice. Can capture a live snapshot via webcam, inspect an image file, "
+            "or analyze a spoken/typed meal description. "
+            "Use whenever the user asks about the calories or nutritional value of food."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "query": {
+                    "type": "STRING",
+                    "description": "Food or meal description (e.g. 'How many calories in this plate?', 'I had 2 eggs and toast')."
+                },
+                "image_path": {
+                    "type": "STRING",
+                    "description": "Optional local file path to a food photo."
+                },
+                "use_camera": {
+                    "type": "BOOLEAN",
+                    "description": "True to capture a live photo from the webcam."
+                }
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "pushup_counter",
+        "description": (
+            "Live AI workout and repetition counter. Tracks reps, tempo, and calories burned "
+            "for pushups, squats, and bodyweight exercises through the webcam with live HUD overlay. "
+            "Use whenever the user asks to count pushups, track squats, or start a workout."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "query": {
+                    "type": "STRING",
+                    "description": "User's request (e.g. 'count my pushups', 'track 20 squats')."
+                },
+                "exercise": {
+                    "type": "STRING",
+                    "description": "pushups | squats | general"
+                },
+                "target": {
+                    "type": "INTEGER",
+                    "description": "Target rep goal (e.g. 20)."
+                }
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "upload_video",
+        "description": (
+            "Automates video publishing to TikTok, YouTube Shorts, or Instagram. "
+            "Auto-locates recent videos on Desktop/Downloads, generates viral SEO captions and tags, "
+            "copies metadata to clipboard, reveals the file in Explorer, and launches the studio uploader."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "description": {
+                    "type": "STRING",
+                    "description": "Video topic, caption brief, or context (in user's language)."
+                },
+                "platform": {
+                    "type": "STRING",
+                    "description": "tiktok | youtube | instagram (default: tiktok)"
+                },
+                "video_path": {
+                    "type": "STRING",
+                    "description": "Optional path to the video file to publish."
+                }
+            },
+            "required": ["description"]
+        }
+    },
 ]
 
 
@@ -1467,7 +1892,7 @@ class BrahmaLive:
             set_speech_sink(self.speak)
         except Exception:
             pass
-            
+
         try:
             from actions.background_monitor import set_monitor_speech_sink
             set_monitor_speech_sink(self.speak)
@@ -1486,6 +1911,22 @@ class BrahmaLive:
         self.ui.on_text_command = self._on_text_command
         self.ui.on_attention_action = self._on_attention_action
         self.ui.on_remote_clicked = self._make_remote_key
+        self._echo = EchoGuard()
+        self._resume_handle = None
+        self._ptt = None
+        self._ptt_held = False
+        try:
+            self._ptt_enabled = config_manager.get_push_to_talk_enabled()
+            if self._ptt_enabled:
+                self.set_push_to_talk(True)
+        except Exception:
+            self._ptt_enabled = False
+
+        try:
+            audio_devices.configure(SEND_SAMPLE_RATE, RECEIVE_SAMPLE_RATE)
+            audio_devices.prefetch()
+        except Exception:
+            pass
         self._last_activity = time.monotonic()
         self._idle_prompts = [
             "Hey, you there?",
@@ -1496,6 +1937,29 @@ class BrahmaLive:
         ]
         self._idle_speech_thread = threading.Thread(target=self._idle_speech_loop, daemon=True)
         self._idle_speech_thread.start()
+
+    def set_push_to_talk(self, enabled: bool) -> str:
+        self._ptt_enabled = bool(enabled)
+        self._ptt_held = False
+        if not enabled:
+            if self._ptt is not None:
+                self._ptt.stop()
+                self._ptt = None
+            return "off"
+        if self._ptt is None:
+            self._ptt = PushToTalk(self._on_ptt)
+        scope = self._ptt.start()
+        try:
+            self.ui.write_log(
+                f"SYS: Push-to-talk ativado — segure {self._ptt.label}"
+                + ("." if scope == "global" else " (funciona enquanto a janela estiver em foco).")
+            )
+        except Exception:
+            pass
+        return scope
+
+    def _on_ptt(self, held: bool) -> None:
+        self._ptt_held = held
 
     def _reset_idle_activity(self):
         self._last_activity = time.monotonic()
@@ -1524,16 +1988,16 @@ class BrahmaLive:
             time.sleep(60.0)
             if not engine:
                 continue
-            
+
             try:
                 if self.ui.muted or self._is_speaking or self._meeting_active or self._pending_attention:
                     continue
-                
+
                 # Check if it should trigger using the engine's time monotonic logic
                 if engine.should_trigger(self._last_activity):
                     engine.mark_triggered()
                     prompt = engine.build_prompt(memory={})
-                    
+
                     if self.session and self._loop:
                         import asyncio
                         async def _send():
@@ -1543,13 +2007,13 @@ class BrahmaLive:
                                 print(f"[Proactive] Error: {e}")
                         asyncio.run_coroutine_threadsafe(_send(), self._loop)
                         self._reset_idle_activity()
-                    
+
             except Exception as e:
                 print(f"[Proactive] Error: {e}")
 
     def _make_remote_key(self):
         if self._dashboard is None:
-            self.ui.write_log("ERR: Mobile Connect unavailable. Install fastapi, uvicorn, cryptography, and qrcode[pil].")
+            self.ui.write_log("ERR: Conexão Móvel indisponível. Instale fastapi, uvicorn, cryptography e qrcode[pil].")
             return None
         key = self._dashboard.new_key()
         url = self._dashboard.get_url()
@@ -1567,6 +2031,13 @@ class BrahmaLive:
         text = (text or "").strip()
         if not text:
             return
+        if len(text) > 4:
+            threading.Thread(
+                target=_update_memory_async,
+                args=(text, ""),
+                daemon=True
+            ).start()
+        self.ui.set_state("THINKING")
         try:
             stop_native_speech()
         except Exception:
@@ -1603,15 +2074,15 @@ class BrahmaLive:
                 if rem.lower().strip().startswith(prefix):
                     rem = rem.strip()[len(prefix):].strip()
                     break
-            
+
             # Remove leading "to " if present
             if rem.lower().startswith("to "):
                 rem = rem[3:].strip()
-                
+
             recipient = rem.strip()
             self._email_mode = True
             self._email_recipient = recipient
-            
+
             try:
                 self.ui.begin_task_workspace(
                     text,
@@ -1625,29 +2096,27 @@ class BrahmaLive:
                 )
             except Exception:
                 pass
-                
+
             if not recipient:
                 self._email_step = 0
-                prompt = "Who would you like to send the email to?"
-                self.ui.write_log(f"Brahma Echo: {prompt}")
+                prompt = "Para quem você gostaria de enviar o e-mail?"
                 self.speak(prompt)
                 try:
                     self.ui.update_task_workspace(
-                        status="Identifying recipient",
-                        output="Asking for email recipient...",
+                        status="Identificando destinatário",
+                        output="Perguntando o destinatário do e-mail...",
                         percent=10,
                     )
                 except Exception:
                     pass
             else:
                 self._email_step = 1
-                prompt = "Which email app would you like to use? (Gmail, default mail app, etc.)"
-                self.ui.write_log(f"Brahma Echo: {prompt}")
+                prompt = "Qual aplicativo de e-mail você gostaria de usar? (Gmail, app padrão, etc.)"
                 self.speak(prompt)
                 try:
                     self.ui.update_task_workspace(
-                        status="Selecting email app",
-                        output=f"Recipient identified: {recipient}. Asking for email application...",
+                        status="Selecionando app de e-mail",
+                        output=f"Destinatário identificado: {recipient}. Perguntando o aplicativo de e-mail...",
                         percent=25,
                     )
                 except Exception:
@@ -1660,43 +2129,367 @@ class BrahmaLive:
             devices = self._smart_home.list_devices()
             routed_text_home = sd_mgr.route_command(text, devices)
             if routed_text_home != text:
-                print(f"[BRAHMA ECHO] Redirection: '{text}' -> '{routed_text_home}'")
+                print(f"[ULTRON] Redirection: '{text}' -> '{routed_text_home}'")
                 text = routed_text_home
         except Exception as e:
-            print(f"[BRAHMA ECHO] Redirection error: {e}")
+            print(f"[ULTRON] Redirection error: {e}")
 
         developer_settings = self.ui._load_app_settings() if hasattr(self.ui, "_load_app_settings") else {}
-        developer_enabled = bool(developer_settings.get("developer_mode_enabled", False))
         developer_workspace = str(developer_settings.get("developer_mode_workspace", "")).strip()
-        website_request = _looks_like_website_request(text)
-        if website_request and not (developer_enabled and developer_workspace):
-            message = "Website builds need developer mode enabled and a workspace folder selected first."
-            self.ui.write_log(f"ERR: {message}")
-            self.speak(message)
+        if not developer_workspace:
+            developer_workspace = str(Path.home() / "Desktop" / "BrahmaProjects")
+            Path(developer_workspace).mkdir(parents=True, exist_ok=True)
+
+        presentation_request = _looks_like_presentation_request(text)
+        spreadsheet_request = _looks_like_spreadsheet_request(text)
+
+        if presentation_request:
+            self.speak("Projetando seus slides de apresentação...")
+            if hasattr(self.ui, "begin_task_workspace"):
+                self.ui.begin_task_workspace(
+                    text,
+                    ["Researching topic", "Outlining slides", "Applying typography & theme", "Generating PowerPoint deck"],
+                    source=source or "local"
+                )
+
+            def _run_presentation():
+                try:
+                    from actions.office_generator import generate_presentation_from_prompt
+                    res = generate_presentation_from_prompt(text, player=self.ui, speak=self.speak)
+                    self.ui.write_log(f"[BrahmaOffice] {res}")
+                    if hasattr(self.ui, "update_task_workspace"):
+                        self.ui.update_task_workspace(status="Apresentação Concluída", output=res, percent=100)
+                    self.speak("Sua apresentação foi criada e salva na Área de Trabalho, senhor.")
+                except Exception as exc:
+                    self.ui.write_log(f"ERR: Presentation generation failed: {exc}")
+                    if hasattr(self.ui, "update_task_workspace"):
+                        self.ui.update_task_workspace(status="Geração Falhou", output=str(exc), percent=0)
+                    self.speak("Houve um problema ao criar a apresentação, senhor. Verifique os logs.")
+
+            threading.Thread(target=_run_presentation, daemon=True).start()
             return
 
-        if website_request and developer_enabled and developer_workspace:
-            try:
-                self.speak("Working on your website...")
-                if hasattr(self.ui, "_developer_status_lbl"):
-                    self.ui._developer_status_lbl.setText("Building website with Gemini in the selected workspace")
-                    self.ui._developer_card.show()
-                    self.ui._developer_card.raise_()
-                result = website_builder(
-                    parameters={
-                        "action": "create",
-                        "description": text,
-                        "title": text,
-                        "output_dir": developer_workspace,
-                        "auto_open": True,
-                    },
-                    player=self.ui,
+        if spreadsheet_request:
+            self.speak("Montando sua planilha...")
+            if hasattr(self.ui, "begin_task_workspace"):
+                self.ui.begin_task_workspace(
+                    text,
+                    ["Analyzing data structure", "Defining headers & formulas", "Formatting workbook", "Saving Excel spreadsheet"],
+                    source=source or "local"
                 )
-                self.ui.write_log(f"[WebsiteBuilder] {result[:400]}")
-                self.speak(result[:800])
+
+            def _run_spreadsheet():
+                try:
+                    from actions.office_generator import generate_spreadsheet_from_prompt
+                    res = generate_spreadsheet_from_prompt(text, player=self.ui, speak=self.speak)
+                    self.ui.write_log(f"[BrahmaOffice] {res}")
+                    if hasattr(self.ui, "update_task_workspace"):
+                        self.ui.update_task_workspace(status="Planilha Concluída", output=res, percent=100)
+                    self.speak("Sua planilha foi criada e salva na Área de Trabalho, senhor.")
+                except Exception as exc:
+                    self.ui.write_log(f"ERR: Spreadsheet generation failed: {exc}")
+                    if hasattr(self.ui, "update_task_workspace"):
+                        self.ui.update_task_workspace(status="Geração Falhou", output=str(exc), percent=0)
+                    self.speak("Houve um problema ao criar a planilha, senhor. Verifique os logs.")
+
+            threading.Thread(target=_run_spreadsheet, daemon=True).start()
+            return
+
+        website_request = _looks_like_website_request(text)
+        code_request = (not presentation_request and not spreadsheet_request) and _looks_like_code_request(text) and any(w in text.lower() for w in ("app", "website", "web", "program", "script", "project", "game", "calc", "html", "react"))
+
+        if website_request or code_request:
+            self.speak("Trabalhando no seu projeto com o Brahma Dev...")
+            if hasattr(self.ui, "begin_task_workspace"):
+                self.ui.begin_task_workspace(text, ["Analyzing specifications", "Scaffolding files", "Writing code", "Verifying build"], source=source or "local")
+
+            def _run_brahma_dev():
+                try:
+                    import webbrowser
+                    from actions.brahma_dev_agent import run_dev_agent
+                    res = run_dev_agent({
+                        "description": text,
+                        "workspace_path": developer_workspace
+                    }, speak=self.speak)
+                    self.ui.write_log(f"[BrahmaDev] {res[:400]}")
+
+                    if "encountered an error during inference" in res or "LLM error:" in res:
+                        if hasattr(self.ui, "update_task_workspace"):
+                            self.ui.update_task_workspace(status="Erro de Build", output=res, percent=0)
+                        self.speak("Houve um erro ao construir o projeto, senhor. Verifique os logs.")
+                        return
+
+                    if hasattr(self.ui, "update_task_workspace"):
+                        self.ui.update_task_workspace(status="Projeto Concluído", output=res, percent=100)
+
+                    folder_display = developer_workspace
+                    try:
+                        folder_display = Path(developer_workspace).name or developer_workspace
+                    except Exception:
+                        pass
+
+                    self.speak(f"Seu projeto foi concluído e salvo em {folder_display}, senhor.")
+
+                    # Auto-open index.html in browser if created
+                    try:
+                        idx_path = Path(developer_workspace) / "index.html"
+                        if idx_path.exists():
+                            webbrowser.open(str(idx_path.resolve()))
+                    except Exception:
+                        pass
+                except Exception as exc:
+                    self.ui.write_log(f"ERR: Brahma Dev failed: {exc}")
+                    if hasattr(self.ui, "update_task_workspace"):
+                        self.ui.update_task_workspace(status="Build Falhou", output=str(exc), percent=0)
+                    self.speak("Houve um problema ao construir o projeto, senhor. Verifique os logs.")
+
+            threading.Thread(target=_run_brahma_dev, daemon=True).start()
+            return
+
+        # Google Workspace Direct Command Handling (Gmail & Calendar checks)
+        lower_cmd = text.lower().strip()
+        is_email_check = any(phrase in lower_cmd for phrase in ("check email", "check my email", "unread email", "read email", "my inbox", "check inbox", "show emails"))
+        is_calendar_check = any(phrase in lower_cmd for phrase in ("my schedule", "what's on my calendar", "check calendar", "my meetings", "schedule today", "events today"))
+
+        if is_email_check:
+            self.speak("Verificando sua caixa de entrada do Gmail, senhor...")
+            if hasattr(self.ui, "begin_task_workspace"):
+                self.ui.begin_task_workspace(
+                    text,
+                    ["Connecting to Gmail", "Fetching unread messages", "Parsing headers & body", "Summarizing inbox"],
+                    source=source or "local"
+                )
+            def _run_gw_email():
+                try:
+                    from actions.google_workspace_mcp import google_workspace
+                    res = google_workspace({"service": "gmail", "action": "unread"}, player=self.ui, speak=self.speak)
+                    self.ui.write_log(f"[GoogleWorkspace] {res}")
+                    if hasattr(self.ui, "update_task_workspace"):
+                        self.ui.update_task_workspace(status="Verificação de E-mail Concluída", output=res, percent=100)
+                    self.speak("Aqui estão seus e-mails mais recentes, senhor.")
+                except Exception as exc:
+                    self.ui.write_log(f"ERR: Gmail check failed: {exc}")
+                    if hasattr(self.ui, "update_task_workspace"):
+                        self.ui.update_task_workspace(status="Verificação de E-mail Falhou", output=str(exc), percent=0)
+                    self.speak("Não foi possível verificar os e-mails. Certifique-se de que suas credenciais estão configuradas em Configurações.")
+            threading.Thread(target=_run_gw_email, daemon=True).start()
+            return
+
+        if is_calendar_check:
+            self.speak("Verificando sua agenda do calendário...")
+            if hasattr(self.ui, "begin_task_workspace"):
+                self.ui.begin_task_workspace(
+                    text,
+                    ["Connecting to Calendar", "Retrieving scheduled events", "Formatting timeline"],
+                    source=source or "local"
+                )
+            def _run_gw_calendar():
+                try:
+                    from actions.google_workspace_mcp import google_workspace
+                    res = google_workspace({"service": "calendar", "action": "list"}, player=self.ui, speak=self.speak)
+                    self.ui.write_log(f"[GoogleWorkspace] {res}")
+                    if hasattr(self.ui, "update_task_workspace"):
+                        self.ui.update_task_workspace(status="Agenda Obtida", output=res, percent=100)
+                    self.speak("Aqui está sua agenda, senhor.")
+                except Exception as exc:
+                    self.ui.write_log(f"ERR: Calendar check failed: {exc}")
+                    if hasattr(self.ui, "update_task_workspace"):
+                        self.ui.update_task_workspace(status="Verificação de Agenda Falhou", output=str(exc), percent=0)
+                    self.speak("Houve um problema ao verificar sua agenda, senhor.")
+            threading.Thread(target=_run_gw_calendar, daemon=True).start()
+            return
+
+        # OS Hardware & Diagnostics Direct Command Handling (0 background API credits)
+        is_ram_check = any(p in lower_cmd for p in ("eating my ram", "ram hogs", "memory hogs", "check ram", "ram usage", "memory usage", "who is using ram"))
+        is_battery_check = any(p in lower_cmd for p in ("battery health", "check battery", "battery status", "battery percentage", "is laptop charging", "how much battery"))
+        is_brightness_req = any(p in lower_cmd for p in ("dim screen", "dim monitor", "increase brightness", "lower brightness", "set brightness", "screen brightness"))
+        is_kill_req = (lower_cmd.startswith("kill ") or lower_cmd.startswith("terminate ") or lower_cmd.startswith("force kill ")) and len(lower_cmd.split()) <= 4
+        is_diag_req = any(p in lower_cmd for p in ("system status", "system diagnostics", "hardware status", "computer vitals", "pc diagnostics"))
+
+        if is_ram_check:
+            self.speak("Escaneando os consumidores de memória...")
+            def _run_ram():
+                from actions.system_diagnostics_mcp import system_diagnostics
+                res = system_diagnostics({"action": "ram_hogs"}, player=self.ui, speak=self.speak)
+                self.ui.write_log(f"[Diagnostics] {res}")
+                if hasattr(self.ui, "finish_task_workspace"):
+                    self.ui.finish_task_workspace(res, "Análise de memória concluída.", 100)
+            threading.Thread(target=_run_ram, daemon=True).start()
+            return
+
+        if is_battery_check:
+            def _run_battery():
+                from actions.system_diagnostics_mcp import system_diagnostics
+                res = system_diagnostics({"action": "battery"}, player=self.ui, speak=self.speak)
+                self.ui.write_log(f"[Diagnostics] {res}")
+                if hasattr(self.ui, "finish_task_workspace"):
+                    self.ui.finish_task_workspace(res, "Verificação de bateria concluída.", 100)
+            threading.Thread(target=_run_battery, daemon=True).start()
+            return
+
+        if is_brightness_req:
+            import re
+            m = re.search(r"(\d+)", lower_cmd)
+            lvl = int(m.group(1)) if m else None
+            rel = "dim" in lower_cmd or "lower" in lower_cmd or "increase" in lower_cmd or "boost" in lower_cmd
+            if rel and lvl is None:
+                lvl = -20 if ("dim" in lower_cmd or "lower" in lower_cmd) else 20
+            def _run_brightness():
+                from actions.system_diagnostics_mcp import system_diagnostics
+                p = {"action": "brightness"}
+                if lvl is not None:
+                    p["level"] = lvl
+                    p["relative"] = rel
+                res = system_diagnostics(p, player=self.ui, speak=self.speak)
+                self.ui.write_log(f"[Diagnostics] {res}")
+                if hasattr(self.ui, "finish_task_workspace"):
+                    self.ui.finish_task_workspace(res, "Brilho ajustado.", 100)
+            threading.Thread(target=_run_brightness, daemon=True).start()
+            return
+
+        if is_kill_req:
+            target_app = lower_cmd.split(None, 1)[1].strip()
+            def _run_kill():
+                from actions.system_diagnostics_mcp import system_diagnostics
+                res = system_diagnostics({"action": "kill", "target": target_app, "force": "force" in lower_cmd}, player=self.ui, speak=self.speak)
+                self.ui.write_log(f"[Diagnostics] {res}")
+                if hasattr(self.ui, "finish_task_workspace"):
+                    self.ui.finish_task_workspace(res, "Gerenciamento de processos concluído.", 100)
+            threading.Thread(target=_run_kill, daemon=True).start()
+            return
+
+        if is_diag_req:
+            self.speak("Recuperando o relatório de diagnóstico do sistema...")
+            def _run_diag():
+                from actions.system_diagnostics_mcp import system_diagnostics
+                res = system_diagnostics({"action": "status"}, player=self.ui, speak=self.speak)
+                self.ui.write_log(f"[Diagnostics] {res}")
+                if hasattr(self.ui, "finish_task_workspace"):
+                    self.ui.finish_task_workspace(res, "Relatório do sistema pronto.", 100)
+            threading.Thread(target=_run_diag, daemon=True).start()
+            return
+
+        # Autonomous Self-Healing & Continuous Learning Fast-Path
+        is_trigger_bug = any(p in lower_cmd for p in ("trigger test bug", "simulate bug", "test bug", "create bug", "simulate error", "trigger error", "break test"))
+        is_heal_cmd = any(p in lower_cmd for p in ("fix that bug", "fix the bug", "heal yourself", "auto heal", "patch yourself", "fix error", "fix this error"))
+        is_rollback_cmd = any(p in lower_cmd for p in ("undo last patch", "rollback patch", "revert patch", "undo patch"))
+        is_patch_history = any(p in lower_cmd for p in ("patch history", "patch log", "show patches", "auto heal status"))
+        is_learn_rule = (
+            lower_cmd.startswith("remember to ") or
+            lower_cmd.startswith("remember that ") or
+            (lower_cmd.startswith("always ") and len(lower_cmd.split()) > 2 and not lower_cmd.startswith("always open")) or
+            (lower_cmd.startswith("never ") and len(lower_cmd.split()) > 2) or
+            "new rule:" in lower_cmd
+        )
+
+        if is_trigger_bug:
+            def _run_test_bug():
+                try:
+                    from actions.test_action import test_action
+                    res = test_action({}, player=self.ui, speak=self.speak)
+                    self.ui.write_log(f"[TestAction] {res}")
+                    self.speak(f"A ação de teste foi bem-sucedida sem erros: {res}. O bug parece já estar corrigido!")
+                except Exception as exc:
+                    import traceback
+                    from actions.auto_heal_engine import AutoHealEngine
+                    tb_str = traceback.format_exc()
+                    AutoHealEngine.record_last_error(tb_str)
+                    err_msg = f"Bug simulado acionado em test_action.py: {type(exc).__name__}. Traceback capturado! Agora você pode dizer 'Ultron, corrija esse bug'."
+                    self.speak(err_msg)
+                    self.ui.write_log(f"[AutoHeal Test] {err_msg}")
+                    if hasattr(self.ui, "finish_task_workspace"):
+                        self.ui.finish_task_workspace(tb_str, "Bug simulado capturado.", 100)
+            threading.Thread(target=_run_test_bug, daemon=True).start()
+            return
+
+        if is_heal_cmd:
+            self.speak("Analisando o último traceback capturado e sintetizando a correção...")
+            def _run_heal():
+                from actions.auto_heal_engine import auto_heal
+                res = auto_heal({"action": "heal"}, player=self.ui, speak=self.speak)
+                self.ui.write_log(f"[AutoHeal] {res}")
+                if hasattr(self.ui, "finish_task_workspace"):
+                    self.ui.finish_task_workspace(res, "Auto-correção concluída.", 100)
+            threading.Thread(target=_run_heal, daemon=True).start()
+            return
+
+        if is_rollback_cmd:
+            def _run_rollback():
+                from actions.auto_heal_engine import auto_heal
+                res = auto_heal({"action": "rollback"}, player=self.ui, speak=self.speak)
+                self.ui.write_log(f"[AutoHeal] {res}")
+                if hasattr(self.ui, "finish_task_workspace"):
+                    self.ui.finish_task_workspace(res, "Reversão concluída.", 100)
+            threading.Thread(target=_run_rollback, daemon=True).start()
+            return
+
+        if is_patch_history:
+            def _run_history():
+                from actions.auto_heal_engine import auto_heal
+                action_type = "status" if "status" in lower_cmd else "history"
+                res = auto_heal({"action": action_type}, player=self.ui, speak=self.speak)
+                self.ui.write_log(f"[AutoHeal] {res}")
+                if hasattr(self.ui, "finish_task_workspace"):
+                    self.ui.finish_task_workspace(res, "Relatório de auto-correção pronto.", 100)
+            threading.Thread(target=_run_history, daemon=True).start()
+            return
+
+        if is_learn_rule:
+            rule_raw = lower_cmd.replace("remember that ", "").replace("remember to ", "").replace("new rule: ", "").strip()
+            def _run_learn():
+                from core.learned_rules import LearnedRulesEngine
+                res = LearnedRulesEngine.add_rule(rule_raw, origin="voice_directive")
+                msg = res.get("message", f"Entendido. Gravei '{rule_raw}' na minha memória contínua.")
+                self.speak(msg)
+                self.ui.write_log(f"[LearnedRules] {msg}")
+                if hasattr(self.ui, "finish_task_workspace"):
+                    self.ui.finish_task_workspace(msg, "Regra aprendida.", 100)
+            threading.Thread(target=_run_learn, daemon=True).start()
+            return
+
+        # Local PC Volume Control (Speakers)
+        is_volume_cmd = any(p in lower_cmd for p in ("volume up", "volume down", "mute volume", "mute audio", "unmute", "set volume", "increase volume", "decrease volume", "lower volume")) or (lower_cmd in ("mute", "unmute", "volume max"))
+        if is_volume_cmd and not any(m in lower_cmd for m in ("phone", "mobile", "android", "tablet")):
+            def _run_volume():
+                from actions.computer_settings import volume_up, volume_down, volume_mute, volume_set
+                import re
+                if any(w in lower_cmd for w in ("up", "increase", "higher", "raise")):
+                    volume_up()
+                    self.speak("Volume aumentado.")
+                elif any(w in lower_cmd for w in ("down", "decrease", "lower")):
+                    volume_down()
+                    self.speak("Volume diminuído.")
+                elif "unmute" in lower_cmd or "mute" in lower_cmd:
+                    volume_mute()
+                    self.speak("Áudio alternado.")
+                else:
+                    m = re.search(r"(\d+)", lower_cmd)
+                    if m:
+                        val = int(m.group(1))
+                        volume_set(val)
+                        self.speak(f"Volume definido para {val} por cento.")
+                    else:
+                        volume_up()
+                        self.speak("Volume ajustado.")
+            threading.Thread(target=_run_volume, daemon=True).start()
+            return
+
+        # Local PC App Launcher (runs on computer unless explicitly targeted to phone)
+        has_mobile_target = any(m in lower_cmd for m in ("on phone", "on my phone", "on mobile", "on my mobile", "on android", "on tablet"))
+        is_open_app_cmd = any(lower_cmd.startswith(prefix) for prefix in ("open app ", "open ", "launch app ", "launch ", "start app ", "start ")) and not has_mobile_target and not any(p in lower_cmd for p in ("website", "url", "http", "presentation", "sheet", "spreadsheet", "project", "code", "game"))
+        if is_open_app_cmd:
+            from actions.open_app import open_app, _APP_ALIASES
+            clean_app_candidate = lower_cmd
+            for prefix in ("open app ", "open ", "launch app ", "launch ", "start app ", "start "):
+                if clean_app_candidate.startswith(prefix):
+                    clean_app_candidate = clean_app_candidate[len(prefix):].strip()
+                    break
+            if clean_app_candidate in _APP_ALIASES or any(clean_app_candidate in k for k in _APP_ALIASES):
+                def _run_open_local_app():
+                    open_app({"app_name": clean_app_candidate}, player=self.ui)
+                    self.speak(f"Abrindo {clean_app_candidate}, senhor.")
+                threading.Thread(target=_run_open_local_app, daemon=True).start()
                 return
-            except Exception as exc:
-                self.ui.write_log(f"ERR: Website build failed: {exc}")
 
         memory_ctx = _memory_context_for_request(text)
         routed_text = f"{memory_ctx}\n\nCurrent User Request:\n{text}" if memory_ctx else text
@@ -1718,8 +2511,8 @@ class BrahmaLive:
         if _looks_like_screen_request(text):
             try:
                 self.ui.update_task_workspace(
-                    status="Scanning screen",
-                    output="Brahma Echo is inspecting the screen for what you asked about.",
+                    status="Analisando tela",
+                    output="ULTRON está inspecionando a tela para responder o que você perguntou.",
                     percent=40,
                 )
             except Exception:
@@ -1746,7 +2539,7 @@ class BrahmaLive:
                 if not success:
                     try:
                         self.ui.update_task_workspace(
-                            status="Screen analysis failed",
+                            status="Análise de tela falhou",
                             output=(
                                 "Screen analysis could not complete. "
                                 "Check your internet connection, API key, or screen capture permissions."
@@ -1761,6 +2554,7 @@ class BrahmaLive:
         if self._use_openrouter_first or not self._loop or not self.session:
             threading.Thread(target=self._fallback_reply, args=(text, memory_ctx), daemon=True).start()
             return
+        self.ui.set_state("THINKING")
         asyncio.run_coroutine_threadsafe(
             self.session.send_client_content(
                 turns={"parts": [{"text": routed_text}]},
@@ -1772,24 +2566,42 @@ class BrahmaLive:
 
     def _handle_smart_home_command(self, text: str, source: str = "local") -> bool:
         normalized = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9\s%]", " ", text.lower())).strip()
-        connect_words = (
-            "phone", "mobile", "android", "tablet", "device", "devices", "brahma connect",
-            "my phone", "my mobile", "my tablet", "my android", "turn on flashlight", "flashlight",
-            "volume", "open url", "launch app", "get battery", "device info",
+
+        # Don't touch commands targeted at phone or mobile
+        mobile_words = (
+            "phone", "mobile", "android", "tablet", "brahma connect",
+            "my phone", "my mobile", "my tablet", "my android", "flashlight", "torch"
         )
-        smart_home_words = (
-            "fan", "light", "lights", "lamp", "plug", "switch", "socket", "bulb",
-            "kasa", "atomberg", "room", "bedroom", "living room", "kitchen", "office",
-            "balcony", "bathroom", "home device", "smart home", "smart-home",
-        )
-        action_words = ("turn on", "turn off", "switch on", "switch off", "power on", "power off", "set", "speed", "brightness", "restart", "reboot", "toggle")
-        if any(word in normalized for word in connect_words):
+        if any(word in normalized for word in mobile_words):
             return False
-        if not any(word in normalized for word in smart_home_words) and not any(word in normalized for word in action_words):
+
+        # Don't hijack PC screen/monitor brightness
+        if any(w in normalized for w in ("screen", "monitor", "display", "laptop", "pc")) and "brightness" in normalized:
+            return False
+
+        smart_home_words = (
+            "fan", "fans", "light", "lights", "lamp", "plug", "socket", "outlet", "bulb",
+            "kasa", "atomberg", "bedroom", "living room", "kitchen", "office room",
+            "balcony", "bathroom", "hall", "dining", "smart home", "smart-home",
+            "ac", "air conditioner", "thermostat"
+        )
+        has_smart_word = any(word in normalized for word in smart_home_words)
+        if not has_smart_word:
+            try:
+                for d in self._smart_home.list_devices():
+                    d_name = str(d.get("name", "")).lower()
+                    d_room = str(d.get("room", "")).lower()
+                    if (d_name and d_name in normalized) or (d_room and d_room in normalized):
+                        has_smart_word = True
+                        break
+            except Exception:
+                pass
+
+        if not has_smart_word:
             return False
         try:
             result = self._smart_home.execute_command(text)
-            detail = str(result.get("detail") or "Smart-home command completed.")
+            detail = str(result.get("detail") or "Comando de casa inteligente concluído.")
             title = f"Smart Home: {result.get('action', 'control')}"
             plan = [
                 "Identify the target device or room",
@@ -1801,12 +2613,11 @@ class BrahmaLive:
                 title=title,
                 command=text,
                 plan=plan,
-                status="Executing smart-home command",
+                status="Executando comando de casa inteligente",
                 output=detail,
                 percent=100,
                 source=source,
             )
-            self.ui.write_log(f"Brahma Echo: {detail}")
             self.speak(detail)
             if not self.ui.muted:
                 self.ui.set_state("LISTENING")
@@ -1815,14 +2626,14 @@ class BrahmaLive:
             message = f"I couldn't control the smart home device: {exc}"
             self.ui.write_log(f"ERR: {message}")
             self.ui.update_task_workspace(
-                title="Smart Home Control",
+                title="Controle de Casa Inteligente",
                 command=text,
                 plan=[
                     "Identify the target device or room",
                     "Send the command to the smart-home provider",
                     "Verify the new state",
                 ],
-                status="Smart-home command failed",
+                status="Comando de casa inteligente falhou",
                 output=message,
                 percent=100,
                 source=source,
@@ -1864,13 +2675,18 @@ class BrahmaLive:
 
     def _handle_brahma_connect_command(self, text: str, source: str = "local") -> bool:
         normalized = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9\s%]", " ", text.lower())).strip()
-        connect_words = (
-            "phone", "mobile", "android", "tablet", "device", "devices", "brahma connect",
-            "my phone", "my mobile", "my tablet", "my android", "turn on flashlight",
-            "turn off flashlight", "flashlight", "volume", "get battery", "battery", "launch app",
-            "open url", "device info", "my laptop", "my pc", "my computer",
-        )
-        if not any(word in normalized for word in connect_words):
+
+        # Explicit mobile indicators: only route to phone if user explicitly mentions phone/mobile
+        # or asks for a phone-exclusive action (flashlight/torch, ring phone).
+        is_flashlight = "flashlight" in normalized or "torch" in normalized
+        is_ring_phone = any(p in normalized for p in ("ring phone", "ring my phone", "find my phone", "find phone", "locate phone"))
+        has_phone_ref = any(token in normalized for token in (
+            "phone", "mobile", "android", "tablet", "brahma connect",
+            "my phone", "my mobile", "my tablet", "my android"
+        ))
+
+        # Never hijack local PC commands (e.g. open chrome, volume up, pc battery) unless user says 'on phone'
+        if not (has_phone_ref or is_flashlight or is_ring_phone):
             return False
 
         try:
@@ -1891,14 +2707,20 @@ class BrahmaLive:
                 if any(token in normalized for token in (name, device_id, platform, "phone", "mobile", "android", "tablet")):
                     target = str(device.get("device_id") or device.get("name") or "").strip()
                     break
-            if not target and len(devices) == 1:
+            if not target and (has_phone_ref or is_flashlight or is_ring_phone) and len(devices) == 1:
                 target = str(devices[0].get("device_id") or devices[0].get("name") or "").strip()
             if not target:
                 return False
 
             action = None
             params: dict[str, object] = {}
-            if "flashlight" in normalized and ("turn on" in normalized or "switch on" in normalized or "power on" in normalized or "on" == normalized):
+
+            # Check for complex multi-step mobile workflow first
+            # Examples: "open X and do Y", "search for Z on X", "message X on Y"
+            if (" and " in normalized or " search " in normalized or " play " in normalized or " message " in normalized or " tell " in normalized) and ("open " in normalized or "launch " in normalized or "app" in normalized):
+                action = "mobile_autopilot"
+                params["instruction"] = text
+            elif "flashlight" in normalized and ("turn on" in normalized or "switch on" in normalized or "power on" in normalized or "on" == normalized):
                 action = "flashlight_on"
             elif "flashlight" in normalized and ("turn off" in normalized or "switch off" in normalized or "power off" in normalized or "off" == normalized):
                 action = "flashlight_off"
@@ -1920,9 +2742,33 @@ class BrahmaLive:
                 action = "volume_get"
             elif "info" in normalized or "status" in normalized:
                 action = "get_device_info"
-                
+
             if not action:
                 return False
+
+            if action == "mobile_autopilot":
+                # Route complex commands to the autopilot loop
+                def _run_autopilot():
+                    try:
+                        from actions.mobile_autopilot import mobile_autopilot
+                        result_json = mobile_autopilot({"target": target, "instruction": params["instruction"]}, player=self.ui, speak=self.speak)
+                        print(f"[Autopilot Result]: {result_json}")
+                        try:
+                            result_dict = json.loads(result_json)
+                            if not result_dict.get("success"):
+                                print(f"[Autopilot Error]: {result_dict.get('error') or result_dict}")
+                                self.speak(f"O Piloto Automático encontrou um erro: {result_dict.get('error', 'erro desconhecido')}")
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        print(f"Autopilot failed: {e}")
+                    finally:
+                        try:
+                            self.ui.set_state("IDLE")
+                        except Exception:
+                            pass
+                threading.Thread(target=_run_autopilot, daemon=True).start()
+                return True
 
             if action == "launch_app":
                 app_name = str(params.get("app_name") or "").strip()
@@ -1943,7 +2789,7 @@ class BrahmaLive:
             result_json = connect_execute(parameters=payload, player=self.ui)
             result = json.loads(result_json)
             if result.get("success", False):
-                detail = str(result.get("detail") or result.get("error") or "Device command completed.")
+                detail = str(result.get("detail") or result.get("error") or "Comando do dispositivo concluído.")
                 title = f"Brahma Connect: {action}"
                 self.ui.update_task_workspace(
                     title=title,
@@ -1954,12 +2800,11 @@ class BrahmaLive:
                         "Verify the device response",
                         "Report the result",
                     ],
-                    status="Executing device command",
+                    status="Executando comando do dispositivo",
                     output=detail,
                     percent=100,
                     source=source,
                 )
-                self.ui.write_log(f"Brahma Echo: {detail}")
                 self.speak(detail)
                 if not self.ui.muted:
                     self.ui.set_state("LISTENING")
@@ -1980,28 +2825,28 @@ class BrahmaLive:
 
         if name == "connect_list_devices":
             count = int(data.get("count") or len(data.get("devices") or []))
-            return f"I found {count} connected device{'s' if count != 1 else ''}."
+            return f"Encontrei {count} dispositivo{'s' if count != 1 else ''} conectado{'s' if count != 1 else ''}."
 
         if name == "connect_get_device":
             device = data.get("device") or {}
-            label = str(device.get("name") or "the device")
+            label = str(device.get("name") or "o dispositivo")
             status = "online" if device.get("online") else "offline"
-            return f"{label} is {status}."
+            return f"{label} está {status}."
 
         if name == "connect_get_capabilities":
             device = data.get("device") or {}
-            label = str(device.get("name") or "The device")
-            return f"{label} capabilities are ready."
+            label = str(device.get("name") or "O dispositivo")
+            return f"As capacidades de {label} estão prontas."
 
         if name == "connect_pair_device":
             pairing = data.get("pairing") or data
             code = str(pairing.get("pairing_code") or "").strip()
             if code:
-                return f"Pairing code ready: {code}."
-            return "Pairing is ready."
+                return f"Código de pareamento pronto: {code}."
+            return "O pareamento está pronto."
 
         if name == "connect_disconnect_device":
-            return "The device has been disconnected."
+            return "O dispositivo foi desconectado."
 
         if name == "connect_execute":
             if data.get("success", False):
@@ -2022,16 +2867,17 @@ class BrahmaLive:
         app = (event.get("app") or "an app").strip()
         kind = (event.get("kind") or "message").strip().lower()
         if kind == "call":
-            return f"Incoming call detected on {app}. Should I pick it up, ignore it, or cut the call?"
+            return f"Chamada recebida detectada em {app}. Devo atender, ignorar ou encerrar a chamada?"
         title = (event.get("title") or "").strip()
         preview = (event.get("preview") or "").strip()
         if title:
-            return f"You received a message on {app} from {title}. It says: {preview}"
-        return f"You received a message on {app}. It says: {preview}"
+            return f"Você recebeu uma mensagem em {app} de {title}. Diz: {preview}"
+        return f"Você recebeu uma mensagem em {app}. Diz: {preview}"
 
     def _announce_attention(self, event: dict):
         msg = self._attention_message(event)
-        self.ui.write_log(f"Brahma Echo: {msg}")
+        # Spoken below; the live model transcribes it into the chat, so logging
+        # here as well would show the same line twice.
         if self.session and self._loop:
             self.speak(msg)
         else:
@@ -2104,7 +2950,7 @@ class BrahmaLive:
         if summary:
             self.ui.write_log(f"[Meeting] {summary}")
         if answer:
-            self.ui.write_log(f"Brahma Echo: {answer}")
+            self.ui.write_log(f"ULTRON: {answer}")
 
     def _on_meeting_state(self, state: str):
         if state == "LISTENING":
@@ -2125,7 +2971,6 @@ class BrahmaLive:
             self._reply_mode = True
 
         message = "What would you like to say in reply?"
-        self.ui.write_log(f"Brahma Echo: {message}")
         if self.session and self._loop:
             self.speak(message)
         else:
@@ -2141,8 +2986,8 @@ class BrahmaLive:
                 source="reply",
             )
             self.ui.update_task_workspace(
-                status="Awaiting your reply",
-                output="Type the message you want to send, and I will make it sound natural before sending it as you.",
+                status="Aguardando sua resposta",
+                output="Digite a mensagem que você quer enviar, e eu vou deixá-la mais natural antes de enviá-la como você.",
                 percent=10,
             )
         except Exception:
@@ -2201,8 +3046,8 @@ class BrahmaLive:
             if not reply_text:
                 reply_text = text
             self.ui.update_task_workspace(
-                status="Sending reply",
-                output="Sending your expanded reply now...",
+                status="Enviando resposta",
+                output="Enviando sua resposta expandida agora...",
                 percent=70,
             )
             receiver = (event.get("title") or "").strip()
@@ -2252,7 +3097,7 @@ class BrahmaLive:
         try:
             client = genai.Client(api_key=_get_api_key(), http_options={"api_version": "v1beta"})
             response = client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-3.6-flash",
                 contents=f"{system_prompt}\n\nUser Response: {text}",
                 config={"temperature": 0.1, "response_mime_type": "application/json"}
             )
@@ -2260,14 +3105,19 @@ class BrahmaLive:
             return data.get("intent", "IGNORE"), data.get("reply_text", "")
         except Exception:
             lower = text.lower()
-            if any(c in lower for c in ("cancel", "stop", "skip", "never mind", "abort")):
+            if any(c in lower for c in ("cancel", "stop", "skip", "never mind", "abort", "don't reply", "do not reply")):
                 return "CANCEL", ""
-            if any(a in lower for a in ("take over", "auto mode", "handle it", "you reply")):
+            if any(a in lower for a in ("take over", "auto mode", "handle it", "you reply", "auto reply", "take care of it")):
                 return "TAKE_OVER", ""
-            if lower.startswith("tell ") or lower.startswith("reply ") or lower.startswith("say ") or lower.startswith("send "):
-                import re
-                cleaned = re.sub(r"^(tell (him|her|them)?|reply( saying)?|say|send) ", "", text, flags=re.IGNORECASE)
-                return "MANUAL_REPLY", cleaned
+            for verb in ("reply", "tell him", "tell her", "tell them", "tell", "say", "send"):
+                if verb in lower:
+                    import re
+                    pattern = rf"^.*?\b{verb}\b(?:\s+(?:him|her|them|that|to\s+say|saying))?\s*"
+                    cleaned = re.sub(pattern, "", text, flags=re.IGNORECASE).strip()
+                    if cleaned:
+                        return "MANUAL_REPLY", cleaned
+            if len(text.strip().split()) >= 2 and not any(g in lower for g in ("hello", "hey brahma", "who are you")):
+                return "MANUAL_REPLY", text.strip()
             return "IGNORE", ""
 
     def _handle_ig_reply_flow(self, text: str) -> bool:
@@ -2275,21 +3125,20 @@ class BrahmaLive:
             thread_id = self._ig_pending_thread.get("thread_id")
             username = self._ig_pending_thread.get("username")
             message_text = self._ig_pending_thread.get('message')
-            
+
             intent, payload = self._parse_ig_reply_intent(text)
-            
+
             if intent == "CANCEL":
                 self._ig_reply_mode = False
                 msg = "Instagram reply cancelled."
-                self.ui.write_log(f"Brahma Echo: {msg}")
                 self.speak(msg)
                 self._ig_pending_thread = None
                 return True
-                
+
             if intent == "TAKE_OVER":
-                self.ui.write_log("SYS: Taking over Instagram thread.")
-                self.speak(f"I will now take over the chat with {username}.")
-                from actions.instagram_chat import add_auto_thread, send_direct_reply
+                self.ui.write_log("SYS: Assumindo a conversa do Instagram.")
+                self.speak(f"Vou assumir a conversa com {username} agora.")
+                from actions.instagram_mcp import add_auto_thread, send_direct_reply
                 add_auto_thread(thread_id)
                 def _generate_and_send():
                     try:
@@ -2298,28 +3147,33 @@ class BrahmaLive:
                     except Exception as e:
                         print(f"Error taking over thread: {e}")
                 threading.Thread(target=_generate_and_send, daemon=True).start()
-                
+
             elif intent == "MANUAL_REPLY":
-                self.ui.write_log(f"SYS: Sending manual reply to {username}.")
-                self.speak("Message sent.")
-                from actions.instagram_chat import send_direct_reply
-                send_direct_reply(thread_id, payload)
-                
+                self.ui.write_log(f"SYS: Enviando resposta manual para @{username}: '{payload}'")
+                self.speak("Mensagem enviada.")
+                from actions.instagram_mcp import send_direct_reply
+                def _do_send():
+                    try:
+                        send_direct_reply(thread_id, payload)
+                    except Exception as e:
+                        print(f"Error sending manual reply to @{username}: {e}")
+                threading.Thread(target=_do_send, daemon=True).start()
+
             elif intent == "IGNORE":
-                return False # Let the main command loop handle this input
-                
+                return False
+
             self._ig_reply_mode = False
             self._ig_pending_thread = None
             return True
         return False
 
+    def _handle_email_flow(self, text: str) -> bool:
         lower = text.lower()
         if any(cancel in lower for cancel in ("cancel", "never mind", "skip", "stop", "abort")):
             self._email_mode = False
             self._email_step = 0
             self._email_profiles = {}
             msg = "Email sending cancelled, sir."
-            self.ui.write_log(f"Brahma Echo: {msg}")
             self.speak(msg)
             try:
                 self.ui.finish_task_workspace("Email sending cancelled.", "Cancelled", 100)
@@ -2331,13 +3185,12 @@ class BrahmaLive:
             # We just collected the recipient
             self._email_recipient = text.strip()
             self._email_step = 1
-            prompt = "Which email app would you like to use? (Gmail, default mail app, etc.)"
-            self.ui.write_log(f"Brahma Echo: {prompt}")
+            prompt = "Qual aplicativo de e-mail você gostaria de usar? (Gmail, app padrão, etc.)"
             self.speak(prompt)
             try:
                 self.ui.update_task_workspace(
-                    status="Selecting email app",
-                    output=f"Recipient: {self._email_recipient}. Asking for email application...",
+                    status="Selecionando app de e-mail",
+                    output=f"Destinatário: {self._email_recipient}. Perguntando o aplicativo de e-mail...",
                     percent=40,
                 )
             except Exception:
@@ -2348,14 +3201,13 @@ class BrahmaLive:
             # We just collected the app name
             self._email_app = text.strip()
             self._email_step = 2
-            
-            prompt = "What is the message you'd like to send?"
-            self.ui.write_log(f"Brahma Echo: {prompt}")
+
+            prompt = "Qual é a mensagem que você gostaria de enviar?"
             self.speak(prompt)
             try:
                 self.ui.update_task_workspace(
-                    status="Collecting message",
-                    output=f"Recipient: {self._email_recipient} | App: {self._email_app}. Asking for message content...",
+                    status="Coletando mensagem",
+                    output=f"Destinatário: {self._email_recipient} | App: {self._email_app}. Perguntando o conteúdo da mensagem...",
                     percent=70,
                 )
             except Exception:
@@ -2367,28 +3219,27 @@ class BrahmaLive:
             self._email_message = text.strip()
             self._email_mode = False
             self._email_step = 0
-            
+
             # Now let's execute composing!
-            msg = f"Opening {self._email_app} and composing email to {self._email_recipient}..."
-            self.ui.write_log(f"Brahma Echo: {msg}")
+            msg = f"Abrindo {self._email_app} e compondo e-mail para {self._email_recipient}..."
             self.speak(msg)
             try:
                 self.ui.update_task_workspace(
-                    status="Composing email",
-                    output=f"Composing message to {self._email_recipient} via {self._email_app}...",
+                    status="Compondo e-mail",
+                    output=f"Compondo mensagem para {self._email_recipient} via {self._email_app}...",
                     percent=90,
                 )
             except Exception:
                 pass
-            
+
             try:
                 import urllib.parse
                 import webbrowser
-                subject = "Message from Brahma Echo"
+                subject = "Message from ULTRON"
                 quoted_recipient = urllib.parse.quote(self._email_recipient)
                 quoted_subject = urllib.parse.quote(subject)
                 quoted_body = urllib.parse.quote(self._email_message)
-                
+
                 import os
                 import subprocess
                 import shutil
@@ -2399,10 +3250,10 @@ class BrahmaLive:
                 if "gmail" in app_lower or "chrome" in app_lower:
                     import urllib.parse
                     quoted_recipient = urllib.parse.quote(self._email_recipient)
-                    quoted_subject = urllib.parse.quote("Message from Brahma Echo")
+                    quoted_subject = urllib.parse.quote("Message from ULTRON")
                     quoted_body = urllib.parse.quote(self._email_message)
                     url = f"https://mail.google.com/mail/?view=cm&fs=1&to={quoted_recipient}&su={quoted_subject}&body={quoted_body}"
-                    
+
                     # Use webbrowser to naturally open a new tab in the already running Chrome window
                     import webbrowser
                     webbrowser.open(url)
@@ -2413,7 +3264,7 @@ class BrahmaLive:
                 else:
                     url = f"mailto:{quoted_recipient}?subject={quoted_subject}&body={quoted_body}"
                     webbrowser.open(url)
-                
+
                 try:
                     self.ui.finish_task_workspace("Email composed successfully.", "Composed", 100)
                 except Exception:
@@ -2444,7 +3295,6 @@ class BrahmaLive:
                 return self._prompt_message_reply(event)
             if self._attention_matches(lower, ("hear", "read", "what is it", "tell me", "show it", "open it")):
                 preview = read_event_preview(event)
-                self.ui.write_log(f"Brahma Echo: {preview}")
                 threading.Thread(target=speak_native, args=(preview,), daemon=True).start()
                 with self._attention_lock:
                     self._pending_attention = None
@@ -2494,7 +3344,6 @@ class BrahmaLive:
         if kind == "message":
             if decision == "hear":
                 preview = read_event_preview(event)
-                self.ui.write_log(f"Brahma Echo: {preview}")
                 threading.Thread(target=speak_native, args=(preview,), daemon=True).start()
             elif decision == "reply":
                 self._prompt_message_reply(event)
@@ -2525,8 +3374,8 @@ class BrahmaLive:
             self.ui.set_state("THINKING")
             try:
                 self.ui.update_task_workspace(
-                    status="Thinking",
-                    output="Brahma Echo is drafting a direct reply.",
+                    status="Pensando",
+                    output="ULTRON está elaborando uma resposta direta.",
                     percent=35,
                 )
             except Exception:
@@ -2539,7 +3388,7 @@ class BrahmaLive:
                 try:
                     reply = _gemini_text_reply(request_text)
                 except Exception as e:
-                    print(f"[BRAHMA ECHO] ⚠️ Gemini fallback failed: {e}")
+                    print(f"[ULTRON] ⚠️ Gemini fallback failed: {e}")
                     if _is_gemini_limit_error(e):
                         self._use_openrouter_first = True
 
@@ -2548,27 +3397,34 @@ class BrahmaLive:
                     reply = openrouter_client.chat(
                         request_text,
                         system=(
-                            "You are Brahma Echo, a concise, helpful desktop assistant. "
+                            "You are ULTRON, a concise, helpful desktop assistant. "
                             "Reply naturally and briefly. Do not mention internal implementation details."
                         ),
                     )
                 except Exception as e:
-                    print(f"[BRAHMA ECHO] ⚠️ OpenRouter fallback failed: {e}")
+                    print(f"[ULTRON] ⚠️ OpenRouter fallback failed: {e}")
                     if gemini_first and not self._use_openrouter_first and _is_gemini_limit_error(e):
                         self._use_openrouter_first = True
             reply = (reply or "").strip()
             if not reply:
-                reply = "I’m ready, sir."
-            self.ui.write_log(f"Brahma Echo: {reply}")
+                reply = "Estou pronto, senhor."
+            self.ui.write_log(f"ULTRON: {reply}")
+            # In fallback mode the live model is unavailable, so this reply is not
+            # transcribed — speak it through the fallback TTS so the user hears it.
+            # (No double voice here: Edge TTS does not write back to the chat.)
             try:
-                self.ui.finish_task_workspace(reply, "Reply delivered.", 100)
+                self.speak(reply)
+            except Exception:
+                pass
+            try:
+                self.ui.finish_task_workspace(reply, "Resposta entregue.", 100)
             except Exception:
                 pass
             if not self.ui.muted:
                 self.ui.set_state("LISTENING")
         except Exception as e:
             msg = f"Fallback reply failed: {e}"
-            print(f"[BRAHMA ECHO] ⚠️ {msg}")
+            print(f"[ULTRON] ⚠️ {msg}")
             self.ui.write_log(f"ERR: {msg}")
             try:
                 self.ui.finish_task_workspace(msg, "Reply failed.", 100)
@@ -2585,21 +3441,80 @@ class BrahmaLive:
         elif not self.ui.muted:
             self.ui.set_state("LISTENING")
 
+    def trigger_barge_in(self):
+        """Immediately interrupts AI speech playback and switches state to LISTENING."""
+        with self._speaking_lock:
+            if not self._is_speaking:
+                return
+            self._is_speaking = False
+
+        try:
+            from actions.attention_monitor import stop_native_speech
+            stop_native_speech()
+        except Exception:
+            pass
+
+        try:
+            if self.audio_in_queue:
+                while not self.audio_in_queue.empty():
+                    try:
+                        self.audio_in_queue.get_nowait()
+                    except Exception:
+                        break
+        except Exception:
+            pass
+
+        # No acoustic cue on barge-in: a blip every time the user cuts in is
+        # distracting and masquerades as a mute toggle.
+
+        if hasattr(self, "ui") and self.ui and not self.ui.muted:
+            self.ui.set_state("LISTENING")
+
     def speak(self, text: str):
         text = (text or "").strip()
         if not text:
             return
-        
+        # De-duplication guard: never start a second utterance while one is still
+        # playing. Without this, two near-simultaneous speak() calls (e.g. the
+        # greeting plus a tool reply) were queued onto the live session and the
+        # assistant said both — the "double voice" the user heard.
+        with self._speaking_lock:
+            if self._is_speaking:
+                try:
+                    self.ui.write_log(f"SYS: (fala ignorada, já falando): {text[:60]}")
+                except Exception:
+                    pass
+                return
+            self._is_speaking = True
+        try:
+            self.ui.set_state("SPEAKING")
+        except Exception:
+            pass
         if self.session and self._loop:
-            # Route text through Gemini Live API for a unified native voice
+            # Route text through Gemini Live API for a unified native voice.
+            # Mark speaking immediately so the microphone treats the reply as our
+            # own voice (echo guard) and barge-in can interrupt it — otherwise the
+            # user's own question during the greeting overlaps with the answer.
             import asyncio
             async def _send():
                 try:
-                    prompt = f"System Alert / Context: {text}\n\nPlease relay this information to me naturally now."
+                    prompt = f"System Alert / Context: {text}\n\nDiga isso ao usuário em português do Brasil, de forma natural e breve. Não acrescente nada além disso."
                     await self.session.send(input=prompt, end_of_turn=True)
                 except Exception as e:
-                    print(f"[BRAHMA ECHO] Unified Speak err: {e}")
+                    print(f"[ULTRON] Unified Speak err: {e}")
             asyncio.run_coroutine_threadsafe(_send(), self._loop)
+            # Safety release: if the live session never signals turn_complete the
+            # speaking flag would stay True forever and block all future speech.
+            def _release_after_delay():
+                time.sleep(25)
+                with self._speaking_lock:
+                    if self._is_speaking:
+                        self._is_speaking = False
+                        try:
+                            self.ui.set_state("LISTENING")
+                        except Exception:
+                            pass
+            threading.Thread(target=_release_after_delay, daemon=True).start()
         else:
             # Fallback to Edge TTS if Gemini Live is disconnected
             def _speak_thread():
@@ -2614,7 +3529,7 @@ class BrahmaLive:
     def speak_error(self, tool_name: str, error: str):
         short = str(error)[:120]
         self.ui.write_log(f"ERR: {tool_name} — {short}")
-        self.speak(f"Sir, {tool_name} encountered an error. {short}")
+        self.speak(f"Senhor, {tool_name} encontrou um erro. {short}")
 
     def _build_config(self) -> types.LiveConnectConfig:
         from datetime import datetime
@@ -2631,25 +3546,41 @@ class BrahmaLive:
             f"Use this to calculate exact times for reminders.\n\n"
         )
 
+        loc_ctx = ""
+        try:
+            from core.device_location import get_device_city
+            dev_city = get_device_city(default="")
+            if dev_city and dev_city != "Local Area":
+                loc_ctx = (
+                    f"[DEVICE PHYSICAL LOCATION]\n"
+                    f"Current device location: {dev_city}\n"
+                    f"Use this location for local weather, time zone, and neighborhood context.\n\n"
+                )
+        except Exception:
+            pass
+
         parts = [time_ctx]
+        if loc_ctx:
+            parts.append(loc_ctx)
         if mem_str:
             parts.append(mem_str)
         parts.append(sys_prompt)
         parts.append(
-            "Wake-word mode: if the microphone is muted, still listen for the words 'Brahma Echo', 'hey', 'hi', and 'hello'. "
+            "Wake-word mode: if the microphone is muted, still listen for the words 'ULTRON', 'hey', 'hi', and 'hello'. "
             "When you hear one of these activation cues, keep the session friendly and concise, "
             "and wait for the user's next command. "
+            "ALWAYS speak in Brazilian Portuguese, including any greeting when you do respond. "
             "IMPORTANT: Do NOT speak an unprompted generic greeting (like 'Thank you, how can I help you?') upon connecting. "
             "Remain completely silent until the user speaks to you or asks a question."
         )
 
-        return types.LiveConnectConfig(
+        config_kwargs = dict(
             response_modalities=["AUDIO"],
             output_audio_transcription={},
             input_audio_transcription={},
             system_instruction="\n".join(parts),
             tools=[{"function_declarations": TOOL_DECLARATIONS}],
-            session_resumption=types.SessionResumptionConfig(),
+            session_resumption=types.SessionResumptionConfig(handle=getattr(self, '_resume_handle', None)),
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
@@ -2658,23 +3589,97 @@ class BrahmaLive:
                 )
             ),
         )
+        # Tune the end-of-speech detector so replies are fast: a short silence
+        # window ends the user's turn quickly instead of waiting many seconds.
+        try:
+            config_kwargs["realtime_input_config"] = types.RealtimeInputConfig(
+                automatic_activity_detection=types.AutomaticActivityDetection(
+                    start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
+                    end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
+                    prefix_padding_ms=150,
+                    silence_duration_ms=400,
+                ),
+                # Interrupt as soon as the user starts talking, so barge-in feels
+                # instant instead of waiting for the turn to end.
+                activity_handling=types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
+            )
+        except Exception:
+            pass
+        try:
+            return types.LiveConnectConfig(**config_kwargs)
+        except Exception:
+            # Fall back to the plain config if this SDK build lacks the VAD fields.
+            config_kwargs.pop("realtime_input_config", None)
+            return types.LiveConnectConfig(**config_kwargs)
 
     async def _execute_tool(self, fc) -> types.FunctionResponse:
         name = fc.name
         args = dict(fc.args or {})
 
-        print(f"[BRAHMA ECHO] 🔧 {name}  {args}")
-        self.speak(f"Working on {name.replace('_', ' ')}...")
+        print(f"[ULTRON] 🔧 {name}  {args}")
+        # (silent) — do not announce which internal tool is running
         self.ui.set_state("THINKING")
+
+        # Trigger Brahma Right Wing: Live Operations & Sources Telemetry
+        tool_title = name.replace("_", " ").title()
+        brief_query = (
+            args.get("query")
+            or args.get("description")
+            or args.get("topic")
+            or args.get("prompt")
+            or args.get("title")
+            or args.get("action")
+            or ""
+        )
+        sources = []
+        if "url" in args:
+            sources.append(args["url"])
+        if "file_path" in args:
+            sources.append(Path(args["file_path"]).name)
+        elif "path" in args:
+            sources.append(Path(args["path"]).name)
+        elif "query" in args and name in ("web_search", "flight_finder", "youtube_video"):
+            sources.append(f"Busca: {str(args['query'])[:28]}")
+
+        try:
+            self.ui.show_hud_operation(
+                title=f"{tool_title.upper()} ATIVO",
+                step=f"Processando: {brief_query[:75]}" if brief_query else f"Executando {tool_title}...",
+                sources=sources,
+                tool=name
+            )
+        except Exception:
+            pass
+
         try:
             self.ui.update_task_workspace(
-                title=f"Running {name}",
-                status=f"Executing {name}",
-                output="Waiting for the tool to finish.",
+                title=f"Executando {name}",
+                status=f"Executando {name}",
+                output="Aguardando a ferramenta terminar.",
                 percent=45,
             )
         except Exception:
             pass
+        if name == "undo":
+            action = args.get("action", "undo")
+            if action == "list":
+                items = undo_stack.history()
+                result = ("Coisas que posso desfazer, mais recentes primeiro:\n" +
+                          "\n".join(f"  • {item}" for item in items)
+                         ) if items else "Ainda não alterei nada que eu possa desfazer."
+            else:
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(None, undo_stack.undo_last)
+            self.speak("Desfeito.")
+            self.ui.set_state("LISTENING")
+            return types.FunctionResponse(name=name, id=fc.id, response={"result": result})
+
+        elif name == "recall_memory":
+            query = args.get("query", "")
+            result = search_memory(query, limit=8)
+            self.ui.set_state("LISTENING")
+            return types.FunctionResponse(name=name, id=fc.id, response={"result": result})
+
         if name == "save_memory":
             category = args.get("category", "notes")
             key      = args.get("key", "")
@@ -2710,11 +3715,80 @@ class BrahmaLive:
             elif name == "open_app":
                 r = await loop.run_in_executor(None, lambda: open_app(parameters=args, response=None, player=self.ui))
                 result = r or f"Opened {args.get('app_name')}."
-                
+
             elif name == "check_instagram_messages":
                 self.ui.write_log("SYS: Checking Instagram messages...")
-                from actions.instagram_chat import get_recent_messages
-                result = await loop.run_in_executor(None, get_recent_messages, 5)
+                if hasattr(self.ui, "show_hud_operation"):
+                    self.ui.show_hud_operation("Instagram Inbox", "Fetching recent direct messages...", sources=["instagram.com"])
+                from actions.instagram_mcp import get_recent_messages, InstagramService
+                amount = int(args.get("amount", 5)) if args else 5
+                result = await loop.run_in_executor(None, get_recent_messages, amount)
+                if hasattr(self.ui, "show_hud_deliverable"):
+                    try:
+                        inbox_data = InstagramService.instance().get_inbox(amount=amount)
+                        bullets = [f"@{item['sender']}: {item['last_message']}" for item in inbox_data[:4]]
+                        self.ui.show_hud_deliverable("Instagram Inbox", summary=f"Retrieved {len(inbox_data)} recent conversations", bullets=bullets, kind="result")
+                    except Exception:
+                        pass
+
+            elif name == "instagram_send_dm":
+                recipient = args.get("recipient", "")
+                message = args.get("message", "")
+                open_browser = args.get("open_in_browser", True)
+                self.ui.write_log(f"SYS: Sending Instagram DM to @{recipient}...")
+                if hasattr(self.ui, "show_hud_operation"):
+                    self.ui.show_hud_operation("Instagram DM", f"Messaging @{recipient}...", sources=["instagram.com"])
+                from actions.instagram_mcp import InstagramService
+                def _do_send():
+                    return InstagramService.instance().send_dm(recipient, message, open_in_browser=open_browser)
+                res = await loop.run_in_executor(None, _do_send)
+                if hasattr(self.ui, "show_hud_deliverable"):
+                    self.ui.show_hud_deliverable("Instagram DM Sent", summary=f"Direct message sent to @{res.get('recipient')}", bullets=[f"Message: {message[:60]}...", "Opened in browser for verification"], kind="result")
+                result = f"Direct message sent to @{recipient}. Chat opened in browser: {res.get('browser_url')}"
+
+            elif name == "instagram_post_photo":
+                image_path = args.get("image_path", "")
+                caption = args.get("caption", "")
+                open_browser = args.get("open_in_browser", True)
+                self.ui.write_log("SYS: Publicando foto no Instagram...")
+                if hasattr(self.ui, "show_hud_operation"):
+                    self.ui.show_hud_operation("Post no Instagram", f"Enviando {Path(image_path).name}...", sources=["instagram.com"])
+                from actions.instagram_mcp import InstagramService
+                def _do_post():
+                    return InstagramService.instance().post_photo(image_path, caption=caption, open_in_browser=open_browser)
+                res = await loop.run_in_executor(None, _do_post)
+                if hasattr(self.ui, "show_hud_deliverable"):
+                    self.ui.show_hud_deliverable("Instagram Post Published", summary="Photo published live to Instagram!", bullets=[f"URL: {res.get('post_url')}", f"Caption: {caption[:60]}..."], kind="deliverable")
+                result = f"Successfully published photo to Instagram! Post URL: {res.get('post_url')}"
+
+            elif name == "instagram_post_reel":
+                video_path = args.get("video_path", "")
+                caption = args.get("caption", "")
+                thumb = args.get("thumbnail_path")
+                open_browser = args.get("open_in_browser", True)
+                self.ui.write_log("SYS: Publicando Reel no Instagram...")
+                if hasattr(self.ui, "show_hud_operation"):
+                    self.ui.show_hud_operation("Reel do Instagram", f"Enviando {Path(video_path).name}...", sources=["instagram.com"])
+                from actions.instagram_mcp import InstagramService
+                def _do_reel():
+                    return InstagramService.instance().post_reel(video_path, caption=caption, thumbnail_path=thumb, open_in_browser=open_browser)
+                res = await loop.run_in_executor(None, _do_reel)
+                if hasattr(self.ui, "show_hud_deliverable"):
+                    self.ui.show_hud_deliverable("Instagram Reel Published", summary="Reel published live to Instagram!", bullets=[f"URL: {res.get('reel_url')}", f"Caption: {caption[:60]}..."], kind="deliverable")
+                result = f"Successfully published Reel to Instagram! Reel URL: {res.get('reel_url')}"
+
+            elif name == "instagram_get_user_info":
+                username = args.get("username", "")
+                self.ui.write_log(f"SYS: Looking up Instagram user @{username}...")
+                if hasattr(self.ui, "show_hud_operation"):
+                    self.ui.show_hud_operation("Instagram Intelligence", f"Looking up @{username}...", sources=["instagram.com"])
+                from actions.instagram_mcp import InstagramService
+                def _do_lookup():
+                    return InstagramService.instance().get_user_profile(username)
+                res = await loop.run_in_executor(None, _do_lookup)
+                if hasattr(self.ui, "show_hud_deliverable"):
+                    self.ui.show_hud_deliverable(f"@{res.get('username')} Profile", summary=res.get("bio", "No bio"), bullets=[f"Followers: {res.get('followers', 0):,}", f"Following: {res.get('following', 0):,}", f"Posts: {res.get('posts_count', 0):,}", f"Verified: {'Yes' if res.get('is_verified') else 'No'}"], kind="result")
+                result = json.dumps(res, indent=2)
 
             elif name == "instagram_reply":
                 action = args.get("action")
@@ -2722,9 +3796,9 @@ class BrahmaLive:
                 if getattr(self, "_ig_pending_thread", None):
                     thread_id = self._ig_pending_thread.get("thread_id")
                     username = self._ig_pending_thread.get("username")
+                    from actions.instagram_mcp import add_auto_thread, send_direct_reply
                     if action == "take_over":
                         self.ui.write_log("SYS: Taking over Instagram thread via tool.")
-                        from actions.instagram_chat import add_auto_thread, send_direct_reply
                         add_auto_thread(thread_id)
                         message_text = self._ig_pending_thread.get('message')
                         def _generate_and_send():
@@ -2734,17 +3808,37 @@ class BrahmaLive:
                             except Exception as e:
                                 print(f"Error taking over thread: {e}")
                         threading.Thread(target=_generate_and_send, daemon=True).start()
-                        result = f"Successfully took over the chat with {username}. The backend will now automatically reply to them."
+                        result = f"Successfully took over the chat with @{username}. The backend will now automatically reply to them."
                     else:
-                        self.ui.write_log(f"SYS: Sending manual reply to {username}.")
-                        from actions.instagram_chat import send_direct_reply
+                        self.ui.write_log(f"SYS: Sending manual reply to @{username}.")
                         send_direct_reply(thread_id, reply_text)
-                        result = f"Successfully sent the manual reply to {username}."
-                        
+                        result = f"Successfully sent manual reply to @{username} and opened thread in browser."
+
                     self._ig_reply_mode = False
                     self._ig_pending_thread = None
                 else:
-                    result = "Error: There is no pending Instagram message to reply to right now."
+                    recipient = args.get("recipient") or args.get("username")
+                    from actions.instagram_mcp import InstagramService, add_auto_thread
+                    thread_id = None
+                    if not recipient:
+                        try:
+                            inbox = InstagramService.instance().get_inbox(amount=1)
+                            if inbox:
+                                recipient = inbox[0].get("sender")
+                                thread_id = inbox[0].get("thread_id")
+                        except Exception:
+                            pass
+
+                    if recipient:
+                        if action == "take_over":
+                            add_auto_thread(thread_id or recipient)
+                            result = f"Successfully took over the chat with @{recipient}. ULTRON will now automatically reply."
+                        else:
+                            res = InstagramService.instance().send_dm(recipient, reply_text, open_in_browser=True)
+                            result = f"Sent reply to @{recipient}: '{reply_text}'. Thread opened in browser."
+                        self._ig_reply_mode = False
+                    else:
+                        result = "Could not find a recent conversation to reply to. Please specify who you want to message."
 
             elif name == "system_manager":
                 from actions.system_manager import run as sm_run
@@ -2794,17 +3888,33 @@ class BrahmaLive:
                 result = r or "Done."
 
             elif name == "presentation_builder":
-                r = await loop.run_in_executor(
-                    None,
-                    lambda: create_presentation(parameters=args, player=self.ui)
-                )
+                if not args.get("slides") and not args.get("outline"):
+                    from actions.office_generator import generate_presentation_from_prompt
+                    topic = args.get("topic") or args.get("title") or "Presentation"
+                    r = await loop.run_in_executor(
+                        None,
+                        lambda: generate_presentation_from_prompt(topic, player=self.ui, speak=self.speak)
+                    )
+                else:
+                    r = await loop.run_in_executor(
+                        None,
+                        lambda: create_presentation(parameters=args, player=self.ui)
+                    )
                 result = r or "Presentation created."
 
             elif name == "spreadsheet_builder":
-                r = await loop.run_in_executor(
-                    None,
-                    lambda: create_spreadsheet(parameters=args, player=self.ui)
-                )
+                if not args.get("worksheets") and not args.get("sheets"):
+                    from actions.office_generator import generate_spreadsheet_from_prompt
+                    topic = args.get("topic") or args.get("title") or "Spreadsheet"
+                    r = await loop.run_in_executor(
+                        None,
+                        lambda: generate_spreadsheet_from_prompt(topic, player=self.ui, speak=self.speak)
+                    )
+                else:
+                    r = await loop.run_in_executor(
+                        None,
+                        lambda: create_spreadsheet(parameters=args, player=self.ui)
+                    )
                 result = r or "Spreadsheet created."
 
 
@@ -2848,7 +3958,12 @@ class BrahmaLive:
             elif name == "smart_home_control":
                 command_text = str(args.get("command") or "").strip()
                 r = await loop.run_in_executor(None, lambda: self._smart_home.execute_command(command_text))
-                result = str((r or {}).get("detail") or "Smart-home command completed.")
+                result = str((r or {}).get("detail") or "Comando de casa inteligente concluído.")
+
+            elif name in ("smart_organizer", "desktop_organizer"):
+                from actions.desktop_organizer_mcp import smart_organizer
+                r = await loop.run_in_executor(None, lambda: smart_organizer(parameters=args, player=self.ui, speak=self.speak))
+                result = r or "Done."
 
             elif name == "desktop_control":
                 r = await loop.run_in_executor(None, lambda: desktop_control(parameters=args, player=self.ui))
@@ -2858,7 +3973,12 @@ class BrahmaLive:
                 from agent.task_queue import get_queue, TaskPriority
                 priority_map = {"low": TaskPriority.LOW, "normal": TaskPriority.NORMAL, "high": TaskPriority.HIGH}
                 priority = priority_map.get(args.get("priority", "normal").lower(), TaskPriority.NORMAL)
-                task_id  = get_queue().submit(goal=args.get("goal", ""), priority=priority, speak=self.speak)
+                task_id  = get_queue().submit(
+                    goal=args.get("goal", ""),
+                    priority=priority,
+                    speak=self.speak,
+                    player=self.ui
+                )
                 result   = f"Task started (ID: {task_id})."
 
             elif name == "web_search":
@@ -2902,6 +4022,28 @@ class BrahmaLive:
                 from actions.calendar_scheduler import calendar_scheduler
                 r = await loop.run_in_executor(None, lambda: calendar_scheduler(parameters=args, player=self.ui, speak=self.speak))
                 result = r or "Done."
+            elif name in ("google_workspace", "gmail", "google_calendar", "google_drive", "workspace") or name.startswith("workspace_"):
+                from actions.google_workspace_mcp import google_workspace
+                p = dict(args or {})
+                if name.startswith("workspace_"):
+                    parts = name.split("_", 2)
+                    if len(parts) > 1:
+                        p.setdefault("service", parts[1])
+                    if len(parts) > 2:
+                        p.setdefault("action", parts[2])
+                r = await loop.run_in_executor(None, lambda: google_workspace(parameters=p, player=self.ui, speak=self.speak))
+                result = r or "Google Workspace task completed."
+            elif name in ("system_diagnostics", "diagnostics", "os_hardware", "hardware_control", "ram_hogs", "kill_process", "brightness_control"):
+                from actions.system_diagnostics_mcp import system_diagnostics
+                p = dict(args or {})
+                if name == "ram_hogs":
+                    p.setdefault("action", "ram_hogs")
+                elif name == "kill_process":
+                    p.setdefault("action", "kill")
+                elif name == "brightness_control":
+                    p.setdefault("action", "brightness")
+                r = await loop.run_in_executor(None, lambda: system_diagnostics(parameters=p, player=self.ui, speak=self.speak))
+                result = r or "Diagnostics completed."
             elif name in ("daily_briefing", "briefing"):
                 from actions.daily_briefing import daily_briefing
                 r = await loop.run_in_executor(None, lambda: daily_briefing(parameters=args, player=self.ui, speak=self.speak))
@@ -2910,6 +4052,25 @@ class BrahmaLive:
                 from actions.unlock_device import unlock_device
                 r = await loop.run_in_executor(None, lambda: unlock_device(parameters=args, player=self.ui))
                 result = r or "Done."
+            elif name in ("auto_heal", "self_patch", "rollback"):
+                from actions.auto_heal_engine import auto_heal
+                p = dict(args or {})
+                if name == "rollback":
+                    p.setdefault("action", "rollback")
+                r = await loop.run_in_executor(None, lambda: auto_heal(parameters=p, player=self.ui, speak=self.speak))
+                result = r or "Auto-heal completed."
+            elif name in ("calorie_counter", "nutrition_scan", "food_analysis"):
+                from actions.calorie_counter import calorie_counter
+                r = await loop.run_in_executor(None, lambda: calorie_counter(parameters=args, player=self.ui, speak=self.speak))
+                result = r or "Nutrition analysis complete."
+            elif name in ("pushup_counter", "workout_tracker", "rep_counter"):
+                from actions.pushup_counter import pushup_counter
+                r = await loop.run_in_executor(None, lambda: pushup_counter(parameters=args, player=self.ui, speak=self.speak))
+                result = r or "Workout session complete."
+            elif name in ("upload_video", "video_publisher", "publish_video"):
+                from actions.upload_video import upload_video
+                r = await loop.run_in_executor(None, lambda: upload_video(parameters=args, player=self.ui, speak=self.speak))
+                result = r or "Video publishing ready."
             elif name == "shutdown_brahma":
                 self.ui.write_log("SYS: Shutdown requested.")
                 self.speak("Goodbye, sir.")
@@ -2925,21 +4086,53 @@ class BrahmaLive:
 
         except Exception as e:
             result = f"Tool '{name}' failed: {e}"
+            tb_str = traceback.format_exc()
             traceback.print_exc()
+            try:
+                from actions.auto_heal_engine import AutoHealEngine
+                AutoHealEngine.record_last_error(tb_str)
+            except Exception:
+                pass
             self.speak_error(name, e)
 
         try:
-            self.speak(f"{name.replace('_', ' ')} completed.")
-            self.ui.finish_task_workspace(result, "Task completed.", 100)
+            pass  # (silent) — do not announce internal tool completion
+            self.ui.finish_task_workspace(result, "Tarefa concluída.", 100)
+        except Exception:
+            pass
+
+        # Trigger Brahma Left Wing: Final Deliverables & Results
+        try:
+            import re
+            file_match = re.search(r'([A-Za-z]:\\[^\s"\'<>`\r\n]+\.(?:pdf|docx|xlsx|pptx|png|jpg|mp4|py|html|json|txt))', str(result))
+            detected_file = file_match.group(1).strip() if file_match else None
+            if not detected_file and "file_path" in args:
+                p_cand = Path(args["file_path"])
+                if p_cand.exists():
+                    detected_file = str(p_cand.resolve())
+
+            res_str = str(result)
+            bullets = []
+            for l in res_str.splitlines():
+                cl = l.strip()
+                if (cl.startswith(("-", "*", "•", ">")) or cl.startswith(tuple("123456789."))) and len(cl) > 3:
+                    bullets.append(cl.lstrip("-*•>0123456789. ").strip())
+                elif len(cl) > 15 and not cl.startswith("#") and len(bullets) < 4:
+                    bullets.append(cl)
+
+            self.ui.show_hud_deliverable(
+                title=f"{tool_title.upper()} DELIVERABLE",
+                summary=res_str[:160] if not bullets else "",
+                bullets=bullets[:5],
+                file_path=detected_file,
+                kind=name
+            )
         except Exception:
             pass
 
         tool_voice = self._connect_tool_voice(name, result)
         if tool_voice:
-            try:
-                self.ui.write_log(f"Brahma Echo: {tool_voice}")
-            except Exception:
-                pass
+            # Spoken below; transcription already puts it in the chat.
             try:
                 self.speak(tool_voice)
             except Exception:
@@ -2948,7 +4141,7 @@ class BrahmaLive:
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
 
-        print(f"[BRAHMA ECHO] 📤 {name} → {str(result)[:80]}")
+        print(f"[ULTRON] 📤 {name} → {str(result)[:80]}")
 
         return types.FunctionResponse(
             id=fc.id, name=name,
@@ -2996,36 +4189,66 @@ class BrahmaLive:
     async def _send_realtime(self):
         while True:
             msg = await self.out_queue.get()
-            await self.session.send_realtime_input(media=msg)
+            # The live API requires a real Blob with the sample rate embedded in
+            # the mime type. Passing a bare dict ("audio/pcm", no rate) made the
+            # model silently ignore every chunk: no reply, no transcription.
+            try:
+                blob = types.Blob(
+                    data=msg.get("data"),
+                    mime_type="audio/pcm;rate=16000",
+                )
+                await self.session.send_realtime_input(media=blob)
+            except Exception as e:
+                print(f"[ULTRON] send_realtime err: {e}")
 
     async def _listen_audio(self):
-        print("[BRAHMA ECHO] 🎤 Mic started")
+        print("[ULTRON] 🎤 Mic started")
         loop = asyncio.get_event_loop()
         import numpy as np
+        _mic_name = config_manager.get_input_device()
+        _mic_dev = audio_devices.resolve(_mic_name, "input") if _mic_name else None
+        _mic_stats = {"peak": 0.0, "frames": 0}
 
         def callback(indata, frames, time_info, status):
             with self._speaking_lock:
                 brahma_speaking = self._is_speaking
+            # Only yield the microphone to the phone while its audio queue is
+            # actually live. If this flag ever got stuck True the user's mic would
+            # stay dead and they could not talk to the assistant at all.
             if self._phone_active:
-                return
-            
-            if not self.ui.muted or getattr(self.ui, "_wakeword_listening", False):
-                # Calculate RMS volume of the chunk
-                rms = np.sqrt(np.mean(np.square(indata, dtype=np.float32)))
-                
-                # Smart Echo Gate: High threshold if AI is speaking, very low if silent
-                threshold = 1200.0 if brahma_speaking else 10.0
-                
-                if rms > threshold:
-                    data = indata.tobytes()
-                else:
-                    # Stream pure silence to keep timeline intact but prevent echo
-                    data = np.zeros_like(indata).tobytes()
-                    
+                q = getattr(self._dashboard, "_phone_audio_queue", None) if self._dashboard else None
+                if q is not None and not q.empty():
+                    return
+                self._phone_active = False
+
+            if getattr(self, "_ptt_enabled", False) and not getattr(self, "_ptt_held", False):
+                data = np.zeros_like(indata).tobytes()
                 loop.call_soon_threadsafe(
                     self.out_queue.put_nowait,
                     {"data": data, "mime_type": "audio/pcm"}
                 )
+                return
+
+            lvl = float(np.sqrt(np.mean(np.square(indata, dtype=np.float32))))
+            if lvl > _mic_stats["peak"]:
+                _mic_stats["peak"] = lvl
+            self._last_user_mic_level = lvl
+            # Always forward the real microphone signal. The live model performs
+            # its own echo handling and — critically — it can only interrupt
+            # itself (START_OF_ACTIVITY_INTERRUPTS) if it actually receives the
+            # user's voice. The old silence gate made interruption slow/impossible.
+            # Keep the mic level updated for the UI meter.
+            if not brahma_speaking and not self.ui.muted:
+                try:
+                    self.ui.set_audio_level(min(1.0, lvl / 1200.0))
+                except Exception:
+                    pass
+            data = indata.tobytes()
+
+            loop.call_soon_threadsafe(
+                self.out_queue.put_nowait,
+                {"data": data, "mime_type": "audio/pcm"}
+            )
 
         try:
             with sd.InputStream(
@@ -3033,22 +4256,31 @@ class BrahmaLive:
                 channels=CHANNELS,
                 dtype="int16",
                 blocksize=CHUNK_SIZE,
+                device=_mic_dev,
                 callback=callback,
             ):
-                print("[BRAHMA ECHO] 🎤 Mic stream open")
+                print(f"[ULTRON] 🎤 Mic stream open ({_mic_name or 'Default'})")
                 while True:
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(3)
+                    # Diagnostics: does the microphone actually hear anything?
+                    print(f"[ULTRON] 🎤 mic peak level last 3s: {_mic_stats['peak']:.1f} "
+                          f"(>8 forwards to the model)")
+                    _mic_stats["peak"] = 0.0
         except Exception as e:
-            print(f"[BRAHMA ECHO] ❌ Mic: {e}")
+            print(f"[ULTRON] ❌ Mic: {e}")
             raise
 
     async def _receive_audio(self):
-        print("[BRAHMA ECHO] 👂 Recv started")
+        print("[ULTRON] 👂 Recv started")
         out_buf, in_buf = [], []
 
         try:
             while True:
                 async for response in self.session.receive():
+                    _sru = getattr(response, "session_resumption_update", None)
+                    if _sru is not None:
+                        if getattr(_sru, "resumable", False) and getattr(_sru, "new_handle", None):
+                            self._resume_handle = _sru.new_handle
 
                     if response.data:
                         self.audio_in_queue.put_nowait(response.data)
@@ -3056,10 +4288,35 @@ class BrahmaLive:
                     if response.server_content:
                         sc = response.server_content
 
+                        # Native barge-in: the live model tells us the user cut in.
+                        # Stop the local playback immediately (drain the queue) so
+                        # the assistant actually goes quiet the instant the user
+                        # speaks, instead of finishing its buffered sentence.
+                        interrupted_now = bool(getattr(sc, "interrupted", False))
+                        if interrupted_now:
+                            # Only act if the microphone actually heard the user at a
+                            # real speaking level recently. The model also raises
+                            # "interrupted" for its own echo; acting on that chopped
+                            # every reply into one-word stutters.
+                            heard_user = float(getattr(self, "_last_user_mic_level", 0.0)) > 60.0
+                            if heard_user:
+                                try:
+                                    while not self.audio_in_queue.empty():
+                                        self.audio_in_queue.get_nowait()
+                                except Exception:
+                                    pass
+                                out_buf = []
+                                self._suppress_playback_until = time.monotonic() + 0.3
+                                self.set_speaking(False)
+
                         if sc.output_transcription and sc.output_transcription.text:
-                            self.set_speaking(True)
+                            # Do NOT re-arm "speaking" on the same message that
+                            # signalled an interruption, or the barge-in would be
+                            # undone and the reply would keep playing over the user.
+                            if not interrupted_now:
+                                self.set_speaking(True)
                             txt = sc.output_transcription.text.strip()
-                            if txt:
+                            if txt and not interrupted_now:
                                 out_buf.append(txt)
 
                         if sc.input_transcription and sc.input_transcription.text:
@@ -3082,13 +4339,31 @@ class BrahmaLive:
                             self.set_speaking(False)
 
                             full_in = " ".join(in_buf).strip()
+                            full_out = " ".join(out_buf).strip()
                             if full_in:
-                                self.ui.write_log(f"You: {full_in}")
+                                # Guard against the model transcribing its own
+                                # speech back as the user: if our spoken reply and
+                                # this "input" are basically the same text, treat
+                                # it as echo and do NOT log it as the user.
+                                in_norm = full_in.lower().strip()
+                                out_norm = full_out.lower().strip()
+                                looks_like_echo = bool(out_norm) and (
+                                    in_norm == out_norm
+                                    or in_norm in out_norm
+                                    or out_norm in in_norm
+                                )
+                                if not looks_like_echo and full_in != getattr(self, "_last_logged_in", ""):
+                                    self._last_logged_in = full_in
+                                    self.ui.write_log(f"You: {full_in}")
                             in_buf = []
 
-                            full_out = " ".join(out_buf).strip()
                             if full_out:
-                                self.ui.write_log(f"Brahma Echo: {full_out}")
+                                # Gemini Live can emit the same reply across several
+                                # turn_complete events, which showed up as duplicated
+                                # greeting lines in the chat. Only log genuinely new text.
+                                if full_out != getattr(self, "_last_logged_out", ""):
+                                    self._last_logged_out = full_out
+                                    self.ui.write_log(f"ULTRON: {full_out}")
                             out_buf = []
 
                             if full_in and len(full_in) > 5:
@@ -3099,38 +4374,94 @@ class BrahmaLive:
                                 ).start()
 
                     if response.tool_call:
+                        self.ui.set_state("EXECUTING")
                         fn_responses = []
                         for fc in response.tool_call.function_calls:
-                            print(f"[BRAHMA ECHO] 📞 {fc.name}")
+                            print(f"[ULTRON] 📞 {fc.name}")
                             fr = await self._execute_tool(fc)
                             fn_responses.append(fr)
+                        self.ui.set_state("THINKING")
                         await self.session.send_tool_response(
                             function_responses=fn_responses
                         )
 
         except Exception as e:
-            print(f"[BRAHMA ECHO] ❌ Recv: {e}")
+            print(f"[ULTRON] ❌ Recv: {e}")
             traceback.print_exc()
             raise
 
     async def _play_audio(self):
-        print("[BRAHMA ECHO] 🔊 Play started")
+        print("[ULTRON] 🔊 Play started")
         loop = asyncio.get_event_loop()
+        import numpy as np
+
+        _spk_name = config_manager.get_output_device()
+        _spk_dev = audio_devices.resolve(_spk_name, "output") if _spk_name else None
 
         stream = sd.RawOutputStream(
             samplerate=RECEIVE_SAMPLE_RATE,
             channels=CHANNELS,
             dtype="int16",
             blocksize=CHUNK_SIZE,
+            device=_spk_dev,
         )
         stream.start()
+
+        # Cancel any watchdog left over from a previous session before starting
+        # a new one, so reconnects don't stack multiple watchdogs that fight over
+        # the speaking flag.
         try:
+            old_wd = getattr(self, "_play_watchdog", None)
+            if old_wd is not None:
+                old_wd.cancel()
+        except Exception:
+            pass
+
+        async def _idle_watchdog():
+            # Safety net: if the model never sends turn_complete (dropped packet,
+            # network hiccup) _is_speaking could stay True forever. Release it only
+            # after the queue has been idle for a sustained window — a single
+            # momentary gap between audio chunks must NOT cut the current reply.
+            idle = 0.0
+            while True:
+                await asyncio.sleep(0.5)
+                try:
+                    if self.audio_in_queue.empty():
+                        idle += 0.5
+                    else:
+                        idle = 0.0
+                    if idle >= 2.5 and self._is_speaking:
+                        self.set_speaking(False)
+                        idle = 0.0
+                except Exception:
+                    pass
+        try:
+            self._play_watchdog = asyncio.create_task(_idle_watchdog())
             while True:
                 chunk = await self.audio_in_queue.get()
+                # After a barge-in, ignore any chunk that was already in flight so
+                # the assistant truly goes silent the moment the user speaks — a
+                # stale chunk would otherwise re-arm "speaking" and play on.
+                if time.monotonic() < getattr(self, "_suppress_playback_until", 0.0):
+                    continue
+                # Audio only lands in this queue when the model is actually
+                # speaking, so play it directly. The previous "drop if not
+                # _is_speaking" check raced the transcription event and chopped
+                # the first syllables off every reply.
                 self.set_speaking(True)
+                try:
+                    pcm = np.frombuffer(chunk, dtype=np.int16)
+                    lvl = float(np.sqrt(np.mean(np.square(pcm, dtype=np.float32))))
+                    self._echo.note_output(pcm, RECEIVE_SAMPLE_RATE, lvl)
+                    # Remember how loud we are playing, so the mic gate knows what
+                    # counts as "the user talking over us" versus our own echo.
+                    self._output_level = lvl
+                    self.ui.set_audio_level(min(1.0, lvl / 2500.0))
+                except Exception:
+                    pass
                 await asyncio.to_thread(stream.write, chunk)
         except Exception as e:
-            print(f"[BRAHMA ECHO] ❌ Play: {e}")
+            print(f"[ULTRON] ❌ Play: {e}")
             raise
         finally:
             self.set_speaking(False)
@@ -3179,7 +4510,7 @@ class BrahmaLive:
 
         while True:
             try:
-                print("[BRAHMA ECHO] 🔌 Connecting...")
+                print("[ULTRON] 🔌 Connecting...")
                 self.ui.set_state("THINKING")
                 config = self._build_config()
 
@@ -3187,25 +4518,28 @@ class BrahmaLive:
                 session = await asyncio.wait_for(connect_cm.__aenter__(), timeout=LIVE_CONNECT_TIMEOUT)
                 try:
                     async with asyncio.TaskGroup() as tg:
-                        self.session        = session
+                        self.session = session
                         self._loop          = asyncio.get_event_loop()
+                        _LIVE_READY.set()
                         self.audio_in_queue = asyncio.Queue()
                         self.out_queue      = asyncio.Queue()  # Fix: removed maxsize=10 to prevent dropping packets
                         
-                        print("[BRAHMA ECHO] ✅ Connected.")
+                        print("[ULTRON] ✅ Connected.")
                         try:
                             self.ui.boot_set_step_status("Connect AI backend", "done")
                             self.ui.boot_set_progress(75, "AI backend connected")
                         except Exception:
                             pass
                         self.ui.set_state("LISTENING")
-                        self.ui.write_log("SYS: Brahma Echo online.")
 
                         tg.create_task(self._send_realtime())
                         tg.create_task(self._listen_audio())
-                        tg.create_task(self._relay_phone_audio())
                         tg.create_task(self._receive_audio())
                         tg.create_task(self._play_audio())
+                        # NOTE: _relay_phone_audio is started once in run() (outside
+                        # this loop). Starting it here too spawned a duplicate on
+                        # every reconnect, leaking tasks that all fought over the
+                        # same phone-audio queue.
                         try:
                             self.ui.boot_set_step_status("Initialize audio", "done")
                             self.ui.boot_set_progress(92, "Audio subsystems online")
@@ -3224,15 +4558,16 @@ class BrahmaLive:
                         pass
                     
             except Exception as e:
-                print(f"[BRAHMA ECHO] ⚠️ {e}")
+                print(f"[ULTRON] ⚠️ {e}")
                 traceback.print_exc()
                 if _is_gemini_limit_error(e):
                     self._use_openrouter_first = True
                 self.session = None
                 self._loop = None
+                _LIVE_READY.clear()
             self.set_speaking(False)
             self.ui.set_state("LISTENING")
-            print("[BRAHMA ECHO] 🔄 Reconnecting in 5s...")
+            print("[ULTRON] 🔄 Reconnecting in 5s...")
             await asyncio.sleep(5)
 
 def main():
@@ -3251,7 +4586,7 @@ def main():
     if DashboardServer is not None and not dashboard_enabled:
         _startup_log("dashboard disabled: port 8000 already in use")
         try:
-            ui.write_log("SYS: Mobile Connect is already running in another Brahma Echo instance.")
+            ui.write_log("SYS: Mobile Connect is already running in another ULTRON instance.")
         except Exception:
             pass
     if dashboard_enabled:
@@ -3350,7 +4685,11 @@ def main():
         print(f"DEBUG: start_ig_daemon is {start_ig_daemon}")
         
         if start_ig_daemon:
-            from actions.instagram_chat import set_ig_prompt_callback
+            try:
+                from actions.instagram_mcp import set_ig_prompt_callback
+            except ImportError:
+                from actions.instagram_chat import set_ig_prompt_callback
+
             def _ig_handler(thread_id, username, text, is_auto):
                 if is_auto:
                     return _ig_gemini_reply(username, text)
@@ -3361,14 +4700,37 @@ def main():
                         "username": username,
                         "message": text
                     }
-                    msg = f"You have a new Instagram message from {username}. What should I reply, or should I take over the chat?"
-                    ui.write_log(f"📱 Insta ({username}): {text}")
-                    ui.write_log(f"Brahma Echo: {msg}")
+                    clean_text = (text or "").strip()
+                    snippet = f": '{clean_text[:75]}...'" if len(clean_text) > 75 else (f": '{clean_text}'" if clean_text else "")
+                    msg = f"Você recebeu uma nova mensagem no Instagram de {username}{snippet}. O que devo responder, ou devo assumir a conversa?"
+                    ui.write_log(f"📱 Insta (@{username}): {clean_text or '[Media/Attachment]'}")
                     brahma_echo.speak(msg)
                     return None
-                
+
             set_ig_prompt_callback(_ig_handler)
             start_ig_daemon()
+
+        # Background Email Watcher
+        try:
+            from actions.google_workspace_mcp import (
+                start_email_daemon,
+                set_email_prompt_callback,
+                get_stored_gmail_credentials,
+            )
+            gmail_addr, gmail_pw = get_stored_gmail_credentials()
+            if gmail_addr and gmail_pw:
+                def _email_handler(sender, subject, msg_id):
+                    clean_subj = (subject or "No Subject").strip()
+                    subj_preview = f"'{clean_subj[:70]}...'" if len(clean_subj) > 70 else f"'{clean_subj}'"
+                    msg = f"Você recebeu um novo e-mail de {sender} com o assunto: {subj_preview}."
+                    ui.write_log(f"📧 Email ({sender}): {clean_subj}")
+                    brahma_echo.speak(msg)
+
+                set_email_prompt_callback(_email_handler)
+                start_email_daemon(poll_interval=25)
+                print("[ULTRON] Background email watcher started.")
+        except Exception as e:
+            print(f"[ULTRON] Email daemon initialization notice: {e}")
 
         def _clipboard_monitor():
             try:
@@ -3385,7 +4747,7 @@ def main():
                         text = (curr_clip or "").strip()
                         if text and len(text) > 3:
                             reply = _clipboard_gemini_reply(text[:1000])
-                            ui.write_log(f"Brahma Echo (Clipboard): {reply}")
+                            ui.write_log(f"ULTRON (Clipboard): {reply}")
                             brahma_echo.speak(reply)
                 except Exception:
                     pass
@@ -3401,24 +4763,13 @@ def main():
         threading.Thread(target=runner, daemon=True).start()
 
     start_runner()
-    try:
-        ui.play_boot_sequence(
-            finished_callback=lambda: threading.Thread(
-                target=_speak_daily_briefing,
-                args=(ui,),
-                daemon=True,
-                name="daily-briefing",
-            ).start()
-        )
-    except Exception:
-        ui.show_main()
-        start_runner()
-        threading.Thread(
-            target=_speak_daily_briefing,
-            args=(ui,),
-            daemon=True,
-            name="daily-briefing",
-        ).start()
+    ui.show_main()
+    threading.Thread(
+        target=_speak_daily_briefing,
+        args=(ui,),
+        daemon=True,
+        name="daily-briefing",
+    ).start()
     ui.root.mainloop()
 
 

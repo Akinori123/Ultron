@@ -227,7 +227,7 @@ def open_app(
     app_name = (parameters or {}).get("app_name", "").strip()
 
     if not app_name:
-        return "Please specify which application to open, sir."
+        return "Por favor, especifique qual aplicativo abrir, senhor."
 
     system   = platform.system()
     launcher = _OS_LAUNCHERS.get(system)

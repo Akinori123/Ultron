@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import json
-import re
-import sys
 from pathlib import Path
 from typing import Any
 
+from actions.brahma_dev_agent import run_dev_agent
 from actions.dev_agent import dev_agent
-from actions.website_builder import website_builder
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -38,58 +36,24 @@ def _selected_workspace(parameters: dict[str, Any]) -> str:
     ).strip()
 
 
-def _looks_like_website_request(text: str) -> bool:
-    low = (text or "").lower()
-    tokens = (
-        "website",
-        "landing page",
-        "homepage",
-        "home page",
-        "web page",
-        "portfolio",
-        "product site",
-        "business site",
-        "marketing site",
-        "site",
-        "web app",
-        "frontend",
-        "ui",
-    )
-    return any(token in low for token in tokens)
-
-
-def _looks_like_calculator_request(text: str) -> bool:
-    low = (text or "").lower()
-    return any(token in low for token in (
-        "calculator",
-        "calc",
-        "simple calculator",
-        "math calculator",
-        "html calculator",
-    ))
-
-
 def run_developer_mode_request(parameters: dict[str, Any], speak=None) -> str:
     params = dict(parameters or {})
-    description = str(params.get("description") or "").strip()
+    description = str(params.get("description") or params.get("brief") or "").strip()
     workspace = _selected_workspace(params)
 
     if not workspace:
-        return "Developer mode needs a selected workspace folder first."
+        workspace = str(Path.home() / "Desktop" / "BrahmaProjects")
+        Path(workspace).mkdir(parents=True, exist_ok=True)
 
     params["workspace_path"] = workspace
     params["output_dir"] = workspace
 
-    if _looks_like_website_request(description) or _looks_like_calculator_request(description):
-        if _looks_like_calculator_request(description):
-            params.setdefault("site_name", params.get("title") or "Calculator")
-            params.setdefault("brief", description)
-            params["project_type"] = "calculator"
-        else:
-            params.setdefault("site_name", params.get("title") or "Website")
-            params.setdefault("brief", description)
-        return website_builder(params, player=None)
+    # Run native Brahma Dev Agent powered by Claude Code architecture & tools
+    try:
+        return run_dev_agent(params, speak=speak)
+    except Exception as exc:
+        print(f"[ClaudeBridge] BrahmaDevAgent encountered error: {exc}, falling back to legacy dev agent")
+        params.setdefault("language", params.get("language") or "python")
+        params.setdefault("project_name", params.get("project_name") or "brahma_project")
+        return dev_agent(params, player=None, speak=speak)
 
-    params.setdefault("language", params.get("language") or "python")
-    params.setdefault("project_name", params.get("project_name") or "brahma_project")
-    return dev_agent(params, player=None, speak=speak)

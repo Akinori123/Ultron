@@ -217,11 +217,11 @@ def spotify_controller(
 
     elif action in ("next", "skip", "next_track"):
         _press_media_key("nexttrack")
-        return "Skipped to next song."
+        return "Pulou para a próxima música."
 
     elif action in ("previous", "prev", "previous_track", "back"):
         _press_media_key("prevtrack")
-        return "Playing previous song."
+        return "Reproduzindo a música anterior."
 
     elif action in ("volume_up", "vol_up"):
         for _ in range(6):
@@ -270,7 +270,7 @@ def spotify_controller(
             _open_url_in_chrome(direct_url)
             if player:
                 try:
-                    player.write_log(f"Brahma Echo: Playing '{query}' in Google Chrome")
+                    player.write_log(f"ULTRON: Reproduzindo '{query}' no Google Chrome")
                 except Exception:
                     pass
             return f"Playing '{query}' in Google Chrome."
@@ -283,7 +283,7 @@ def spotify_controller(
             daemon=True
         ).start()
 
-        return f"Opened and playing '{query}' in Google Chrome."
+        return f"Aberto e reproduzindo '{query}' no Google Chrome."
 
     else:
         if query:
@@ -293,5 +293,5 @@ def spotify_controller(
 
 
 def run(parameters: dict, player=None, session_memory=None) -> str:
-    """Plugin wrapper for Mark-LI architecture."""
+    """Plugin wrapper for Brahma architecture."""
     return spotify_controller(parameters, player=player, session_memory=session_memory)

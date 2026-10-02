@@ -29,13 +29,13 @@ def reminder(
     message  = parameters.get("message", "Reminder")
 
     if not date_str or not time_str:
-        return "I need both a date and a time to set a reminder."
+        return "Preciso de uma data e um horário para definir um lembrete."
 
     try:
         target_dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
 
         if target_dt <= datetime.now():
-            return "That time is already in the past."
+            return "Esse horário já passou."
 
         task_name    = f"MARKReminder_{target_dt.strftime('%Y%m%d_%H%M')}"
         safe_message = message.replace('"', '').replace("'", "").strip()[:200]
@@ -142,7 +142,7 @@ except Exception:
                 os.remove(notify_script)
             except Exception:
                 pass
-            return "I couldn't schedule the reminder due to a system error."
+            return "Não consegui agendar o lembrete devido a um erro de sistema."
 
         if player:
             player.write_log(f"[reminder] set for {date_str} {time_str}")
@@ -150,7 +150,7 @@ except Exception:
         return f"Reminder set for {target_dt.strftime('%B %d at %I:%M %p')}."
 
     except ValueError:
-        return "I couldn't understand that date or time format."
+        return "Não consegui entender esse formato de data ou hora."
 
     except Exception as e:
         return f"Something went wrong while scheduling the reminder: {str(e)[:80]}"

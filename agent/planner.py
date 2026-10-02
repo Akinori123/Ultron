@@ -3,6 +3,12 @@ import re
 import sys
 from pathlib import Path
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 
 def get_base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -21,11 +27,27 @@ ABSOLUTE RULES:
 - NEVER use generated_code or write Python scripts. It does not exist.
 - NEVER reference previous step results in parameters. Every step is independent.
 - Use web_search for ANY information retrieval, research, or current data.
-- Use file_controller to save content to disk.
+- Use pdf_document to create, compile, or generate PDF files (NEVER use file_controller for .pdf files).
+- Use word_document to create or generate Word (.docx) documents.
+- Use file_controller to save text/code files to disk.
 - Use cmd_control to open files or run system commands.
 - Max 5 steps. Use the minimum steps needed.
 
 AVAILABLE TOOLS AND THEIR PARAMETERS:
+
+pdf_document
+  action: "create" | "convert" | "create_letter" (default: create)
+  title: string (required) — clear descriptive title for the PDF document
+  subtitle: string (optional) — brief subtitle
+  content: string (required) — full report or summary text to format into the PDF
+  output_path: string (optional, e.g. "downloads" or full path ending in .pdf)
+  auto_open: boolean (optional, default: true)
+
+word_document
+  action: "create" | "convert" (default: create)
+  title: string (required)
+  content: string (required)
+  output_path: string (optional)
 
 open_app
   app_name: string (required)
@@ -44,11 +66,17 @@ game_updater
   shutdown_when_done: boolean (optional)
 
 browser_control
-  action: "go_to" | "search" | "click" | "type" | "scroll" | "get_text" | "press" | "close" (required)
-  url: string (for go_to)
-  query: string (for search)
-  text: string (for click/type)
+  action: "go_to" | "search" | "click" | "hover" | "type" | "press" | "scroll" | "fill_form" | "snapshot" | "find" | "evaluate" | "screenshot" | "tabs" | "wait_for" | "select_option" | "upload" | "close" (required)
+  url: string (for go_to / navigate)
+  query: string (for search / find)
+  text: string (for click / type / wait_for)
+  selector: string (CSS selector or element ref e.g. "e2")
+  element: string (element ref from snapshot)
+  fields: dict or list of fields (for fill_form)
   direction: "up" | "down" (for scroll)
+  key: string (for press, e.g. "Enter", "Tab", "Escape")
+  expression: string (for evaluate, JavaScript expression)
+  path: string (for screenshot / upload)
 
 file_controller
   action: "write" | "create_file" | "read" | "list" | "delete" | "move" | "copy" | "find" | "disk_usage" (required)
@@ -91,9 +119,15 @@ reminder
   message: string (required)
 
 desktop_control
-  action: "wallpaper" | "organize" | "clean" | "list" | "task" (required)
+  action: "wallpaper" | "organize" | "preview" | "clean" | "undo" | "list" | "task" (required)
   path: string (optional)
   task: string (optional)
+
+smart_organizer
+  action: "preview" | "organize" | "undo" | "find_duplicates" | "clean_empty_folders" | "archive_old" (required)
+  target: "desktop" | "downloads" | "documents" | "pictures" | string folder path (optional)
+  mode: "by_type" | "by_date" (optional)
+  days: integer (optional)
 
 youtube_video
   action: "play" | "summarize" | "trending" (required)
@@ -127,6 +161,54 @@ claude_code
   description: string (required)
   workspace_path: string (optional)
   Use for all coding, website, project, file-editing, and developer requests.
+
+presentation_builder
+  topic: string (required) — topic, theme or title of the presentation
+  theme: "corporate" | "neon" | "luxury" | "academic" | "sunset" | "creative" (optional)
+  Use whenever user asks to create, build, design or make a presentation, ppt, pitch deck, or slideshow.
+
+spreadsheet_builder
+  topic: string (required) — purpose, topic or title of the spreadsheet
+  Use whenever user asks to create, build, or generate a spreadsheet, Excel sheet, budget, tracker, or workbook.
+
+google_workspace
+  service: "gmail" | "calendar" | "drive" (required)
+  action: "list" | "read" | "send" | "unread" | "search" | "create" | "delete" | "upload" (required)
+  query: string (for email or drive search)
+  message_id: string (for reading email)
+  to: string (for sending email)
+  subject: string (for email subject)
+  body: string (for email body)
+  title: string (for calendar event)
+  date: string (for calendar date YYYY-MM-DD or today/tomorrow)
+  time: string (for calendar time HH:MM)
+  duration_minutes: number (optional, default: 30)
+  filename: string (for drive file read/search)
+  path: string (for drive upload)
+  Use whenever user asks to check/send emails, read/search Gmail, check/schedule calendar meetings, or search Google Drive files.
+
+system_diagnostics
+  action: "status" | "ram_hogs" | "cpu_hogs" | "kill" | "brightness" | "battery" | "disk" (required)
+  target: string (for kill, process name e.g. "chrome" or PID)
+  level: number (for brightness, 0-100)
+  monitor: string | number (for brightness, optional target monitor)
+  relative: boolean (optional, if level is +10 or -10)
+  limit: number (for ram_hogs/cpu_hogs, default: 5)
+  Use whenever user asks to check RAM usage, find RAM/CPU hogs, check battery health, adjust screen brightness, terminate/kill frozen apps, or get full hardware telemetry.
+
+auto_heal
+  action: "status" | "heal" | "history" | "rollback" | "learn_rule" | "list_rules" (required)
+  error_traceback: string (optional, exception traceback or error to repair)
+  rule_text: string (optional, for learn_rule)
+  category: string (optional, for learn_rule: general, formatting, workflow, habit)
+  patch_id: string (optional, for rollback)
+  Use whenever user asks to fix an error/bug, heal/patch Brahma, undo/rollback a patch, view patch history, or remember a permanent rule/behavioral preference.
+
+mobile_autopilot
+  instruction: string (required) — what to do on the phone
+  target: string (optional) — phone device name
+  Use whenever user asks to do complex multi-step workflows on their phone (e.g., "open Instagram and message X", "play jazz on youtube on my phone").
+
 EXAMPLES:
 
 Goal: "research mechanical engineering and save it to a notepad file"
@@ -256,20 +338,32 @@ def create_plan(goal: str, context: str = "") -> dict:
     import google.generativeai as genai
 
     genai.configure(api_key=_get_api_key())
-    model = genai.GenerativeModel(
-        model_name="gemini-2.5-flash-lite",
-        system_instruction=PLANNER_PROMPT
-    )
-
+    candidates = ["gemini-3.1-flash-lite", "gemini-3.5-flash", "gemini-flash-latest"]
+    
     user_input = f"Goal: {goal}"
     if context:
         user_input += f"\n\nContext: {context}"
 
-    try:
-        response = model.generate_content(user_input)
-        text     = response.text.strip()
-        text     = re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
+    text = None
+    for model_name in candidates:
+        try:
+            model = genai.GenerativeModel(
+                model_name=model_name,
+                system_instruction=PLANNER_PROMPT
+            )
+            response = model.generate_content(user_input)
+            if response.text:
+                text = response.text.strip()
+                break
+        except Exception as e:
+            print(f"[Planner] ⚠️ {model_name} planning error: {e}")
+            continue
 
+    if not text:
+        return _fallback_plan(goal)
+
+    try:
+        text = re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
         plan = json.loads(text)
 
         if "steps" not in plan or not isinstance(plan["steps"], list):
@@ -325,10 +419,7 @@ def replan(goal: str, completed_steps: list, failed_step: dict, error: str) -> d
     import google.generativeai as genai
 
     genai.configure(api_key=_get_api_key())
-    model = genai.GenerativeModel(
-        model_name="gemini-2.5-flash",
-        system_instruction=PLANNER_PROMPT
-    )
+    candidates = ["gemini-3.1-flash-lite", "gemini-3.5-flash", "gemini-flash-latest"]
 
     completed_summary = "\n".join(
         f"  - Step {s['step']} ({s['tool']}): DONE" for s in completed_steps
@@ -344,11 +435,26 @@ Error: {error}
 
 Create a REVISED plan for the remaining work only. Do not repeat completed steps."""
 
+    text = None
+    for model_name in candidates:
+        try:
+            model = genai.GenerativeModel(
+                model_name=model_name,
+                system_instruction=PLANNER_PROMPT
+            )
+            response = model.generate_content(prompt)
+            if response.text:
+                text = response.text.strip()
+                break
+        except Exception as e:
+            print(f"[Planner] ⚠️ {model_name} replan error: {e}")
+            continue
+
     try:
-        response = model.generate_content(prompt)
-        text     = response.text.strip()
-        text     = re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
-        plan     = json.loads(text)
+        if not text:
+            raise ValueError("All models failed during replanning")
+        text = re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
+        plan = json.loads(text)
 
         for step in plan.get("steps", []):
             _rewrite_generated_step(step, goal)

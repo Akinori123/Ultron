@@ -339,35 +339,53 @@ def _cleanup_current_audio() -> None:
         _current_audio_path = None
 
 
+def _pick_edge_voice(text: str) -> str:
+    # Pick an Edge TTS voice that matches the language of the text.
+    # Defaults to Brazilian Portuguese so the assistant never speaks English
+    # with an American accent when it is meant to answer in Portuguese.
+    t = (text or "").strip().lower()
+    if not t:
+        return "pt-BR-AntonioNeural"
+    # Portuguese heuristic: accented characters / common words
+    if any(ch in t for ch in "áàâãéêíóôõúçü"):
+        return "pt-BR-AntonioNeural"
+    pt_words = (" que ", " para ", " com ", " uma ", " o ", " a ", " de ", " do ",
+                " da ", " não ", " sim ", " você ", " senhor", " está ", " olá", " bom dia", " boa tarde", " boa noite")
+    if any(w in f" {t} " for w in pt_words):
+        return "pt-BR-AntonioNeural"
+    # Very small English detector; anything else falls back to pt-BR too.
+    en_words = (" the ", " and ", " with ", " your ", " you ", " this ", " is ", " are ", " for ")
+    if any(w in f" {t} " for w in en_words):
+        return "en-US-GuyNeural"
+    return "pt-BR-AntonioNeural"
+
+
 def _speak_edge_native(text: str) -> None:
     global _current_player_alias, _current_audio_path
     text = (text or "").strip()
     if not text:
         return
-
     try:
         import edge_tts
     except Exception as exc:  # pragma: no cover
         print(f"[AttentionMonitor] Edge TTS import failed: {exc}")
         return
-
     try:
         _cleanup_current_audio()
     except Exception:
         pass
-
-    audio_path = os.path.join(tempfile.gettempdir(), f"brahma_edge_tts_{uuid.uuid4().hex}.mp3")
+    audio_path = os.path.join(tempfile.gettempdir(), f"ultron_edge_tts_{uuid.uuid4().hex}.mp3")
     try:
-        # Use a male neural voice for app speech so daily briefing and alerts sound
-        # closer to Brahma's normal male audio output.
-        communicator = edge_tts.Communicate(text, voice="en-US-GuyNeural")
+        # Match the voice to the language of the text (pt-BR by default) so the
+        # assistant speaks Portuguese naturally instead of English.
+        communicator = edge_tts.Communicate(text, voice=_pick_edge_voice(text))
         communicator.save_sync(audio_path)
     except Exception as exc:  # pragma: no cover
         print(f"[AttentionMonitor] Edge TTS generation failed: {exc}")
         _cleanup_current_audio()
         return
 
-    player_alias = f"brahma_tts_{uuid.uuid4().hex}"
+    player_alias = f"ultron_tts_{uuid.uuid4().hex}"
     try:
         result = ctypes.windll.winmm.mciSendStringW(
             f'open "{audio_path}" type mpegvideo alias {player_alias}',
@@ -395,12 +413,10 @@ def _speak_edge_native(text: str) -> None:
         return
 
 
-_speech_sink = None
-
-
-def set_speech_sink(sink_fn) -> None:
-    global _speech_sink
-    _speech_sink = sink_fn
+def has_speech_sink() -> bool:
+    # True once a live voice sink is wired up, so callers can wait instead of
+    # racing startup and falling back to a second TTS engine (double voice)."
+    return _speech_sink is not None
 
 
 def speak_native(text: str) -> None:
@@ -473,39 +489,39 @@ def _click_best_button(app: str, action: str) -> bool:
 def handle_call_action(event: dict, action: str) -> str:
     app = _norm(event.get("app") or "")
     if not app:
-        return "No app was detected for that call."
+        return "Nenhum aplicativo foi detectado para essa chamada."
 
     if action in {"pick_up", "answer", "accept"}:
         if _click_best_button(app, "accept"):
-            return f"Picked up the call on {event.get('app', 'the app')}."
+            return f"Atendi a chamada em {event.get('app', 'o app')}."
         if _focus_window_by_app(app):
             try:
                 pyautogui.press("enter")
-                return f"Tried to pick up the call on {event.get('app', 'the app')}."
+                return f"Tentei atender a chamada em {event.get('app', 'o app')}."
             except Exception:
                 pass
-        return f"I found the call on {event.get('app', 'the app')}, but could not confirm the answer button."
+        return f"Encontrei a chamada em {event.get('app', 'o app')}, mas não consegui confirmar o botão de atender."
 
     if action in {"ignore", "decline", "reject", "cut"}:
         if _click_best_button(app, "decline"):
-            return f"Declined the call on {event.get('app', 'the app')}."
+            return f"Recusei a chamada em {event.get('app', 'o app')}."
         if _focus_window_by_app(app):
             try:
                 pyautogui.press("esc")
-                return f"Tried to decline the call on {event.get('app', 'the app')}."
+                return f"Tentei recusar a chamada em {event.get('app', 'o app')}."
             except Exception:
                 pass
-        return f"I found the call on {event.get('app', 'the app')}, but could not confirm the decline button."
+        return f"Encontrei a chamada em {event.get('app', 'o app')}, mas não consegui confirmar o botão de recusar."
 
-    return "Unknown call action."
+    return "Ação de chamada desconhecida."
 
 
 def read_event_preview(event: dict) -> str:
     preview = (event.get("preview") or "").strip()
     app = (event.get("app") or "the app").strip()
     if preview:
-        return f"You received a message on {app}. {preview}"
-    return f"You received a message on {app}."
+        return f"Você recebeu uma mensagem em {app}. {preview}"
+    return f"Você recebeu uma mensagem em {app}."
 
 
 @dataclass

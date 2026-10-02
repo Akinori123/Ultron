@@ -209,7 +209,7 @@ def _clipboard_get() -> str:
         return pyperclip.paste()
     _hotkey("ctrl", "c")
     time.sleep(0.2)
-    return "(copied — pyperclip unavailable for read)"
+    return "(copiado — pyperclip indisponível para leitura)"
 
 
 def _clipboard_paste(text: str) -> str:
@@ -442,7 +442,7 @@ def computer_control(
                 time.sleep(0.2)
                 _click(x=coords[0], y=coords[1])
                 return f"Clicked '{desc}' at {coords}"
-            return f"Element not found on screen: '{desc}'"
+            return f"Elemento não encontrado na tela: '{desc}'"
 
         if action == "wait":
             secs = float(params.get("seconds", 1.0))

@@ -6,7 +6,13 @@ import subprocess
 import tempfile
 import os
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Any
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 from agent.planner       import create_plan, replan
 from agent.error_handler import analyze_error, generate_fix, ErrorDecision
@@ -30,7 +36,7 @@ def _run_generated_code(description: str, speak: Callable | None = None) -> str:
     import google.generativeai as genai
 
     if speak:
-        speak("Writing custom code for this task, sir.")
+        speak("Escrevendo código personalizado para esta tarefa, senhor.")
 
     home      = Path.home()
     desktop   = home / "Desktop"
@@ -48,7 +54,7 @@ def _run_generated_code(description: str, speak: Callable | None = None) -> str:
 
     genai.configure(api_key=_get_api_key())
     model = genai.GenerativeModel(
-        model_name="gemini-2.5-flash",
+        model_name="gemini-3.1-flash-lite",
         system_instruction=(
             "You are an expert Python developer. "
             "Write clean, complete, working Python code. "
@@ -95,10 +101,10 @@ def _run_generated_code(description: str, speak: Callable | None = None) -> str:
         if result.returncode == 0 and output:
             return output
         elif result.returncode == 0:
-            return "Task completed successfully."
+            return "Tarefa concluída com sucesso."
         elif error:
             raise RuntimeError(f"Code error: {error[:400]}")
-        return "Completed."
+        return "Concluído."
 
     except subprocess.TimeoutExpired:
         raise RuntimeError("Generated code timed out after 120 seconds.")
@@ -112,25 +118,41 @@ def _inject_context(params: dict, tool: str, step_results: dict, goal: str = "")
         return params
 
     params = dict(params)
+    if goal:
+        params["goal"] = goal
 
-    if tool == "file_controller" and params.get("action") in ("write", "create_file"):
+    if tool in ("pdf_document", "create_pdf", "pdf_tools", "word_document", "docx_tools"):
+        content = params.get("content", "")
+        all_results = [
+            v for v in step_results.values()
+            if v and len(v) > 80 and v not in ("Done.", "Completed.", "Tarefa concluída com sucesso.")
+        ]
+        if all_results and (not content or len(content) < 500):
+            combined = "\n\n---\n\n".join(all_results)
+            translated = _translate_to_goal_language(combined, goal)
+            params["content"] = translated
+            print(f"[Executor] 💉 Injected research results into {tool}")
+
+    elif tool == "file_controller" and params.get("action") in ("write", "create_file"):
         content = params.get("content", "")
         if not content or len(content) < 50:
             all_results = [
                 v for v in step_results.values()
-                if v and len(v) > 100 and v not in ("Done.", "Completed.")
+                if v and len(v) > 100 and v not in ("Done.", "Completed.", "Tarefa concluída com sucesso.")
             ]
             if all_results:
                 combined = "\n\n---\n\n".join(all_results)
                 translated = _translate_to_goal_language(combined, goal)
                 params["content"] = translated
-                print(f"[Executor] 💉 Injected + translated content")
+                print(f"[Executor] 💉 Injected + translated content into {tool}")
 
     return params
+
+
 def _detect_language(text: str) -> str:
     import google.generativeai as genai
     genai.configure(api_key=_get_api_key())
-    model = genai.GenerativeModel("gemini-2.5-flash-lite")
+    model = genai.GenerativeModel("gemini-3.1-flash-lite")
     try:
         response = model.generate_content(
             f"What language is this text written in? "
@@ -148,7 +170,7 @@ def _translate_to_goal_language(content: str, goal: str) -> str:
     try:
         import google.generativeai as genai
         genai.configure(api_key=_get_api_key())
-        model = genai.GenerativeModel("gemini-2.5-flash")
+        model = genai.GenerativeModel("gemini-3.1-flash-lite")
 
         target_lang = _detect_language(goal)
         print(f"[Executor] 🌐 Translating to: {target_lang}")
@@ -171,29 +193,63 @@ def _translate_to_goal_language(content: str, goal: str) -> str:
         print(f"[Executor] ⚠️ Translation failed: {e}")
         return content
 
-def _call_tool(tool: str, parameters: dict, speak: Callable | None) -> str:
+def _call_tool(tool: str, parameters: dict, speak: Callable | None, player: Any = None) -> str:
+    # Live Thinking Out Loud Breadcrumb
+    params = parameters or {}
+    breadcrumb = {
+        "web_search": f"Searching: {params.get('query', 'the web')[:30]}...",
+        "pdf_document": "Generating PDF document...",
+        "word_document": "Formatting Word document...",
+        "open_app": f"Launching {params.get('app_name', 'application')}...",
+        "browser_control": "Navigating browser...",
+        "file_controller": "Managing files...",
+        "screen_process": "Inspecting display...",
+        "office_builder": "Synthesizing presentation...",
+        "system_diagnostics": "Checking system diagnostics...",
+    }.get(tool, f"Running {tool}...")
 
-    if tool == "open_app":
+    if player and hasattr(player, "ui"):
+        try:
+            player.ui.set_state("THINKING", detail=breadcrumb)
+            player.ui.write_log(f"THINKING: {breadcrumb}")
+        except Exception:
+            pass
+
+    if tool in ("pdf_document", "create_pdf", "pdf_tools"):
+        from actions.pdf_tools import create_pdf
+        p = dict(parameters or {})
+        p.setdefault("auto_open", True)
+        return create_pdf(parameters=p, player=player) or "PDF created."
+
+    elif tool in ("word_document", "docx_tools"):
+        from actions.docx_tools import word_document
+        p = dict(parameters or {})
+        return word_document(parameters=p, player=player, speak=speak) or "Word document created."
+
+    elif tool == "open_app":
         from actions.open_app import open_app
-        return open_app(parameters=parameters, player=None) or "Done."
+        return open_app(parameters=parameters, player=player) or "Done."
 
     elif tool == "web_search":
         from actions.web_search import web_search
-        return web_search(parameters=parameters, player=None) or "Done."
+        return web_search(parameters=parameters, player=player) or "Done."
     elif tool == "game_updater":
         from actions.game_updater import game_updater
-        return game_updater(parameters=parameters, player=None, speak=speak) or "Done."
-    elif tool == "browser_control":
+        return game_updater(parameters=parameters, player=player, speak=speak) or "Done."
+    elif tool == "browser_control" or tool.startswith("browser_"):
         from actions.browser_control import browser_control
-        return browser_control(parameters=parameters, player=None) or "Done."
+        p = dict(parameters or {})
+        if tool.startswith("browser_"):
+            p.setdefault("action", tool.replace("browser_", ""))
+        return browser_control(parameters=p, player=player) or "Done."
 
     elif tool == "file_controller":
         from actions.file_controller import file_controller
-        return file_controller(parameters=parameters, player=None) or "Done."
+        return file_controller(parameters=parameters, player=player) or "Done."
 
     elif tool == "cmd_control":
         from actions.cmd_control import cmd_control
-        return cmd_control(parameters=parameters, player=None) or "Done."
+        return cmd_control(parameters=parameters, player=player) or "Done."
 
     elif tool == "claude_code":
         from actions.claude_code_bridge import run_developer_mode_request
@@ -203,8 +259,12 @@ def _call_tool(tool: str, parameters: dict, speak: Callable | None) -> str:
 
     elif tool == "screen_process":
         from actions.screen_processor import screen_process
-        screen_process(parameters=parameters, player=None)
-        return "Screen captured and analyzed."
+        screen_process(parameters=parameters, player=player)
+        return "Tela capturada e analisada."
+
+    elif tool in ("mobile_autopilot", "android_autopilot"):
+        from actions.mobile_autopilot import mobile_autopilot
+        return mobile_autopilot(parameters=parameters, player=player) or "Done."
 
     elif tool == "send_message":
         from actions.send_message import send_message
@@ -225,6 +285,10 @@ def _call_tool(tool: str, parameters: dict, speak: Callable | None) -> str:
     elif tool == "computer_settings":
         from actions.computer_settings import computer_settings
         return computer_settings(parameters=parameters, player=None) or "Done."
+
+    elif tool in ("smart_organizer", "desktop_organizer"):
+        from actions.desktop_organizer_mcp import smart_organizer
+        return smart_organizer(parameters=parameters, player=player) or "Done."
 
     elif tool == "desktop_control":
         from actions.desktop import desktop_control
@@ -266,19 +330,59 @@ def _call_tool(tool: str, parameters: dict, speak: Callable | None) -> str:
 
     elif tool == "calorie_counter":
         from actions.calorie_counter import run as run_calorie_counter
-        return run_calorie_counter(parameters=parameters, player=None) or "Done."
+        return run_calorie_counter(parameters=parameters, player=None, speak=speak) or "Done."
 
     elif tool == "pushup_counter":
         from actions.pushup_counter import run as run_pushup_counter
-        return run_pushup_counter(parameters=parameters, player=None) or "Done."
+        return run_pushup_counter(parameters=parameters, player=None, speak=speak) or "Done."
 
     elif tool == "system_monitor":
-        from actions.system_monitor import run as run_system_monitor
-        return run_system_monitor(parameters=parameters, player=None) or "Done."
+        from actions.system_diagnostics_mcp import system_diagnostics
+        return system_diagnostics(parameters={"action": "ram_hogs"}, player=None, speak=speak) or "Done."
 
     elif tool == "upload_video":
         from actions.upload_video import run as run_upload_video
-        return run_upload_video(parameters=parameters, player=None) or "Done."
+        return run_upload_video(parameters=parameters, player=None, speak=speak) or "Done."
+
+    elif tool in ("presentation_builder", "presentation", "create_presentation"):
+        from actions.office_generator import generate_presentation_from_prompt
+        topic = parameters.get("topic") or parameters.get("title") or parameters.get("description") or "Presentation"
+        return generate_presentation_from_prompt(topic, player=None, speak=speak) or "Presentation created."
+
+    elif tool in ("spreadsheet_builder", "spreadsheet", "create_spreadsheet"):
+        from actions.office_generator import generate_spreadsheet_from_prompt
+        topic = parameters.get("topic") or parameters.get("title") or parameters.get("description") or "Spreadsheet"
+        return generate_spreadsheet_from_prompt(topic, player=None, speak=speak) or "Spreadsheet created."
+
+    elif tool in ("google_workspace", "workspace_gmail", "workspace_calendar", "workspace_drive") or tool.startswith("workspace_"):
+        from actions.google_workspace_mcp import google_workspace
+        p = dict(parameters or {})
+        if tool.startswith("workspace_"):
+            parts = tool.split("_", 2)
+            if len(parts) > 1:
+                p.setdefault("service", parts[1])
+            if len(parts) > 2:
+                p.setdefault("action", parts[2])
+        return google_workspace(parameters=p, player=None, speak=speak) or "Done."
+
+    elif tool in ("system_diagnostics", "diagnostics", "os_hardware", "hardware_control", "ram_hogs", "kill_process", "brightness_control"):
+        from actions.system_diagnostics_mcp import system_diagnostics
+        p = dict(parameters or {})
+        if tool == "ram_hogs":
+            p.setdefault("action", "ram_hogs")
+        elif tool == "kill_process":
+            p.setdefault("action", "kill")
+        elif tool == "brightness_control":
+            p.setdefault("action", "brightness")
+        return system_diagnostics(parameters=p, player=None, speak=speak) or "Done."
+
+    elif tool in ("auto_heal", "self_patch", "rollback"):
+        from actions.auto_heal_engine import auto_heal
+        p = dict(parameters or {})
+        if tool == "rollback":
+            p.setdefault("action", "rollback")
+        return auto_heal(parameters=p, player=None, speak=speak) or "Done."
+
     else:
         print(f"[Executor] ⚠️ Unknown tool '{tool}' — no developer fallback is configured")
         return f"Unknown action: {tool}"
@@ -292,6 +396,7 @@ class AgentExecutor:
         goal:        str,
         speak:       Callable | None        = None,
         cancel_flag: threading.Event | None = None,
+        player:      Any                    = None,
     ) -> str:
         print(f"\n[Executor] 🎯 Goal: {goal}")
 
@@ -314,8 +419,8 @@ class AgentExecutor:
 
             for step in steps:
                 if cancel_flag and cancel_flag.is_set():
-                    if speak: speak("Task cancelled, sir.")
-                    return "Task cancelled."
+                    if speak: speak("Tarefa cancelada, senhor.")
+                    return "Tarefa cancelada."
 
                 step_num = step.get("step", "?")
                 tool     = step.get("tool", "generated_code")
@@ -326,6 +431,22 @@ class AgentExecutor:
 
                 print(f"\n[Executor] ▶️ Step {step_num}: [{tool}] {desc}")
 
+                # Update HUD right telemetry wing with live step operation
+                if player and hasattr(player, "show_hud_operation"):
+                    step_sources = []
+                    if "query" in params:
+                        step_sources.append(str(params["query"]))
+                    if "url" in params:
+                        step_sources.append(str(params["url"]))
+                    if "path" in params or "output_path" in params:
+                        step_sources.append(str(params.get("path") or params.get("output_path")))
+                    player.show_hud_operation(
+                        f"Step {step_num}: {tool.replace('_', ' ').title()}",
+                        desc or f"Executing {tool}...",
+                        sources=step_sources,
+                        tool=tool
+                    )
+
                 attempt = 1
                 step_ok = False
 
@@ -333,15 +454,41 @@ class AgentExecutor:
                     if cancel_flag and cancel_flag.is_set():
                         break
                     try:
-                        result = _call_tool(tool, params, speak)
+                        result = _call_tool(tool, params, speak, player=player)
                         step_results[step_num] = result 
                         completed_steps.append(step)
                         print(f"[Executor] ✅ Step {step_num} done: {str(result)[:100]}")
                         step_ok = True
+
+                        # Check if this step produced a deliverable file
+                        import re
+                        file_match = re.search(r'([A-Za-z]:\\[^\s"\'<>`\r\n]+\.(?:pdf|docx|xlsx|pptx|png|jpg|mp4|py|html|json|txt))', str(result))
+                        if not file_match and ("path" in params or "output_path" in params or "name" in params):
+                            cand = str(params.get("output_path") or params.get("path") or params.get("name") or "")
+                            if cand.lower().endswith((".pdf", ".docx", ".xlsx", ".pptx")):
+                                cand_path = Path(cand).expanduser()
+                                if not cand_path.is_absolute():
+                                    cand_path = Path.home() / "Downloads" / cand_path.name
+                                if cand_path.exists():
+                                    file_match = re.match(r'.*', str(cand_path))
+                        if file_match and player and hasattr(player, "show_hud_deliverable"):
+                            fpath = file_match.group(0).strip()
+                            player.show_hud_deliverable(
+                                title=Path(fpath).name,
+                                summary=f"Deliverable created by step {step_num}.",
+                                file_path=fpath,
+                                kind="file"
+                            )
                         break
 
                     except Exception as e:
                         error_msg = str(e)
+                        try:
+                            import traceback
+                            from actions.auto_heal_engine import AutoHealEngine
+                            AutoHealEngine.record_last_error(traceback.format_exc())
+                        except Exception:
+                            pass
                         print(f"[Executor] ❌ Step {step_num} attempt {attempt} failed: {error_msg}")
 
                         recovery = analyze_error(step, error_msg, attempt=attempt)
@@ -376,7 +523,8 @@ class AgentExecutor:
                                     res = _call_tool(
                                         fixed_step["tool"],
                                         fixed_step["parameters"],
-                                        speak
+                                        speak,
+                                        player=player
                                     )
                                     step_results[step_num] = res
                                     completed_steps.append(step)
@@ -399,7 +547,24 @@ class AgentExecutor:
                     break
 
             if success:
-                return self._summarize(goal, completed_steps, speak)
+                summary = self._summarize(goal, completed_steps, speak)
+                if player and hasattr(player, "show_hud_deliverable"):
+                    import re
+                    found_file = None
+                    for res_text in step_results.values():
+                        fm = re.search(r'([A-Za-z]:\\[^\s"\'<>`\r\n]+\.(?:pdf|docx|xlsx|pptx|png|jpg|mp4|py|html|json|txt))', str(res_text))
+                        if fm and Path(fm.group(0).strip()).exists():
+                            found_file = fm.group(0).strip()
+                            break
+                    bullets = [s.get("description", "") for s in completed_steps if s.get("description")]
+                    player.show_hud_deliverable(
+                        title=Path(found_file).name if found_file else goal[:40],
+                        summary=summary,
+                        bullets=bullets[:4],
+                        file_path=found_file or "",
+                        kind="file" if found_file else "result"
+                    )
+                return summary
 
             if replan_attempts >= self.MAX_REPLAN_ATTEMPTS:
                 msg = f"Task failed after {replan_attempts} replan attempts, sir."
@@ -416,7 +581,7 @@ class AgentExecutor:
         try:
             import google.generativeai as genai
             genai.configure(api_key=_get_api_key())
-            model     = genai.GenerativeModel(model_name="gemini-2.5-flash-lite")
+            model     = genai.GenerativeModel(model_name="gemini-3.1-flash-lite")
             steps_str = "\n".join(f"- {s.get('description', '')}" for s in completed_steps)
             prompt    = (
                 f'User goal: "{goal}"\n'

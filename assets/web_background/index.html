@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Brahma Echo 3D WebGL Living AI Background</title>
+  <title>ULTRON 3D WebGL Living AI Background</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     html, body { width: 100%; height: 100%; overflow: hidden; background: #050505; }
@@ -592,12 +592,12 @@
     const scene = new THREE.Scene();
     scene.fog = new THREE.FogExp2(0x040302, 0.05);
 
-    const camera = new THREE.PerspectiveCamera(55, width / height, 0.1, 500);
-    camera.position.set(0, 0, 10.0);
+    const camera = new THREE.PerspectiveCamera(50, width / height, 0.1, 500);
+    camera.position.set(0, 0, 7.6);
 
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: "high-performance" });
     renderer.setSize(width, height);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setPixelRatio(1.0); // Capped at 1.0 to eliminate high-DPI GPU lag
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 0.9;
     container.appendChild(renderer.domElement);
@@ -606,11 +606,12 @@
     const composer = new THREE.EffectComposer(renderer);
     composer.addPass(new THREE.RenderPass(scene, camera));
 
+    // Half-res bloom buffer for smooth 60 FPS performance without visual degradation
     const bloom = new THREE.UnrealBloomPass(
-      new THREE.Vector2(width, height),
-      3.2, // strength
-      0.80, // radius
-      0.10  // threshold
+      new THREE.Vector2(Math.floor(width / 2), Math.floor(height / 2)),
+      2.5, // strength
+      0.75, // radius
+      0.12  // threshold
     );
     composer.addPass(bloom);
 
@@ -697,6 +698,7 @@
 
     // ——— HERO ORB GROUP ———
     const orbGroup = new THREE.Group();
+    orbGroup.position.set(0, 0.18, 0);
     scene.add(orbGroup);
 
     function lineMat(color, opacity = 1) {
@@ -967,53 +969,101 @@
     const dustPoints = new THREE.Points(dustGeo, dustMat);
     orbGroup.add(dustPoints);
 
-    // ——— REACTIVE BRAHMA ECHO STATE CONTROLLER ———
+    // ——— REACTIVE ULTRON STATE CONTROLLER ———
     let currentState = "IDLE";
-    let targetScale = 1.0;
-    let currentScale = 1.0;
+    let targetScale = 0.52;
+    let currentScale = 0.52;
     let rotSpeedY = 0.0015;
-    let targetCameraZ = 5.8;
-    let currentCameraZ = 5.8;
+    let targetCameraZ = 7.6;
+    let currentCameraZ = 7.6;
     let warpSpeed = 0;
+    let liveAudioAmp = 0;
+    let dispAudioAmp = 0;
 
-    window.setBrahmaState = function(state) {
+    const STATE_COLORS = {
+      LISTENING:  { hot: 0x80ffff, mid: 0x00e5ff, dim: 0x0099bb }, // Cyan
+      SPEAKING:   { hot: 0xffea80, mid: 0xffbe1a, dim: 0xaa8010 }, // Gold
+      THINKING:   { hot: 0xffc080, mid: 0xff9100, dim: 0xcc6600 }, // Sunset Amber
+      EXECUTING:  { hot: 0xd4a0ff, mid: 0x7c4dff, dim: 0x4a148c }, // Violet
+      WORKING:    { hot: 0xd4a0ff, mid: 0x7c4dff, dim: 0x4a148c }, // Violet
+      MUTED:      { hot: 0xff9999, mid: 0xff3b30, dim: 0x881111 }, // Red
+      SCANNING:   { hot: 0xa0ffb0, mid: 0x37ff5f, dim: 0x1dcc43 }, // Emerald
+      ONLINE:     { hot: 0xffea80, mid: 0xffbe1a, dim: 0xaa8010 }, // Gold
+      IDLE:       { hot: 0xffea80, mid: 0xffbe1a, dim: 0xaa8010 }, // Gold
+    };
+
+    let targetColorHot = new THREE.Color(C_HOT);
+    let targetColorMid = new THREE.Color(C_MID);
+    let targetColorDim = new THREE.Color(C_DIM);
+
+    window.setAudioLevel = function(lvl) {
+      const v = Math.max(0, Math.min(1, Number(lvl) || 0));
+      if (v > liveAudioAmp) liveAudioAmp = v;
+    };
+
+    window.setUltronState = function(state) {
       if (!state) return;
       currentState = String(state).toUpperCase();
-      console.log("Brahma Echo 3D StateChanged:", currentState);
+      console.log("ULTRON 3D StateChanged:", currentState);
+
+      const pal = STATE_COLORS[currentState] || STATE_COLORS.IDLE;
+      targetColorHot = new THREE.Color(pal.hot);
+      targetColorMid = new THREE.Color(pal.mid);
+      targetColorDim = new THREE.Color(pal.dim);
 
       if (currentState === "LISTENING") {
-        targetScale = 1.30;
-        rotSpeedY = 0.004;
+        targetScale = 0.58;
+        rotSpeedY = 0.0035;
         electricArcsGroup.visible = false;
-        targetCameraZ = 5.2;
+        targetCameraZ = 7.2;
       } else if (currentState === "THINKING") {
-        targetScale = 1.15;
+        targetScale = 0.54;
         rotSpeedY = 0.012;
         electricArcsGroup.visible = true;
-        targetCameraZ = 5.8;
-      } else if (currentState === "EXECUTING") {
-        targetScale = 1.25;
-        rotSpeedY = 0.020;
+        targetCameraZ = 7.5;
+      } else if (currentState === "EXECUTING" || currentState === "WORKING") {
+        targetScale = 0.60;
+        rotSpeedY = 0.022;
         electricArcsGroup.visible = true;
-        targetCameraZ = 5.6;
+        targetCameraZ = 7.3;
       } else if (currentState === "SPEAKING") {
-        targetScale = 1.40;
-        rotSpeedY = 0.025;
+        targetScale = 0.65;
+        rotSpeedY = 0.026;
         electricArcsGroup.visible = false;
-        targetCameraZ = 4.4; // Cinematic dolly zoom in
+        targetCameraZ = 6.9;
+      } else if (currentState === "MUTED") {
+        targetScale = 0.46;
+        rotSpeedY = 0.0006;
+        electricArcsGroup.visible = false;
+        targetCameraZ = 7.8;
+      } else if (currentState === "SCANNING") {
+        targetScale = 0.58;
+        rotSpeedY = 0.015;
+        electricArcsGroup.visible = true;
+        targetCameraZ = 7.4;
       } else if (currentState === "CINEMATIC") {
-        targetScale = 0.95;
+        targetScale = 0.48;
         rotSpeedY = 0.001;
         electricArcsGroup.visible = false;
-        targetCameraZ = 8.0; // Pushed back for UI space
-      } else { // IDLE
+        targetCameraZ = 8.5;
+      } else { // IDLE / ONLINE
         currentState = "IDLE";
-        targetScale = 1.0;
+        targetScale = 0.52;
         rotSpeedY = 0.0015;
         electricArcsGroup.visible = false;
-        targetCameraZ = 5.8;
+        targetCameraZ = 7.6;
       }
     };
+
+    // CURSOR GAZE & SENTIENT TRACKING
+    let mouseNormX = 0, mouseNormY = 0;
+    let targetTiltX = 0, targetTiltY = 0;
+    window.addEventListener("pointermove", (e) => {
+      mouseNormX = (e.clientX / Math.max(1, window.innerWidth)) * 2 - 1;
+      mouseNormY = -(e.clientY / Math.max(1, window.innerHeight)) * 2 + 1;
+      targetTiltX = -mouseNormY * 0.25;
+      targetTiltY = mouseNormX * 0.35;
+    });
 
     // ANIMATION LOOP
     const clock = new THREE.Clock();
@@ -1022,12 +1072,28 @@
       requestAnimationFrame(animate);
       const t = clock.getElapsedTime();
 
+      // Smooth color morphing toward state targets
+      coreSphereMat.color.lerp(targetColorHot, 0.06);
+      glowSphereMat.color.lerp(targetColorMid, 0.06);
+      icoWireMat.color.lerp(targetColorHot, 0.06);
+      dustMat.color.lerp(targetColorMid, 0.06);
+      arcMat.color.lerp(targetColorHot, 0.08);
+
+      // Smooth audio amplitude
+      liveAudioAmp *= 0.88;
+      dispAudioAmp += (liveAudioAmp - dispAudioAmp) * 0.4;
+
       // Smooth scale & camera interpolation
       currentScale += (targetScale - currentScale) * 0.05;
       orbGroup.scale.setScalar(currentScale);
       
       currentCameraZ += (targetCameraZ - currentCameraZ) * 0.03;
       camera.position.z = currentCameraZ;
+
+      // Sentient Gaze: Smoothly tilt core towards mouse position
+      orbGroup.rotation.x += (targetTiltX - orbGroup.rotation.x) * 0.04;
+      camera.position.x += (mouseNormX * 0.25 - camera.position.x) * 0.03;
+      camera.position.y += (mouseNormY * 0.18 - camera.position.y) * 0.03;
 
       // Rotation dynamics
       outerShell.rotation.y += rotSpeedY;
@@ -1053,22 +1119,25 @@
         pulseMod = 3.0;
       } else if (currentState === "LISTENING") {
         pulseMod = 1.4;
+      } else if (currentState === "MUTED") {
+        pulseMod = 0.4;
       }
 
       const wave1 = Math.sin(t * 1.2 * pulseMod);
       const wave3 = Math.pow(Math.max(0, Math.sin(t * 0.4 * pulseMod)), 5);
       const surge = wave3 * 1.5;
+      const audioPulse = dispAudioAmp * 0.35;
 
-      coreSphere.scale.setScalar(1 + surge + Math.sin(t * 5 * pulseMod) * 0.05);
-      coreSphereMat.opacity = Math.min(0.7, Math.max(0.1, (0.12 + wave1 * 0.06 + surge * 0.2)));
-      glowSphere.scale.setScalar(1 + surge * 0.8);
+      coreSphere.scale.setScalar(1 + surge + audioPulse * 1.3 + Math.sin(t * 5 * pulseMod) * 0.05);
+      coreSphereMat.opacity = Math.min(0.8, Math.max(0.1, (0.12 + wave1 * 0.06 + surge * 0.2 + audioPulse * 0.3)));
+      glowSphere.scale.setScalar(1 + surge * 0.8 + audioPulse * 0.9);
 
       if (electricArcsGroup.visible) {
         electricArcsGroup.rotation.y += 0.03;
         electricArcsGroup.rotation.z += 0.02;
       }
 
-      dustPoints.rotation.y += 0.0003;
+      dustPoints.rotation.y += 0.0003 + audioPulse * 0.002;
       
       // Cinematic Warp Speed during speaking
       if (currentState === "SPEAKING") {

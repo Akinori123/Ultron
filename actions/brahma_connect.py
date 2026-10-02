@@ -90,6 +90,9 @@ def _required_params_for_action(action: str) -> list[str]:
         "get_device_info": [],
         "mouse_move": ["x", "y"],
         "keyboard_type": ["text"],
+        "ui_tap": ["x", "y"],
+        "ui_swipe": ["x1", "y1", "x2", "y2"],
+        "ui_type": ["text"],
     }.get(action, [])
 
 

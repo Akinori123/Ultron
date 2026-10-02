@@ -254,7 +254,7 @@ def _ensure_steam_running(steam_path: Path) -> bool:
 
 def _update_steam_games(steam_path: Path, game_name: str = None) -> str:
     if not _ensure_steam_running(steam_path):
-        return "Could not start Steam."
+        return "Não foi possível iniciar o Steam."
 
     steam_exe = steam_path / "steam.exe"
     games     = _get_steam_games(steam_path)
@@ -267,7 +267,7 @@ def _update_steam_games(steam_path: Path, game_name: str = None) -> str:
         matched    = [g for g in games if name_lower in g["name"].lower()]
         if not matched:
             available = ", ".join(g["name"] for g in games[:5])
-            return f"Game '{game_name}' not found. Installed: {available}..."
+            return f"Jogo '{game_name}' não encontrado. Instalados: {available}..."
         targets = matched
     else:
         targets = games
@@ -304,7 +304,7 @@ def _update_steam_games(steam_path: Path, game_name: str = None) -> str:
         )
     if errors:
         parts.append(f"Errors: {'; '.join(errors)}.")
-    return " ".join(parts) if parts else "No games to update."
+    return " ".join(parts) if parts else "Nenhum jogo para atualizar."
 
 
 _KNOWN_APPIDS: dict[str, tuple[str, str]] = {
@@ -496,7 +496,7 @@ def _handle_install_dialog(game_name: str) -> str:
         if install_clicked:
             suffix = f"Selected {drive_label} and" if drive_selected else "Default drive used, but"
             return f"{suffix} clicked Install for '{game_name}'."
-        return f"Please click Install manually in Steam for '{game_name}'."
+        return f"Por favor, clique em Instalar manualmente no Steam para '{game_name}'."
 
     except ImportError:
         return _handle_install_dialog_pyautogui(game_name, best_drive)
@@ -510,7 +510,7 @@ def _handle_install_dialog_pyautogui(game_name: str, best_drive: dict) -> str:
         import pyautogui
         import pygetwindow as gw
     except ImportError:
-        return f"Install dialog opened for '{game_name}'. Please select '{best_drive['letter']}:' and click Install manually."
+        return f"Janela de instalação aberta para '{game_name}'. Selecione '{best_drive['letter']}:' e clique em Instalar manualmente."
 
     pyautogui.FAILSAFE = False
     drive_label  = f"{best_drive['letter']}:"
@@ -526,7 +526,7 @@ def _handle_install_dialog_pyautogui(game_name: str, best_drive: dict) -> str:
             break
 
     if not install_win:
-        return f"Please select '{drive_label}' and click Install in Steam for '{game_name}'."
+        return f"Selecione '{drive_label}' e clique em Instalar no Steam para '{game_name}'."
 
     try:
         install_win.activate()
@@ -541,12 +541,12 @@ def _handle_install_dialog_pyautogui(game_name: str, best_drive: dict) -> str:
     pyautogui.typewrite(best_drive["letter"], interval=0.05)
     time.sleep(0.2)
     pyautogui.click(wx + int(ww * 0.72), wy + int(wh * 0.88))
-    return f"Attempted drive {drive_label} selection and Install click for '{game_name}'."
+    return f"Tentativa de selecionar a unidade {drive_label} e clicar em Instalar para '{game_name}'."
 
 
 def _install_steam_game(steam_path: Path, game_name: str = None, app_id: str = None) -> str:
     if not _ensure_steam_running(steam_path):
-        return "Could not start Steam."
+        return "Não foi possível iniciar o Steam."
 
     steam_exe       = steam_path / "steam.exe"
     installed_games = _get_steam_games(steam_path)
@@ -558,24 +558,24 @@ def _install_steam_game(steam_path: Path, game_name: str = None, app_id: str = N
         name_lower = game_name.lower()
         already    = next((g for g in installed_games if name_lower in g["name"].lower()), None)
     else:
-        return "Please specify a game name or AppID."
+        return "Por favor, especifique o nome de um jogo ou o AppID."
 
     if already:
         state = already["state"]
         name  = already["name"]
         if state == 4:
-            return f"'{name}' is already installed and up to date."
+            return f"'{name}' já está instalado e atualizado."
         if state == 1026:
             return f"'{name}' is currently downloading or updating."
         if state in (6, 516):
             subprocess.Popen([str(steam_exe), f"steam://update/{already['id']}"])
-            return f"'{name}' has a pending update. Update started."
-        return f"'{name}' is already installed."
+            return f"'{name}' tem uma atualização pendente. Atualização iniciada."
+        return f"'{name}' já está instalado."
 
     if not app_id and game_name:
         found_id, found_name = _search_steam_appid(game_name)
         if not found_id:
-            return f"Could not find '{game_name}' on Steam. Try providing the AppID directly."
+            return f"Não foi possível encontrar '{game_name}' no Steam. Tente fornecer o AppID diretamente."
         app_id    = found_id
         game_name = found_name or game_name
         print(f"[GameUpdater] 🔍 Installing: {game_name} (AppID: {app_id})")
@@ -583,7 +583,7 @@ def _install_steam_game(steam_path: Path, game_name: str = None, app_id: str = N
     try:
         subprocess.Popen([str(steam_exe), f"steam://install/{app_id}"])
         threading.Thread(target=_handle_install_dialog, args=(game_name or str(app_id),), daemon=True).start()
-        return f"Install started for '{game_name}'. Steam will open the download dialog."
+        return f"Instalação iniciada para '{game_name}'. O Steam abrirá a janela de download."
     except Exception as e:
         return f"Install failed: {e}"
 
@@ -611,7 +611,7 @@ def _watch_and_shutdown(steam_path: Path, speak=None, check_interval: int = 30, 
         active = [g for g in _get_steam_games(steam_path) if g["state"] == 1026]
         if active:
             names = ", ".join(g["name"] for g in active)
-            if speak: speak(f"Download started for {names}. I'll shut down when done.")
+            if speak: speak(f"Download iniciado para {names}. Vou desligar quando terminar.")
             break
     else:
         return
@@ -619,12 +619,12 @@ def _watch_and_shutdown(steam_path: Path, speak=None, check_interval: int = 30, 
     while time.time() < deadline:
         time.sleep(check_interval)
         if not any(g["state"] == 1026 for g in _get_steam_games(steam_path)):
-            if speak: speak("Download complete. Shutting down now.")
+            if speak: speak("Download concluído. Desligando agora.")
             time.sleep(5)
             subprocess.run(["shutdown", "/s", "/t", "10"])
             return
 
-    if speak: speak("Download taking too long. Cancelling auto-shutdown.")
+    if speak: speak("O download está demorando muito. Cancelando o desligamento automático.")
 
 
 def _get_epic_games() -> list[dict]:
@@ -657,13 +657,13 @@ def _is_epic_running() -> bool:
 def _update_epic_games(epic_path: Path, game_name: str = None) -> str:
     epic_exe = epic_path / "EpicGamesLauncher.exe"
     if not epic_exe.exists():
-        return "Epic Games Launcher not found."
+        return "Epic Games Launcher não encontrado."
     games = _get_epic_games()
     if game_name:
         name_lower = game_name.lower()
         matched    = [g for g in games if name_lower in g["name"].lower()]
         if not matched:
-            return f"'{game_name}' not found in Epic."
+            return f"'{game_name}' não encontrado na Epic."
         try:
             subprocess.Popen([str(epic_exe), f"com.epicgames.launcher://apps/{matched[0]['id']}?action=launch&silent=true"])
             return f"Opened Epic for '{matched[0]['name']}'."
@@ -675,10 +675,10 @@ def _update_epic_games(epic_path: Path, game_name: str = None) -> str:
                 for g in games[:10]:
                     subprocess.Popen([str(epic_exe), f"com.epicgames.launcher://apps/{g['id']}?action=launch&silent=true"])
                     time.sleep(0.5)
-                return f"Triggered update check for {len(games)} Epic game(s)."
+                return f"Verificação de atualização acionada para {len(games)} jogo(s) da Epic."
             else:
                 subprocess.Popen([str(epic_exe)])
-                return f"Epic Games Launcher opened. {len(games)} game(s) will be checked."
+                return f"Epic Games Launcher aberto. {len(games)} jogo(s) serão verificados."
         except Exception as e:
             return f"Epic update failed: {e}"
 
@@ -693,25 +693,25 @@ def _schedule_daily_update(hour: int = 3, minute: int = 0) -> str:
                   "/SC", "DAILY", "/ST", f"{hour:02d}:{minute:02d}", "/F", *extra]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode == 0:
-            return f"Daily game update scheduled at {hour:02d}:{minute:02d}."
+            return f"Atualização diária de jogos agendada para {hour:02d}:{minute:02d}."
     return f"Scheduling failed: {result.stderr.strip()}"
 
 
 def _cancel_scheduled_update() -> str:
     result = subprocess.run(["schtasks", "/Delete", "/TN", "BrahmaAI_GameUpdater", "/F"],
                             capture_output=True, text=True)
-    return "Scheduled update cancelled." if result.returncode == 0 else "No scheduled update found."
+    return "Atualização agendada cancelada." if result.returncode == 0 else "No scheduled update found."
 
 
 def _get_schedule_status() -> str:
     result = subprocess.run(["schtasks", "/Query", "/TN", "BrahmaAI_GameUpdater", "/FO", "LIST"],
                             capture_output=True, text=True)
     if result.returncode != 0:
-        return "No scheduled game update found."
+        return "Nenhuma atualização de jogo agendada encontrada."
     for line in result.stdout.strip().split("\n"):
         if any(k in line for k in ("Next Run", "Sonraki", "Prochaine", "Próxima", "Nächste")):
-            return f"Game update scheduled. {line.strip()}"
-    return "Game update is scheduled."
+            return f"Atualização de jogo agendada. {line.strip()}"
+    return "Atualização de jogo agendada."
 
 
 def game_updater(parameters: dict, player=None, speak=None) -> str:

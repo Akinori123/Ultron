@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 
-title Brahma AI - Lite - Premium Launcher
+title ULTRON - Premium Launcher
 cd /d "%~dp0"
 
 color 0E

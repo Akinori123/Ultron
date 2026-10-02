@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <title>Brahma Echo Remote</title>
+  <title>ULTRON Remoto</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
@@ -135,21 +135,21 @@
 </head>
 <body>
   <div class="card" id="card">
-    <div class="logo"><em>BRAHMA ECHO</em> AI</div>
-    <div class="sub">Remote Access</div>
-    <p id="reconnecting">Reconnecting…</p>
-    <p class="hint">Press <strong style="color:var(--text)">Mobile Connect</strong> in the Brahma Echo desktop app to get a QR code or session key.</p>
+    <div class="logo"><em>ULTRON</em> AI</div>
+    <div class="sub">Acesso Remoto</div>
+    <p id="reconnecting">Reconectando…</p>
+    <p class="hint">Pressione <strong style="color:var(--text)">Conexão Móvel</strong> no aplicativo ULTRON para desktop para obter um código QR ou chave de sessão.</p>
     <div class="key-wrap">
       <input class="key-input" id="key" type="text" maxlength="6"
              autocomplete="off" autocorrect="off" spellcheck="false"
              placeholder="· · · · · ·">
     </div>
     <div class="err" id="err"></div>
-    <button class="btn" onclick="doLogin()">CONNECT</button>
+    <button class="btn" onclick="doLogin()">CONECTAR</button>
     <p class="voice-note">
-      🎤 <strong style="color:var(--text)">Voice commands:</strong> open
-      <code>chrome://flags</code> on your phone, search
-      <code>Insecure origins treated as secure</code>, add your Brahma Echo URL, tap Relaunch.
+      🎤 <strong style="color:var(--text)">Comandos de voz:</strong> abra
+      <code>chrome://flags</code> no seu celular, procure
+      <code>Insecure origins treated as secure</code>, adicione seu URL do ULTRON e toque em Relaunch.
     </p>
   </div>
 
@@ -199,7 +199,7 @@
         });
         data = await r.json();
       } catch (e) {
-        document.getElementById('err').textContent = 'Connection error';
+        document.getElementById('err').textContent = 'Erro de conexão';
         shake(); return;
       }
       if (data.ok && data.token) {
@@ -209,7 +209,7 @@
       } else {
         inp.value = '';
         inp.focus();
-        document.getElementById('err').textContent = 'Invalid or expired key';
+        document.getElementById('err').textContent = 'Chave inválida ou expirada';
         shake();
       }
     }

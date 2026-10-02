@@ -1,9 +1,9 @@
 $WshShell = New-Object -ComObject WScript.Shell
-$Shortcut = $WshShell.CreateShortcut('C:\Users\ravit\OneDrive\Desktop\Brahma Echo - Premium.lnk')
-$Shortcut.TargetPath = 'D:\TiTech Prabha Solution\Brahma AI\Brahma AI\Brahma-AI---Lite-main\Brahma-AI---Lite-main\.venv\Scripts\pythonw.exe'
-$Shortcut.Arguments = '"D:\TiTech Prabha Solution\Brahma AI\Brahma AI\Brahma-AI---Lite-main\Brahma-AI---Lite-main\main.py"'
-$Shortcut.WorkingDirectory = 'D:\TiTech Prabha Solution\Brahma AI\Brahma AI\Brahma-AI---Lite-main\Brahma-AI---Lite-main'
+$Shortcut = $WshShell.CreateShortcut('C:\Users\dofek\OneDrive\Desktop\ULTRON.lnk')
+$Shortcut.TargetPath = 'D:\Downloads\Ultron-Echo-main\Ultron-Echo-main\.venv\Scripts\pythonw.exe'
+$Shortcut.Arguments = '"D:\Downloads\Ultron-Echo-main\Ultron-Echo-main\main.py"'
+$Shortcut.WorkingDirectory = 'D:\Downloads\Ultron-Echo-main\Ultron-Echo-main'
 $Shortcut.WindowStyle = 7
-$Shortcut.Description = 'Launch Brahma Echo - Premium'
-if ('D:\TiTech Prabha Solution\Brahma AI\Brahma AI\Brahma-AI---Lite-main\Brahma-AI---Lite-main\assets\Brahma_Lite_Logo.ico') { $Shortcut.IconLocation = 'D:\TiTech Prabha Solution\Brahma AI\Brahma AI\Brahma-AI---Lite-main\Brahma-AI---Lite-main\assets\Brahma_Lite_Logo.ico,0' }
+$Shortcut.Description = 'Launch ULTRON'
+if ('D:\Downloads\Ultron-Echo-main\Ultron-Echo-main\assets\Ultron_Lite_Logo.ico') { $Shortcut.IconLocation = 'D:\Downloads\Ultron-Echo-main\Ultron-Echo-main\assets\Ultron_Lite_Logo.ico,0' }
 $Shortcut.Save()

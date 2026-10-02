@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import threading
 import time
 import wave
@@ -31,7 +32,7 @@ def _base_dir() -> Path:
 
 BASE_DIR = _base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
-LIVE_MODEL = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+LIVE_MODEL = "models/gemini-3.6-flash-native-audio-preview-12-2025"
 IMG_MAX_W = 1280
 IMG_MAX_H = 720
 JPEG_Q = 72
@@ -231,7 +232,7 @@ class MeetingAssistant:
             prompt,
         ]
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.6-flash",
             contents=contents,
             config={"temperature": 0.0},
         )
@@ -381,7 +382,7 @@ Answer: ...
                     prompt,
                 ]
                 response = client.models.generate_content(
-                    model="gemini-2.5-flash",
+                    model="gemini-3.6-flash",
                     contents=contents,
                     config={"temperature": 0.2},
                 )

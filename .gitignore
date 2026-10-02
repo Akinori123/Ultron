@@ -12,6 +12,7 @@ downloads/
 memory/calendar_events.json
 config/identity.json
 config/brahma_connect/devices.json
+.playwright-mcp/
 
 # Local secrets and environment-specific config
 config/api_keys.json
@@ -29,6 +30,14 @@ memory/long_term.json
 _run.out.txt
 _run.err.txt
 _discord_live_test.txt
+scratch/
+.cache/
+.pytest_cache/
+config/ig_browser_profile/
+config/*_cache.json
+config/*_history.json
+config/learned_rules.json
+memory/nutrition_log.json
 
 # Virtual environments
 .venv/
@@ -57,6 +66,8 @@ config/.email_key
 config/email_credentials.json
 config/ig_session.json
 
+config/ig_session.json
+
 # Installer and Build Scripts
 installer/
 install_wizard.py
@@ -66,3 +77,15 @@ search_results.txt
 homescreen background/node_modules/
 homescreen background/.next/
 homescreen background/out/
+brahma_native_engine/
+
+# Android Gradle build artifacts
+.gradle/
+**/build/
+brahma-connect-android/.gradle/
+brahma-connect-android/app/build/
+brahma-connect-android/local.properties
+
+# Patch backups
+config/patch_backups/
+

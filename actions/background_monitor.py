@@ -104,7 +104,7 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
     interval = parameters.get("interval", 60)
     
     if not m_type or not target:
-        return "You must provide a 'type' (system/crypto/website) and a 'target' (ram/cpu/bitcoin/url)."
+        return "Você deve fornecer um 'type' (system/crypto/website) e um 'target' (ram/cpu/bitcoin/url)."
         
     res = add_monitor(m_type, target, float(threshold), condition, int(interval))
     if player:

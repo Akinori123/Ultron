@@ -85,8 +85,8 @@ class OpenRouterClient:
         self._headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type":  "application/json",
-            "HTTP-Referer":  "https://github.com/mark-xxv",
-            "X-Title":       "Brahma Echo",
+            "HTTP-Referer":  "https://github.com/brahma-ai",
+            "X-Title":       "ULTRON",
         }
 
     def _is_rate_limited(self, model: str) -> bool:
@@ -218,7 +218,7 @@ class OpenRouterClient:
         self,
         prompt: str,
         system: str = (
-            "You are a component of Brahma Echo, an open-source personal assistant. "
+            "You are a component of ULTRON, an open-source personal assistant. "
             "Be concise, helpful, and precise."
         ),
         history: Optional[list[dict]] = None,
@@ -349,7 +349,7 @@ client = OpenRouterClient()
 
 if __name__ == "__main__":
     print("=" * 55)
-    print("  Brahma Echo — OpenRouter Client Self-Test")
+    print("  ULTRON — OpenRouter Client Self-Test")
     print("=" * 55)
 
     print("\n[TEST 1] Basic chat...")
@@ -375,8 +375,8 @@ if __name__ == "__main__":
     try:
         history = [
             {"role": "system",    "content": "You are a helpful assistant. Be brief."},
-            {"role": "user",      "content": "My name is Tony."},
-            {"role": "assistant", "content": "Hello Tony, how can I help you?"},
+            {"role": "user",      "content": "My name is Suryaansh."},
+            {"role": "assistant", "content": "Hello Suryaansh, how can I help you?"},
             {"role": "user",      "content": "What is my name?"},
         ]
         reply = client.multi_turn(history)

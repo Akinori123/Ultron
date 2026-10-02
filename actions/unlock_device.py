@@ -23,14 +23,14 @@ def _get_settings() -> dict:
 def unlock_device(parameters: dict, response=None, player=None, session_memory=None) -> str:
     target = parameters.get("target") or parameters.get("device_id")
     if not target:
-        return "Error: You must specify a target device to unlock."
+        return "Erro: Você deve especificar um dispositivo de destino para desbloquear."
 
     settings = _get_settings()
     device_pins = settings.get("device_pins", {})
-    
+
     # Try to find pin by exact target match first
     pin = device_pins.get(target)
-    
+
     # If not found, try to resolve the device to get its actual ID from connect gateway
     if not pin:
         try:
@@ -43,9 +43,9 @@ def unlock_device(parameters: dict, response=None, player=None, session_memory=N
                     pin = device_pins.get(device_id)
         except Exception:
             pass
-            
+
     if not pin:
-        return f"Error: No unlock PIN is saved for device '{target}'. Please set the PIN in the UI first."
+        return f"Erro: Nenhum PIN de desbloqueio está salvo para o dispositivo '{target}'. Defina o PIN na interface primeiro."
         
     # Send unlock command via brahma connect
     command_params = {

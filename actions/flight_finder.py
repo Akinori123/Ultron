@@ -285,9 +285,9 @@ def flight_finder(parameters: dict, player=None, speak=None) -> str:
     save        = bool(params.get("save", False))
 
     if not origin or not destination:
-        return "Please provide both origin and destination, sir."
+        return "Por favor, informe a origem e o destino, senhor."
     if not date_raw:
-        return "Please provide a departure date, sir."
+        return "Por favor, informe uma data de partida, senhor."
 
     # Normalise cabin value
     if cabin not in _CABIN_CODE:
@@ -300,7 +300,7 @@ def flight_finder(parameters: dict, player=None, speak=None) -> str:
         player.write_log(f"[FlightFinder] {origin} → {destination} on {date}")
 
     if speak:
-        speak(f"Searching flights from {origin} to {destination} on {date}, sir.")
+        speak(f"Procurando voos de {origin} para {destination} em {date}, senhor.")
 
     print(
         f"[FlightFinder] ▶️ {origin} → {destination} | {date}"
@@ -314,10 +314,10 @@ def flight_finder(parameters: dict, player=None, speak=None) -> str:
         )
 
         if not raw_text:
-            return "Could not retrieve flight data, sir. The page may not have loaded."
+            return "Não foi possível obter os dados de voo, senhor. A página pode não ter carregado."
 
         if speak:
-            speak("Analysing the results now, sir.")
+            speak("Analisando os resultados agora, senhor.")
 
         flights = _parse_flights_with_gemini(raw_text, origin, destination, date)
         spoken  = _format_spoken(flights, origin, destination, date)

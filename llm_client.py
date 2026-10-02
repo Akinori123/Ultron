@@ -146,3 +146,4 @@ class UnifiedAIClient:
             return openrouter_client.multi_turn(messages, model, max_tokens, temperature)
 
 client = UnifiedAIClient()
+LLMClient = UnifiedAIClient

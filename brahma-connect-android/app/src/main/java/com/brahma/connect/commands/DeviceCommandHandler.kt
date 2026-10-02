@@ -32,6 +32,10 @@ class DeviceCommandHandler(private val context: Context) {
             "file_read" -> fileRead(parameters)
             "file_write" -> fileWrite(parameters)
             "file_delete" -> fileDelete(parameters)
+            "ui_dump" -> uiDump()
+            "ui_tap" -> uiTap(parameters)
+            "ui_swipe" -> uiSwipe(parameters)
+            "ui_type" -> uiType(parameters)
             else -> CommandResult(false, errorCode = "UNKNOWN_COMMAND", error = "Unsupported command: $action")
         }
     }
@@ -295,5 +299,62 @@ class DeviceCommandHandler(private val context: Context) {
         } catch (e: Exception) {
             CommandResult(false, errorCode = "DELETE_ERROR", error = e.message ?: "Failed to delete file.")
         }
+    }
+
+    private fun uiDump(): CommandResult {
+        val service = com.brahma.connect.accessibility.BrahmaAccessibilityService.instance
+        if (service == null) {
+            return CommandResult(false, errorCode = "ACCESSIBILITY_DISABLED", error = "Brahma Accessibility Service is not enabled.")
+        }
+        val result = service.dumpUiTree()
+        return if (result.containsKey("error")) {
+            CommandResult(false, errorCode = "UI_DUMP_FAILED", error = result["error"] as String)
+        } else {
+            CommandResult(true, data = result)
+        }
+    }
+
+    private fun uiTap(parameters: Map<String, Any?>): CommandResult {
+        val service = com.brahma.connect.accessibility.BrahmaAccessibilityService.instance
+        if (service == null) {
+            return CommandResult(false, errorCode = "ACCESSIBILITY_DISABLED", error = "Brahma Accessibility Service is not enabled.")
+        }
+        val x = (parameters["x"] as? Number)?.toInt()
+        val y = (parameters["y"] as? Number)?.toInt()
+        if (x == null || y == null) {
+            return CommandResult(false, errorCode = "INVALID_ARGUMENT", error = "x and y coordinates are required.")
+        }
+        val success = service.tap(x, y)
+        return CommandResult(success, data = mapOf("action" to "tap", "success" to success))
+    }
+
+    private fun uiSwipe(parameters: Map<String, Any?>): CommandResult {
+        val service = com.brahma.connect.accessibility.BrahmaAccessibilityService.instance
+        if (service == null) {
+            return CommandResult(false, errorCode = "ACCESSIBILITY_DISABLED", error = "Brahma Accessibility Service is not enabled.")
+        }
+        val x1 = (parameters["x1"] as? Number)?.toInt()
+        val y1 = (parameters["y1"] as? Number)?.toInt()
+        val x2 = (parameters["x2"] as? Number)?.toInt()
+        val y2 = (parameters["y2"] as? Number)?.toInt()
+        val duration = (parameters["duration"] as? Number)?.toLong() ?: 300L
+        if (x1 == null || y1 == null || x2 == null || y2 == null) {
+            return CommandResult(false, errorCode = "INVALID_ARGUMENT", error = "x1, y1, x2, y2 coordinates are required.")
+        }
+        val success = service.swipe(x1, y1, x2, y2, duration)
+        return CommandResult(success, data = mapOf("action" to "swipe", "success" to success))
+    }
+
+    private fun uiType(parameters: Map<String, Any?>): CommandResult {
+        val service = com.brahma.connect.accessibility.BrahmaAccessibilityService.instance
+        if (service == null) {
+            return CommandResult(false, errorCode = "ACCESSIBILITY_DISABLED", error = "Brahma Accessibility Service is not enabled.")
+        }
+        val text = parameters["text"]?.toString()
+        if (text.isNullOrEmpty()) {
+            return CommandResult(false, errorCode = "INVALID_ARGUMENT", error = "text is required.")
+        }
+        val success = service.typeText(text)
+        return CommandResult(success, data = mapOf("action" to "type", "success" to success))
     }
 }

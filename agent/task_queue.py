@@ -32,6 +32,7 @@ class Task:
     speak:       Any        = field(compare=False, default=None)   
     on_complete: Any        = field(compare=False, default=None)  
     cancel_flag: threading.Event = field(compare=False, default_factory=threading.Event)
+    player:      Any        = field(compare=False, default=None)
 
 
 class TaskQueue:
@@ -76,6 +77,7 @@ class TaskQueue:
         priority:    TaskPriority = TaskPriority.NORMAL,
         speak:       Callable | None = None,
         on_complete: Callable | None = None,
+        player:      Any = None,
     ) -> str:
 
         task_id = str(uuid.uuid4())[:8]
@@ -86,6 +88,7 @@ class TaskQueue:
             goal        = goal,
             speak       = speak,
             on_complete = on_complete,
+            player      = player,
         )
 
         with self._condition:
@@ -179,6 +182,7 @@ class TaskQueue:
                 goal        = task.goal,
                 speak       = task.speak,
                 cancel_flag = task.cancel_flag,
+                player      = task.player,
             )
 
             with self._lock:

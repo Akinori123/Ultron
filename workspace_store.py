@@ -154,13 +154,23 @@ class WorkspaceStore:
         self.set_active_conversation_id(conversation_id)
         return conversation_id
 
+    def conversation_exists(self, conversation_id: str) -> bool:
+        if not conversation_id:
+            return False
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM conversations WHERE id = ? LIMIT 1",
+                (conversation_id,),
+            ).fetchone()
+        return bool(row)
+
     def ensure_active_conversation(self, first_user_message: str | None = None) -> str:
         conversation_id = self.get_active_conversation_id()
-        if conversation_id and self.get_conversation(conversation_id):
+        if conversation_id and self.conversation_exists(conversation_id):
             return conversation_id
         return self.create_conversation(_title_from_message(first_user_message or "New Conversation"))
 
-    def get_conversation(self, conversation_id: str) -> dict[str, Any] | None:
+    def get_conversation(self, conversation_id: str, limit: int | None = None) -> dict[str, Any] | None:
         with self._lock, self._connect() as conn:
             convo = conn.execute(
                 "SELECT * FROM conversations WHERE id = ?",
@@ -168,15 +178,31 @@ class WorkspaceStore:
             ).fetchone()
             if not convo:
                 return None
-            messages = conn.execute(
-                """
-                SELECT role, content, timestamp, attachments_json
-                FROM messages
-                WHERE conversation_id = ?
-                ORDER BY timestamp ASC, rowid ASC
-                """,
-                (conversation_id,),
-            ).fetchall()
+            if limit and limit > 0:
+                messages = conn.execute(
+                    """
+                    SELECT role, content, timestamp, attachments_json
+                    FROM (
+                        SELECT role, content, timestamp, attachments_json, rowid
+                        FROM messages
+                        WHERE conversation_id = ?
+                        ORDER BY timestamp DESC, rowid DESC
+                        LIMIT ?
+                    )
+                    ORDER BY timestamp ASC, rowid ASC
+                    """,
+                    (conversation_id, limit),
+                ).fetchall()
+            else:
+                messages = conn.execute(
+                    """
+                    SELECT role, content, timestamp, attachments_json
+                    FROM messages
+                    WHERE conversation_id = ?
+                    ORDER BY timestamp ASC, rowid ASC
+                    """,
+                    (conversation_id,),
+                ).fetchall()
             return {
                 "id": convo["id"],
                 "title": convo["title"],
@@ -232,7 +258,7 @@ class WorkspaceStore:
                     f"Conversation:\n{full_text}"
                 )
                 response = client.models.generate_content(
-                    model="gemini-2.5-flash",
+                    model="gemini-3.6-flash",
                     contents=prompt,
                     config={"temperature": 0.5},
                 )

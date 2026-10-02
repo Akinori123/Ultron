@@ -19,17 +19,17 @@ if platform.system() == "Windows":
     import winreg
 
 from PyQt6.QtCore import (
-    QEasingCurve, QEvent, QMimeData, QObject, QPoint, QPointF, QRectF, QSize, Qt,
-    QTimer, QUrl, QPropertyAnimation, QParallelAnimationGroup, pyqtProperty, pyqtSignal,
+    QEasingCurve, QEvent, QPoint, QPointF, QRectF, QSize, Qt,
+    QTimer, QUrl, QPropertyAnimation, pyqtSignal,
 )
 from PyQt6.QtGui import (
-    QAction, QBrush, QColor, QDragEnterEvent, QDropEvent, QFont, QFontDatabase,
+    QAction, QBrush, QColor, QDragEnterEvent, QDropEvent, QFont,
     QIcon, QImage, QKeySequence, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap,
-    QRadialGradient, QShortcut, QTextOption,
+    QRadialGradient, QShortcut,
 )
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QColorDialog, QComboBox, QDialog, QFileDialog, QFrame, QGraphicsOpacityEffect, QGridLayout, QHBoxLayout,
-    QLabel, QLineEdit, QMenu, QMainWindow, QPushButton, QScrollArea, QSizePolicy, QSlider, QTextBrowser, QTextEdit,
+    QLabel, QLineEdit, QMenu, QMainWindow, QPushButton, QScrollArea, QSizePolicy, QSlider, QTextEdit,
     QGraphicsDropShadowEffect,
     QStyle, QSystemTrayIcon, QVBoxLayout, QWidget, QProgressBar,
     QStackedWidget, QInputDialog, QMessageBox,
@@ -47,6 +47,7 @@ from smart_home import SmartHomeService
 from smart_home_page_new import BrahmaHomePage, _DeviceTile
 from workspace_store import store as workspace_store
 from core.identity import identity
+from sound_manager import sound_mgr
 
 def _base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -63,10 +64,10 @@ LOGO_ICO   = BASE_DIR / "assets" / "Brahma_Lite_Logo.ico"
 BACKGROUND_IMAGE_FILE = BASE_DIR / "assets" / "background.png"
 MODEL_DOWNLOAD_URL = "https://storage.googleapis.com/mediapipe-assets/hand_landmarker.task"
 
-_DEFAULT_W, _DEFAULT_H = 1500, 840
-_MIN_W,     _MIN_H     = 1180, 720
-_LEFT_W  = 270
-_RIGHT_W = 480
+_DEFAULT_W, _DEFAULT_H = 980, 700
+_MIN_W,     _MIN_H     = 820, 580
+_LEFT_W  = 160
+_RIGHT_W = 340
 
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
 
@@ -93,6 +94,17 @@ class C:
     WHITE     = "#ffffff"
     DARK      = "#000000"
     BAR_BG    = "#222222"
+    _listeners: list = []
+
+    @classmethod
+    def register_listener(cls, callback):
+        if callback not in cls._listeners:
+            cls._listeners.append(callback)
+
+    @classmethod
+    def unregister_listener(cls, callback):
+        if callback in cls._listeners:
+            cls._listeners.remove(callback)
 
     @classmethod
     def load_theme(cls, theme_hex: str):
@@ -134,6 +146,12 @@ class C:
         cls.BORDER_B  = f"rgba({r}, {g}, {b}, 0.25)"
         cls.BORDER_A  = f"rgba({r}, {g}, {b}, 0.18)"
 
+        for cb in list(cls._listeners):
+            try:
+                cb()
+            except Exception:
+                pass
+
 try:
     if APP_SETTINGS_FILE.exists():
         with open(APP_SETTINGS_FILE, "r", encoding="utf-8") as f:
@@ -160,8 +178,14 @@ QWidget.setStyleSheet = _new_setStyleSheet
 
 
 class BackgroundWidget(QWidget):
+    _state_sig = pyqtSignal(str)
+    _audio_sig = pyqtSignal(float)
+
     def __init__(self, image_path: Path | str | None = None, parent=None):
         super().__init__(parent)
+        self._state_sig.connect(self._do_set_ai_state)
+        self._audio_sig.connect(self._do_set_audio_level)
+        self._last_audio_js_time = 0.0
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, False)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
         self.setAutoFillBackground(True)
@@ -198,12 +222,17 @@ class BackgroundWidget(QWidget):
                 html_content = self._apply_theme_to_html(html_content)
                 self._web_view.setHtml(html_content, baseUrl=QUrl.fromLocalFile(str(html_path.parent) + "/"))
                 self._web_view.setStyleSheet("background: #000000;")
-                self._web_view.resize(self.size())
+                # The web view owns the background from here on: stop the parent
+                # widget from auto-filling (and painting) over the native
+                # QWebEngineView viewport, which hid the 3D orb entirely.
+                self.setAutoFillBackground(False)
+                self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+                self._web_view.setGeometry(self.rect())
                 self._web_view.lower()
                 self._web_view.show()
+                self.update()
         except Exception:
             self._web_view = None
-
     def _load_background(self) -> None:
         pass
 
@@ -239,10 +268,38 @@ class BackgroundWidget(QWidget):
         return html_content
 
     def set_ai_state(self, state: str) -> None:
+        try:
+            self._state_sig.emit(str(state or "IDLE"))
+        except Exception:
+            pass
+
+    def _do_set_ai_state(self, state: str) -> None:
         if self._web_view:
             try:
-                st = (state or "IDLE").strip()
-                self._web_view.page().runJavaScript(f"if(window.setBrahmaState) window.setBrahmaState('{st}');")
+                st = (state or "IDLE").strip().replace("'", "\\'")
+                page = self._web_view.page()
+                if page:
+                    page.runJavaScript(f"if(window.setBrahmaState) window.setBrahmaState('{st}');")
+            except Exception:
+                pass
+
+    def set_audio_level(self, level: float) -> None:
+        try:
+            self._audio_sig.emit(float(level))
+        except Exception:
+            pass
+
+    def _do_set_audio_level(self, level: float) -> None:
+        now = time.monotonic()
+        if (now - self._last_audio_js_time) < 0.033:  # Max ~30 FPS WebEngine bridge
+            return
+        self._last_audio_js_time = now
+        if self._web_view:
+            try:
+                lv = max(0.0, min(1.0, float(level)))
+                page = self._web_view.page()
+                if page:
+                    page.runJavaScript(f"if(window.setAudioLevel) window.setAudioLevel({lv:.3f});")
             except Exception:
                 pass
 
@@ -252,24 +309,25 @@ class BackgroundWidget(QWidget):
             self._web_view.setGeometry(self.rect())
 
     def paintEvent(self, event):
-        if not self._web_view:
-            painter = QPainter(self)
-            rect = self.rect()
-            if self._fallback_pixmap and not self._fallback_pixmap.isNull():
-                painter.fillRect(rect, QColor(0, 0, 0))
-                scaled = self._fallback_pixmap.scaled(
-                    rect.size(),
-                    Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
-                x = rect.x() + (rect.width() - scaled.width()) // 2
-                y = rect.y() + (rect.height() - scaled.height()) // 2
-                painter.drawPixmap(x, y, scaled)
-            else:
-                painter.fillRect(rect, QColor(0, 0, 0))
-            painter.end()
+        if self._web_view:
+            # The web view paints the background itself. Painting here would
+            # fill over its native viewport and hide the 3D reactor orb.
             return
-        super().paintEvent(event)
+        painter = QPainter(self)
+        rect = self.rect()
+        if self._fallback_pixmap and not self._fallback_pixmap.isNull():
+            painter.fillRect(rect, QColor(0, 0, 0))
+            scaled = self._fallback_pixmap.scaled(
+                rect.size(),
+                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            x = rect.x() + (rect.width() - scaled.width()) // 2
+            y = rect.y() + (rect.height() - scaled.height()) // 2
+            painter.drawPixmap(x, y, scaled)
+        else:
+            painter.fillRect(rect, QColor(0, 0, 0))
+        painter.end()
 
 
 class RemoteKeyOverlay(QWidget):
@@ -314,13 +372,13 @@ class RemoteKeyOverlay(QWidget):
         except Exception:
             pass
 
-        title = QLabel("Mobile Connect")
+        title = QLabel("Conexão Móvel")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
         title.setStyleSheet("color: #ffffff; background: transparent; border: none;")
         lay.addWidget(title)
 
-        subtitle = QLabel("Scan the QR code with your phone to remotely control Brahma Echo.")
+        subtitle = QLabel("Escaneie o código QR com seu celular para controlar o ULTRON remotamente.")
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         subtitle.setWordWrap(True)
         subtitle.setFont(QFont("Segoe UI", 9))
@@ -337,7 +395,7 @@ class RemoteKeyOverlay(QWidget):
         qr_row.addStretch()
         lay.addLayout(qr_row)
 
-        manual_hint = QLabel("Manual address")
+        manual_hint = QLabel("Endereço manual")
         manual_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         manual_hint.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
         manual_hint.setStyleSheet(f"color: {C.TEXT_DIM}; border: none; margin-top: 10px;")
@@ -374,8 +432,8 @@ class RemoteKeyOverlay(QWidget):
 
         btn_row = QHBoxLayout()
         btn_row.setSpacing(14)
-        
-        self._new_btn = QPushButton("New Key")
+
+        self._new_btn = QPushButton("Nova Chave")
         self._new_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._new_btn.setFixedHeight(40)
         self._new_btn.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
@@ -386,8 +444,8 @@ class RemoteKeyOverlay(QWidget):
                 border: 1px solid rgba(255, 255, 255, 0.08);
                 border-radius: 12px;
             }}
-            QPushButton:hover {{ 
-                background: rgba(255, 179, 0, 0.08); 
+            QPushButton:hover {{
+                background: rgba(255, 179, 0, 0.08);
                 border: 1px solid rgba(255, 179, 0, 0.3);
                 color: #ffb300;
             }}
@@ -395,7 +453,7 @@ class RemoteKeyOverlay(QWidget):
         self._new_btn.clicked.connect(self._refresh_key)
         btn_row.addWidget(self._new_btn)
 
-        close_btn = QPushButton("Close")
+        close_btn = QPushButton("Fechar")
         close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         close_btn.setFixedHeight(40)
         close_btn.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
@@ -406,15 +464,15 @@ class RemoteKeyOverlay(QWidget):
                 border: 1px solid rgba(255, 255, 255, 0.08);
                 border-radius: 12px;
             }}
-            QPushButton:hover {{ 
-                background: rgba(255, 60, 60, 0.08); 
+            QPushButton:hover {{
+                background: rgba(255, 60, 60, 0.08);
                 border: 1px solid rgba(255, 60, 60, 0.3);
                 color: #ff6b6b;
             }}
         """)
         close_btn.clicked.connect(self._do_close)
         btn_row.addWidget(close_btn)
-        
+
         lay.addLayout(btn_row)
 
         self._ctimer = QTimer(self)
@@ -434,7 +492,7 @@ class RemoteKeyOverlay(QWidget):
 
     def _update_qr(self, url: str) -> None:
         if not url:
-            self._qr_label.setText("NO URL")
+            self._qr_label.setText("SEM URL")
             return
         try:
             import qrcode
@@ -449,22 +507,22 @@ class RemoteKeyOverlay(QWidget):
             pix.loadFromData(buf.getvalue())
             self._qr_label.setPixmap(pix.scaled(172, 172, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
         except ImportError:
-            self._qr_label.setText("Install\nqrcode[pil]")
+            self._qr_label.setText("Instale\nqrcode[pil]")
             self._qr_label.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
             self._qr_label.setStyleSheet("color: #111; background: white; border-radius: 12px; padding: 6px;")
         except Exception:
-            self._qr_label.setText("QR failed")
+            self._qr_label.setText("Falha no QR")
 
     def _tick(self):
         remaining = max(0, int(self._expiry - time.time()))
         mins, secs = divmod(remaining, 60)
-        self._timer_lbl.setText(f"Key expires in {mins:02d}:{secs:02d}")
+        self._timer_lbl.setText(f"A chave expira em {mins:02d}:{secs:02d}")
         if remaining <= 0:
             self._do_close()
 
     def mark_connected(self) -> None:
         self._ctimer.stop()
-        self._key_lbl.setText("CONNECTED")
+        self._key_lbl.setText("CONECTADO")
         self._key_lbl.setStyleSheet(f"""
             color: {C.GREEN};
             background: rgba(55,255,95,20);
@@ -476,7 +534,7 @@ class RemoteKeyOverlay(QWidget):
         self._qr_label.setText("OK")
         self._qr_label.setFont(QFont("Segoe UI", 34, QFont.Weight.Black))
         self._qr_label.setStyleSheet("color: #37ff5f; background: #041006; border-radius: 12px;")
-        self._timer_lbl.setText("Phone connected. Brahma Echo remote is ready.")
+        self._timer_lbl.setText("Celular conectado. O controle remoto do ULTRON está pronto.")
 
     def _refresh_key(self):
         if not self._on_new_key:
@@ -507,6 +565,690 @@ class RemoteKeyOverlay(QWidget):
 
     def _do_close(self):
         self._ctimer.stop()
+        self.hide()
+        self.closed.emit()
+
+
+class DailyBriefingOverlay(QWidget):
+    closed = pyqtSignal()
+
+    def __init__(self, data=None, parent=None):
+        super().__init__(parent)
+        import datetime
+
+        if isinstance(data, str):
+            self._data = {
+                "greeting": "Briefing Matinal",
+                "timestamp": datetime.datetime.now().strftime("%d/%m/%Y • %H:%M"),
+                "spoken_narrative": data,
+                "weather": {"status": "info", "temp_c": "--", "condition": "Dados atmosféricos", "city": "Local"},
+                "calendar": {"count": 0, "events": []},
+                "gmail": {"count": 0, "senders": []},
+                "instagram": {"count": 0, "senders": []},
+                "headlines": [],
+            }
+        elif isinstance(data, dict):
+            self._data = data
+        else:
+            self._data = {}
+
+        self._remaining_secs = 30
+        self.setFixedSize(720, 540)
+
+        # Glassmorphism container
+        self._frame = QFrame(self)
+        self._frame.setObjectName("BriefingOverlayMainFrame")
+        self._frame.setFixedSize(self.size())
+        self._frame.setStyleSheet(f"""
+            QFrame#BriefingOverlayMainFrame {{
+                background: rgba(10, 12, 18, 250);
+                border: 1px solid rgba(255, 179, 0, 0.4);
+                border-radius: 20px;
+            }}
+        """)
+
+        try:
+            glow = QGraphicsDropShadowEffect(self)
+            glow.setBlurRadius(50)
+            glow.setColor(QColor(0, 0, 0, 220))
+            glow.setOffset(0, 10)
+            self._frame.setGraphicsEffect(glow)
+        except Exception:
+            pass
+
+        main_lay = QVBoxLayout(self._frame)
+        main_lay.setContentsMargins(24, 20, 24, 20)
+        main_lay.setSpacing(14)
+
+        # Header Row
+        hdr_lay = QHBoxLayout()
+        hdr_lay.setSpacing(12)
+
+        hdr_info = QVBoxLayout()
+        hdr_info.setSpacing(2)
+
+        title_lbl = QLabel("⚡ INTELIGÊNCIA ULTRON // BRIEFING MATINAL UNIFICADO")
+        title_lbl.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
+        title_lbl.setStyleSheet(f"color: {C.PRI}; letter-spacing: 1.5px; background: transparent; border: none;")
+        hdr_info.addWidget(title_lbl)
+
+        ts_str = self._data.get("timestamp") or datetime.datetime.now().strftime("%A, %B %d • %I:%M %p")
+        ts_lbl = QLabel(ts_str)
+        ts_lbl.setFont(QFont("Segoe UI", 9))
+        ts_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent; border: none;")
+        hdr_info.addWidget(ts_lbl)
+
+        hdr_lay.addLayout(hdr_info)
+        hdr_lay.addStretch()
+
+        close_btn = QPushButton("✕")
+        close_btn.setFixedSize(32, 32)
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+        close_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: rgba(255, 255, 255, 0.05);
+                color: {C.TEXT_DIM};
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 16px;
+            }}
+            QPushButton:hover {{
+                background: rgba(255, 60, 60, 0.2);
+                border: 1px solid rgba(255, 60, 60, 0.5);
+                color: #ff5555;
+            }}
+        """)
+        close_btn.clicked.connect(self._do_close)
+        hdr_lay.addWidget(close_btn)
+
+        main_lay.addLayout(hdr_lay)
+
+        # 2x2 Bento Grid
+        grid = QGridLayout()
+        grid.setSpacing(12)
+
+        # 1. Weather Card
+        grid.addWidget(self._build_weather_card(), 0, 0)
+        # 2. Calendar Card
+        grid.addWidget(self._build_calendar_card(), 0, 1)
+        # 3. Gmail Card
+        grid.addWidget(self._build_gmail_card(), 1, 0)
+        # 4. Instagram Card
+        grid.addWidget(self._build_instagram_card(), 1, 1)
+
+        main_lay.addLayout(grid)
+
+        # Spoken Narrative Box
+        narrative_frame = QFrame()
+        narrative_frame.setStyleSheet("""
+            QFrame {
+                background: rgba(0, 0, 0, 0.45);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 12px;
+                padding: 4px;
+            }
+        """)
+        narr_lay = QVBoxLayout(narrative_frame)
+        narr_lay.setContentsMargins(12, 10, 12, 10)
+        narr_lay.setSpacing(4)
+
+        narr_tag = QLabel("🎙 RESUMO EXECUTIVO")
+        narr_tag.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        narr_tag.setStyleSheet(f"color: {C.PRI}; letter-spacing: 1px; background: transparent; border: none;")
+        narr_lay.addWidget(narr_tag)
+
+        narrative_text = self._data.get("spoken_narrative") or "Nenhum resumo do briefing foi gerado."
+        narr_lbl = QLabel(narrative_text)
+        narr_lbl.setWordWrap(True)
+        narr_lbl.setFont(QFont("Segoe UI", 9))
+        narr_lbl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent; border: none; line-height: 1.4;")
+        narr_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        narr_lay.addWidget(narr_lbl)
+
+        main_lay.addWidget(narrative_frame)
+
+        # Bottom Bar: Auto-dismiss countdown + action button
+        bot_lay = QHBoxLayout()
+        bot_lay.setSpacing(12)
+
+        self._countdown_lbl = QLabel(f"Fechando automaticamente em {self._remaining_secs}s")
+        self._countdown_lbl.setFont(QFont("Segoe UI", 8))
+        self._countdown_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent; border: none;")
+        bot_lay.addWidget(self._countdown_lbl)
+
+        bot_lay.addStretch()
+
+        dismiss_btn = QPushButton("FECHAR")
+        dismiss_btn.setFixedSize(100, 30)
+        dismiss_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        dismiss_btn.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        dismiss_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: rgba(255, 179, 0, 0.12);
+                color: {C.PRI};
+                border: 1px solid rgba(255, 179, 0, 0.35);
+                border-radius: 8px;
+            }}
+            QPushButton:hover {{
+                background: rgba(255, 179, 0, 0.25);
+                border: 1px solid {C.PRI};
+            }}
+        """)
+        dismiss_btn.clicked.connect(self._do_close)
+        bot_lay.addWidget(dismiss_btn)
+
+        main_lay.addLayout(bot_lay)
+
+        # Auto-hide timer
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(1000)
+
+    def _create_bento_box(self) -> QFrame:
+        box = QFrame()
+        box.setStyleSheet("""
+            QFrame {
+                background: rgba(255, 255, 255, 0.025);
+                border: 1px solid rgba(255, 179, 0, 0.18);
+                border-radius: 12px;
+            }
+        """)
+        return box
+
+    def _build_weather_card(self) -> QFrame:
+        box = self._create_bento_box()
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(4)
+
+        w = self._data.get("weather") or {}
+        tag = QLabel("🌤  ATMOSFERA E CLIMA")
+        tag.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        tag.setStyleSheet(f"color: {C.PRI}; letter-spacing: 1px; background: transparent; border: none;")
+        lay.addWidget(tag)
+
+        temp = w.get("temp_c")
+        temp_str = f"{temp}°C" if temp is not None else "--°C"
+        cond = w.get("condition") or "Céu limpo"
+        city = w.get("city") or "Estação local"
+
+        val_row = QHBoxLayout()
+        val_lbl = QLabel(temp_str)
+        val_lbl.setFont(QFont("Segoe UI", 20, QFont.Weight.Bold))
+        val_lbl.setStyleSheet(f"color: {C.WHITE}; background: transparent; border: none;")
+        val_row.addWidget(val_lbl)
+
+        cond_lbl = QLabel(f"{cond}\n{city}")
+        cond_lbl.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        cond_lbl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent; border: none;")
+        cond_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        val_row.addWidget(cond_lbl)
+        lay.addLayout(val_row)
+
+        hum = w.get("humidity", "--")
+        wind = w.get("wind_kmph", "--")
+        meta_lbl = QLabel(f"Umidade: {hum}% • Vento: {wind} km/h")
+        meta_lbl.setFont(QFont("Segoe UI", 8))
+        meta_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent; border: none;")
+        lay.addWidget(meta_lbl)
+        return box
+
+    def _build_calendar_card(self) -> QFrame:
+        box = self._create_bento_box()
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(4)
+
+        cal = self._data.get("calendar") or {}
+        tag = QLabel("📅  AGENDA DE HOJE")
+        tag.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        tag.setStyleSheet(f"color: {C.PRI}; letter-spacing: 1px; background: transparent; border: none;")
+        lay.addWidget(tag)
+
+        count = cal.get("count", 0)
+        events = cal.get("events", [])
+
+        if count > 0:
+            val_lbl = QLabel(f"{count} Evento{'s' if count > 1 else ''}")
+            val_lbl.setFont(QFont("Segoe UI", 20, QFont.Weight.Bold))
+            val_lbl.setStyleSheet(f"color: {C.WHITE}; background: transparent; border: none;")
+            lay.addWidget(val_lbl)
+
+            evt_summary = events[0] if len(events) == 1 else f"{events[0]} (+{len(events)-1} mais)"
+            sub_lbl = QLabel(evt_summary[:38] + ("..." if len(evt_summary) > 38 else ""))
+            sub_lbl.setFont(QFont("Segoe UI", 8))
+            sub_lbl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent; border: none;")
+            lay.addWidget(sub_lbl)
+        else:
+            val_lbl = QLabel("Agenda Livre")
+            val_lbl.setFont(QFont("Segoe UI", 18, QFont.Weight.Bold))
+            val_lbl.setStyleSheet(f"color: {C.GREEN}; background: transparent; border: none;")
+            lay.addWidget(val_lbl)
+
+            sub_lbl = QLabel("Nenhum evento agendado hoje")
+            sub_lbl.setFont(QFont("Segoe UI", 8))
+            sub_lbl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent; border: none;")
+            lay.addWidget(sub_lbl)
+
+        meta_lbl = QLabel("Google Calendar Ativo")
+        meta_lbl.setFont(QFont("Segoe UI", 8))
+        meta_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent; border: none;")
+        lay.addWidget(meta_lbl)
+        return box
+
+    def _build_gmail_card(self) -> QFrame:
+        box = self._create_bento_box()
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(4)
+
+        gm = self._data.get("gmail") or {}
+        tag = QLabel("✉  COMUNICAÇÕES GMAIL")
+        tag.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        tag.setStyleSheet(f"color: {C.PRI}; letter-spacing: 1px; background: transparent; border: none;")
+        lay.addWidget(tag)
+
+        count = gm.get("count", 0)
+        senders = gm.get("senders", [])
+
+        if count > 0:
+            val_lbl = QLabel(f"{count} Não lidos")
+            val_lbl.setFont(QFont("Segoe UI", 20, QFont.Weight.Bold))
+            val_lbl.setStyleSheet(f"color: {C.WHITE}; background: transparent; border: none;")
+            lay.addWidget(val_lbl)
+
+            if senders:
+                s_str = f"De: {', '.join(senders[:2])}"
+                if len(senders) > 2:
+                    s_str += f" +{len(senders)-2}"
+            else:
+                s_str = "Mensagens não lidas aguardando revisão"
+            sub_lbl = QLabel(s_str[:38] + ("..." if len(s_str) > 38 else ""))
+            sub_lbl.setFont(QFont("Segoe UI", 8))
+            sub_lbl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent; border: none;")
+            lay.addWidget(sub_lbl)
+        else:
+            val_lbl = QLabel("Caixa de Entrada Vazia")
+            val_lbl.setFont(QFont("Segoe UI", 18, QFont.Weight.Bold))
+            val_lbl.setStyleSheet(f"color: {C.GREEN}; background: transparent; border: none;")
+            lay.addWidget(val_lbl)
+
+            sub_lbl = QLabel("Todas as comunicações em dia")
+            sub_lbl.setFont(QFont("Segoe UI", 8))
+            sub_lbl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent; border: none;")
+            lay.addWidget(sub_lbl)
+
+        meta_lbl = QLabel("Google Workspace Conectado")
+        meta_lbl.setFont(QFont("Segoe UI", 8))
+        meta_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent; border: none;")
+        lay.addWidget(meta_lbl)
+        return box
+
+    def _build_instagram_card(self) -> QFrame:
+        box = self._create_bento_box()
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(4)
+
+        ig = self._data.get("instagram") or {}
+        tag = QLabel("📸  INTEL DO INSTAGRAM")
+        tag.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        tag.setStyleSheet(f"color: {C.PRI}; letter-spacing: 1px; background: transparent; border: none;")
+        lay.addWidget(tag)
+
+        count = ig.get("count", 0)
+        senders = ig.get("senders", [])
+
+        if count > 0:
+            val_lbl = QLabel(f"{count} Nova{'s' if count > 1 else ''} DM{'s' if count > 1 else ''}")
+            val_lbl.setFont(QFont("Segoe UI", 20, QFont.Weight.Bold))
+            val_lbl.setStyleSheet(f"color: {C.WHITE}; background: transparent; border: none;")
+            lay.addWidget(val_lbl)
+
+            if senders:
+                s_str = f"De: {', '.join(['@' + s for s in senders[:2]])}"
+                if len(senders) > 2:
+                    s_str += f" +{len(senders)-2}"
+            else:
+                s_str = "Mensagens diretas aguardando revisão"
+            sub_lbl = QLabel(s_str[:38] + ("..." if len(s_str) > 38 else ""))
+            sub_lbl.setFont(QFont("Segoe UI", 8))
+            sub_lbl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent; border: none;")
+            lay.addWidget(sub_lbl)
+        else:
+            val_lbl = QLabel("0 Mensagens Diretas")
+            val_lbl.setFont(QFont("Segoe UI", 18, QFont.Weight.Bold))
+            val_lbl.setStyleSheet(f"color: {C.TEXT}; background: transparent; border: none;")
+            lay.addWidget(val_lbl)
+
+            sub_lbl = QLabel("Nenhuma notificação pendente")
+            sub_lbl.setFont(QFont("Segoe UI", 8))
+            sub_lbl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent; border: none;")
+            lay.addWidget(sub_lbl)
+
+        meta_lbl = QLabel("Navegador do Instagram Pronto")
+        meta_lbl.setFont(QFont("Segoe UI", 8))
+        meta_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent; border: none;")
+        lay.addWidget(meta_lbl)
+        return box
+
+    def _tick(self):
+        self._remaining_secs -= 1
+        if self._remaining_secs <= 0:
+            self._do_close()
+        else:
+            self._countdown_lbl.setText(f"Fechando automaticamente em {self._remaining_secs}s")
+
+    def _do_close(self):
+        if hasattr(self, "_timer") and self._timer.isActive():
+            self._timer.stop()
+        self.hide()
+        self.closed.emit()
+
+
+class ConfirmationOverlay(QWidget):
+    """Physical confirmation gate for irreversible actions (shutdown, restart, wifi toggles)."""
+    answered = pyqtSignal(bool)
+    closed   = pyqtSignal()
+    _OW = 440
+
+    def __init__(self, title: str, detail: str, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(f"""
+            ConfirmationOverlay {{
+                background: rgba(18, 10, 4, 250);
+                border: 2px solid {C.ACC};
+                border-radius: 12px;
+            }}
+        """)
+        self.setFixedWidth(self._OW)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 20, 24, 20)
+        lay.setSpacing(10)
+
+        hdr = QLabel("⚠  CONFIRMAÇÃO FÍSICA NECESSÁRIA")
+        hdr.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+        hdr.setStyleSheet(f"color: {C.ACC}; background: transparent; letter-spacing: 0.5px;")
+        lay.addWidget(hdr)
+
+        ttl = QLabel(title)
+        ttl.setWordWrap(True)
+        ttl.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
+        ttl.setStyleSheet(f"color: {C.TEXT}; background: transparent;")
+        lay.addWidget(ttl)
+
+        if detail:
+            dtl = QLabel(detail)
+            dtl.setWordWrap(True)
+            dtl.setFont(QFont("Segoe UI", 9))
+            dtl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
+            lay.addWidget(dtl)
+
+        self._remaining_secs = 90
+        self._countdown_lbl = QLabel(f"A confirmação é cancelada automaticamente em {self._remaining_secs}s")
+        self._countdown_lbl.setFont(QFont("Segoe UI", 8))
+        self._countdown_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+        lay.addWidget(self._countdown_lbl)
+
+        row = QHBoxLayout()
+        row.setSpacing(10)
+
+        yes = QPushButton("CONFIRMAR")
+        yes.setFixedHeight(36)
+        yes.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        yes.setCursor(Qt.CursorShape.PointingHandCursor)
+        yes.setStyleSheet(f"""
+            QPushButton {{
+                background: rgba(255, 179, 0, 0.15);
+                color: {C.ACC};
+                border: 1.5px solid {C.ACC};
+                border-radius: 6px;
+                padding: 0 16px;
+            }}
+            QPushButton:hover {{
+                background: rgba(255, 179, 0, 0.35);
+                color: {C.WHITE};
+            }}
+        """)
+        yes.clicked.connect(self._on_confirm)
+        row.addWidget(yes)
+
+        no = QPushButton("CANCELAR")
+        no.setFixedHeight(36)
+        no.setFont(QFont("Segoe UI", 9))
+        no.setCursor(Qt.CursorShape.PointingHandCursor)
+        no.setStyleSheet(f"""
+            QPushButton {{
+                background: rgba(255, 255, 255, 0.05);
+                color: {C.TEXT_MED};
+                border: 1px solid {C.BORDER};
+                border-radius: 6px;
+                padding: 0 16px;
+            }}
+            QPushButton:hover {{
+                color: {C.TEXT};
+                border-color: {C.BORDER_B};
+                background: rgba(255, 255, 255, 0.10);
+            }}
+        """)
+        no.clicked.connect(self._on_cancel)
+        row.addWidget(no)
+        lay.addLayout(row)
+
+        no.setDefault(True)
+        no.setFocus()
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(1000)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start()
+
+    def _tick(self):
+        self._remaining_secs -= 1
+        if self._remaining_secs <= 0:
+            self._on_cancel()
+        else:
+            self._countdown_lbl.setText(f"A confirmação é cancelada automaticamente em {self._remaining_secs}s")
+
+    def _on_confirm(self):
+        if hasattr(self, "_timer") and self._timer.isActive():
+            self._timer.stop()
+        self.hide()
+        self.answered.emit(True)
+        self.closed.emit()
+
+    def _on_cancel(self):
+        if hasattr(self, "_timer") and self._timer.isActive():
+            self._timer.stop()
+        self.hide()
+        self.answered.emit(False)
+        self.closed.emit()
+
+
+class MemoryInspectorOverlay(QWidget):
+    """HUD overlay inspecting long-term stored facts, with instant search and manual deletion."""
+    closed = pyqtSignal()
+    _OW = 560
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(f"""
+            MemoryInspectorOverlay {{
+                background: rgba(8, 10, 15, 250);
+                border: 1.5px solid {C.BORDER_B};
+                border-radius: 12px;
+            }}
+        """)
+        self.setFixedWidth(self._OW)
+
+        self._lay = QVBoxLayout(self)
+        self._lay.setContentsMargins(24, 20, 24, 20)
+        self._lay.setSpacing(10)
+        self._filter_query = ""
+        self._rebuild()
+
+    def _rebuild(self):
+        while self._lay.count():
+            item = self._lay.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.hide()
+                w.deleteLater()
+                continue
+            sub = item.layout()
+            if sub is not None:
+                while sub.count():
+                    si = sub.takeAt(0)
+                    sw = si.widget()
+                    if sw is not None:
+                        sw.hide()
+                        sw.deleteLater()
+                sub.deleteLater()
+
+        from memory.memory_manager import all_entries_for_ui
+
+        hdr = QLabel("🧠  O QUE O BRAHMA LEMBRA")
+        hdr.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
+        hdr.setStyleSheet(f"color: {C.PRI}; background: transparent; letter-spacing: 0.5px;")
+        self._lay.addWidget(hdr)
+
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
+        self._lay.addWidget(sep)
+
+        rows = all_entries_for_ui()
+        if self._filter_query:
+            q = self._filter_query.lower()
+            rows = [r for r in rows if q in r.get("key", "").lower() or q in r.get("value", "").lower() or q in r.get("category", "").lower()]
+
+        cap = QLabel(
+            f"{len(rows)} memórias armazenadas. Salvas localmente em memory/long_term.json. "
+            f"Brahma as recorda durante conversas relevantes."
+        )
+        cap.setWordWrap(True)
+        cap.setFont(QFont("Segoe UI", 8))
+        cap.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+        self._lay.addWidget(cap)
+
+        s_row = QHBoxLayout()
+        search_input = QLineEdit()
+        search_input.setPlaceholderText("Filtrar memórias (ex.: café, nome, trabalho, python)...")
+        search_input.setText(self._filter_query)
+        search_input.setStyleSheet(f"""
+            QLineEdit {{
+                background: rgba(20, 24, 32, 220);
+                color: {C.WHITE};
+                border: 1px solid {C.BORDER};
+                border-radius: 6px;
+                padding: 6px 10px;
+                font-size: 11px;
+            }}
+        """)
+        search_input.textChanged.connect(self._on_search_changed)
+        s_row.addWidget(search_input)
+        self._lay.addLayout(s_row)
+
+        if not rows:
+            empty = QLabel("Nenhuma memória correspondente encontrada.")
+            empty.setFont(QFont("Segoe UI", 10))
+            empty.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent; padding: 20px 0;")
+            self._lay.addWidget(empty)
+        else:
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFixedHeight(min(380, 42 * len(rows) + 20))
+            scroll.setStyleSheet(
+                f"QScrollArea {{ border: 1px solid {C.BORDER}; border-radius: 6px; "
+                f"background: rgba(12, 15, 20, 180); }}"
+            )
+            inner = QWidget()
+            inner.setStyleSheet("background: transparent;")
+            ilay = QVBoxLayout(inner)
+            ilay.setContentsMargins(8, 8, 8, 8)
+            ilay.setSpacing(6)
+
+            for r in rows:
+                line = QHBoxLayout()
+                line.setSpacing(8)
+
+                txt = QLabel(f"<b>{r['key'].replace('_', ' ')}</b>: <span style='color:{C.TEXT_MED}'>{r['value']}</span>")
+                txt.setWordWrap(True)
+                txt.setFont(QFont("Segoe UI", 9))
+                txt.setStyleSheet(f"color: {C.TEXT}; background: transparent;")
+                line.addWidget(txt, 1)
+
+                meta = QLabel(f"{r['category'][:4].upper()} · {r.get('updated') or '—'}")
+                meta.setFont(QFont("Segoe UI", 8))
+                meta.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+                line.addWidget(meta)
+
+                rm = QPushButton("✕")
+                rm.setFixedSize(22, 22)
+                rm.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+                rm.setCursor(Qt.CursorShape.PointingHandCursor)
+                rm.setToolTip("Esquecer este fato")
+                rm.setStyleSheet(f"""
+                    QPushButton {{
+                        background: transparent;
+                        color: {C.TEXT_DIM};
+                        border: 1px solid {C.BORDER};
+                        border-radius: 4px;
+                    }}
+                    QPushButton:hover {{
+                        color: {C.RED};
+                        border-color: {C.RED};
+                        background: rgba(255, 59, 48, 0.15);
+                    }}
+                """)
+                rm.clicked.connect(lambda _=False, c=r["category"], k=r["key"]: self._forget(c, k))
+                line.addWidget(rm)
+
+                holder = QWidget()
+                holder.setLayout(line)
+                ilay.addWidget(holder)
+
+            ilay.addStretch()
+            scroll.setWidget(inner)
+            self._lay.addWidget(scroll)
+
+        close = QPushButton("FECHAR")
+        close.setFixedHeight(34)
+        close.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        close.setCursor(Qt.CursorShape.PointingHandCursor)
+        close.setStyleSheet(f"""
+            QPushButton {{
+                background: rgba(255, 255, 255, 0.05);
+                color: {C.TEXT_MED};
+                border: 1px solid {C.BORDER};
+                border-radius: 6px;
+            }}
+            QPushButton:hover {{
+                color: {C.WHITE};
+                border-color: {C.BORDER_B};
+                background: rgba(255, 179, 0, 0.15);
+            }}
+        """)
+        close.clicked.connect(self._do_close)
+        self._lay.addWidget(close)
+
+        self.adjustSize()
+        p = self.parentWidget()
+        if p is not None:
+            self.move(max(16, (p.width() - self.width()) // 2), max(16, (p.height() - self.height()) // 2))
+
+    def _on_search_changed(self, text: str):
+        self._filter_query = text.strip()
+        self._rebuild()
+
+    def _forget(self, category: str, key: str):
+        from memory.memory_manager import forget
+        forget(key, category)
+        QTimer.singleShot(0, self._rebuild)
+
+    def _do_close(self):
         self.hide()
         self.closed.emit()
 
@@ -637,9 +1379,9 @@ def _launched_from_windows_startup() -> bool:
 
 def _default_app_settings() -> dict:
     return {
-        "startup_animation_enabled": True,
+        "startup_animation_enabled": False,
         "last_boot_stamp": 0,
-        "boot_sequence_played": False,
+        "boot_sequence_played": True,
         "show_workspace_on_startup": False,
         "launcher_pos": None,
         "launch_minimized": False,
@@ -664,9 +1406,9 @@ class _SysMetrics:
     def __init__(self):
         self.cpu  = 0.0
         self.mem  = 0.0
-        self.net  = 0.0   
-        self.gpu  = -1.0  
-        self.tmp  = -1.0  
+        self.net  = 0.0
+        self.gpu  = -1.0
+        self.tmp  = -1.0
         self._lock = threading.Lock()
         self._last_net = psutil.net_io_counters()
         self._last_net_t = time.time()
@@ -980,7 +1722,7 @@ class GestureCameraPreview(QFrame):
         self._smoothing_alpha = 0.8
         self._gesture_canvas_alpha = 0.0
         self._sensitivity = 2.2
-        self._sensitivity_levels = {"Low": 1.6, "Medium": 2.2, "High": 3.0, "Ultra": 4.0}
+        self._sensitivity_levels = {"Baixa": 1.6, "Média": 2.2, "Alta": 3.0, "Ultra": 4.0}
         self._invert_cursor_x = True
         self._invert_cursor_y = False
         self._cursor_calibration_x_min: float | None = None
@@ -998,7 +1740,7 @@ class GestureCameraPreview(QFrame):
         header_row.setContentsMargins(0, 0, 0, 0)
         header_row.setSpacing(10)
 
-        title = QLabel("HAND TRACKING")
+        title = QLabel("RASTREAMENTO DE MÃO")
         title.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
         title.setStyleSheet(f"color: {C.WHITE}; letter-spacing: 1px;")
         header_row.addWidget(title)
@@ -1009,12 +1751,12 @@ class GestureCameraPreview(QFrame):
         self._status_dot.setStyleSheet("border-radius: 6px; background: #ffb347;")
         header_row.addWidget(self._status_dot)
 
-        self._status_text = QLabel("SEARCHING")
+        self._status_text = QLabel("PROCURANDO")
         self._status_text.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
         self._status_text.setStyleSheet("color: #ffb347;")
         header_row.addWidget(self._status_text)
 
-        self._invert_btn = QPushButton("⇄ Invert: ON")
+        self._invert_btn = QPushButton("⇄ Inverter: ATIVADO")
         self._invert_btn.setCheckable(True)
         self._invert_btn.setChecked(True)
         self._invert_btn.setFixedHeight(26)
@@ -1025,13 +1767,13 @@ class GestureCameraPreview(QFrame):
         def _toggle_invert(checked):
             self._invert_cursor_x = checked
             self._hand_canvas.set_invert_x(checked)
-            self._invert_btn.setText("⇄ Invert: ON" if checked else "⇄ Invert: OFF")
+            self._invert_btn.setText("⇄ Inverter: ATIVADO" if checked else "⇄ Inverter: DESATIVADO")
         self._invert_btn.toggled.connect(_toggle_invert)
         header_row.addWidget(self._invert_btn)
 
         self._sensitivity_select = QComboBox()
-        self._sensitivity_select.addItems(["Low", "Medium", "High", "Ultra"])
-        self._sensitivity_select.setCurrentText("Medium")
+        self._sensitivity_select.addItems(["Baixa", "Média", "Alta", "Ultra"])
+        self._sensitivity_select.setCurrentText("Média")
         self._sensitivity_select.setFixedWidth(84)
         self._sensitivity_select.setStyleSheet(
             "QComboBox { background: rgba(255,255,255,0.05); color: #f4f6f8; border: 1px solid rgba(255, 179, 0,0.24); border-radius: 8px; padding: 4px 8px; }"
@@ -1045,7 +1787,7 @@ class GestureCameraPreview(QFrame):
         self._hand_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         lay.addWidget(self._hand_canvas)
 
-        self._status_hint_label = QLabel("Initializing hand detection...")
+        self._status_hint_label = QLabel("Inicializando detecção de mão...")
         self._status_hint_label.setFont(QFont("Segoe UI", 8))
         self._status_hint_label.setStyleSheet(f"color: {C.TEXT_DIM};")
         self._status_hint_label.setWordWrap(True)
@@ -1056,15 +1798,15 @@ class GestureCameraPreview(QFrame):
         footer.setHorizontalSpacing(16)
         footer.setVerticalSpacing(8)
 
-        self._status_value = QLabel("Searching")
+        self._status_value = QLabel("Procurando")
         self._confidence_value = QLabel("0%")
-        self._gesture_value = QLabel("None")
-        self._cursor_value = QLabel("Inactive")
+        self._gesture_value = QLabel("Nenhum")
+        self._cursor_value = QLabel("Inativo")
 
         for idx, (label_text, value_label) in enumerate([
             ("Status", self._status_value),
-            ("Confidence", self._confidence_value),
-            ("Gesture", self._gesture_value),
+            ("Confiança", self._confidence_value),
+            ("Gesto", self._gesture_value),
             ("Cursor", self._cursor_value),
         ]):
             label = QLabel(label_text.upper())
@@ -1085,7 +1827,7 @@ class GestureCameraPreview(QFrame):
         except Exception:
             pass
 
-        self._set_status("Camera offline", "lost")
+        self._set_status("Câmera offline", "lost")
         # Do not start camera automatically
 
     def closeEvent(self, event):
@@ -1133,14 +1875,14 @@ class GestureCameraPreview(QFrame):
             self._timer = QTimer(self)
             self._timer.timeout.connect(self._tick)
             self._timer.start(30)
-            self._set_status("Camera ready. Move your hand to steer the cursor.", "searching")
+            self._set_status("Câmera pronta. Mova a mão para controlar o cursor.", "searching")
             try:
                 import pyautogui
                 pyautogui.FAILSAFE = False
             except Exception:
                 pass
         except Exception as exc:
-            self._set_status(f"Gesture camera is offline: {exc}", "lost")
+            self._set_status(f"A câmera de gestos está offline: {exc}", "lost")
 
         if self._cap is not None:
             try:
@@ -1170,14 +1912,14 @@ class GestureCameraPreview(QFrame):
             self.setFixedHeight(self._collapsed_height)
         except Exception:
             pass
-        self._set_status("Camera stopped", "lost")
+        self._set_status("Câmera parada", "lost")
 
     def _download_hand_landmarker_model(self, model_path: Path) -> bool:
         temp_path = model_path.with_suffix(model_path.suffix + ".download")
         try:
             import urllib.request
 
-            self._set_status("Downloading gesture model...", "searching")
+            self._set_status("Baixando o modelo de gestos...", "searching")
             model_path.parent.mkdir(parents=True, exist_ok=True)
             with urllib.request.urlopen(MODEL_DOWNLOAD_URL, timeout=60) as response:
                 with open(temp_path, "wb") as out_file:
@@ -1207,17 +1949,17 @@ class GestureCameraPreview(QFrame):
         try:
             ret, frame = self._cap.read()
             if not ret or frame is None:
-                self._set_status("Camera feed dropped. Trying again…", "lost")
+                self._set_status("Sinal da câmera perdido. Tentando novamente…", "lost")
                 return
             self._process_frame(frame)
         except Exception as exc:
-            self._set_status(f"Gesture camera error: {exc}", "lost")
+            self._set_status(f"Erro na câmera de gestos: {exc}", "lost")
 
     def _process_frame(self, frame):
         try:
             import cv2
         except Exception as exc:
-            self._set_status(f"Gesture camera unavailable: {exc}", "lost")
+            self._set_status(f"Câmera de gestos indisponível: {exc}", "lost")
             return
 
         import importlib
@@ -1255,7 +1997,7 @@ class GestureCameraPreview(QFrame):
                     )
                     self._use_tasks_api = False
                 except Exception as exc:
-                    self._set_status(f"Gesture init error: {exc}", "lost")
+                    self._set_status(f"Erro de inicialização de gestos: {exc}", "lost")
                     return
             else:
                 vision = None
@@ -1276,7 +2018,7 @@ class GestureCameraPreview(QFrame):
                 model_dir.mkdir(parents=True, exist_ok=True)
                 model_path = model_dir / "hand_landmarker.task"
                 if not model_path.exists():
-                    self._set_status("Downloading model", "searching")
+                    self._set_status("Baixando modelo", "searching")
                     if not self._download_hand_landmarker_model(model_path):
                         return
 
@@ -1285,7 +2027,7 @@ class GestureCameraPreview(QFrame):
                     self._use_tasks_api = True
                     self._vision_module = vision
                 except Exception as exc:
-                    self._set_status(f"Gesture init error: {exc}", "lost")
+                    self._set_status(f"Erro de inicialização de gestos: {exc}", "lost")
                     return
 
         height, width = frame.shape[:2]
@@ -1300,7 +2042,7 @@ class GestureCameraPreview(QFrame):
                 mp_image = image_lib.Image(image_lib.ImageFormat.SRGB, np.ascontiguousarray(rgb))
                 results = self._hands.detect(mp_image)
             except Exception as exc:
-                self._set_status(f"Gesture task detect error: {exc}", "lost")
+                self._set_status(f"Erro de detecção de gestos: {exc}", "lost")
                 return
             if getattr(results, "hand_landmarks", None):
                 hand_landmarks = results.hand_landmarks[0]
@@ -1338,7 +2080,7 @@ class GestureCameraPreview(QFrame):
 
             if action == "play_pause":
                 _press_media_key("playpause")
-                self._show_gesture_toast("✋ Air Gesture: Play / Pause")
+                self._show_gesture_toast("✋ Gesto no Ar: Reproduzir / Pausar")
 
             elif action == "swipe_right":
                 # If tracking is inverted, swiping hand to user's right moves next
@@ -1347,7 +2089,7 @@ class GestureCameraPreview(QFrame):
                     pyautogui.press("right")
                 except Exception:
                     pass
-                self._show_gesture_toast("👉 Air Gesture: Next Track / Slide")
+                self._show_gesture_toast("👉 Gesto no Ar: Próxima Faixa / Slide")
 
             elif action == "swipe_left":
                 _press_media_key("prevtrack")
@@ -1355,15 +2097,15 @@ class GestureCameraPreview(QFrame):
                     pyautogui.press("left")
                 except Exception:
                     pass
-                self._show_gesture_toast("👈 Air Gesture: Previous Track / Slide")
+                self._show_gesture_toast("👈 Gesto no Ar: Faixa Anterior / Slide")
 
             elif action == "volume_up":
                 _press_media_key("volumeup")
-                self._show_gesture_toast("👍 Air Gesture: Volume Up")
+                self._show_gesture_toast("👍 Gesto no Ar: Aumentar Volume")
 
             elif action == "volume_down":
                 _press_media_key("volumedown")
-                self._show_gesture_toast("👎 Air Gesture: Volume Down")
+                self._show_gesture_toast("👎 Gesto no Ar: Diminuir Volume")
 
             elif action == "screenshot":
                 from datetime import datetime
@@ -1373,7 +2115,7 @@ class GestureCameraPreview(QFrame):
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                 shot_path = desktop_dir / f"screenshot_{ts}.png"
                 pyautogui.screenshot(str(shot_path))
-                self._show_gesture_toast("✌️ Screenshot saved to Desktop!")
+                self._show_gesture_toast("✌️ Captura de tela salva na Área de Trabalho!")
 
         except Exception as e:
             print(f"[AirGesture] Action '{action}' error: {e}")
@@ -1402,18 +2144,18 @@ class GestureCameraPreview(QFrame):
             self._hand_canvas.set_landmarks(self._smoothed_landmarks)
             self._hand_canvas.set_hand_visible(True)
             self._hand_canvas.set_search_phase(0)
-            self._set_status("Hand detected and tracking.", "tracking")
+            self._set_status("Mão detectada e rastreando.", "tracking")
             self._confidence_value.setText(f"{int(confidence * 100)}%")
-            self._gesture_value.setText(gesture.get("gesture_name", "Open Hand"))
-            self._cursor_value.setText("Active" if gesture.get("cursor") else "Inactive")
+            self._gesture_value.setText(gesture.get("gesture_name", "Mão Aberta"))
+            self._cursor_value.setText("Ativo" if gesture.get("cursor") else "Inativo")
         else:
             self._hand_canvas.set_hand_visible(False)
             self._search_phase = (self._search_phase + 1) % 32
             self._hand_canvas.set_search_phase(self._search_phase)
-            self._set_status("Searching for hand...", "searching")
+            self._set_status("Procurando pela mão...", "searching")
             self._confidence_value.setText("0%")
-            self._gesture_value.setText("None")
-            self._cursor_value.setText("Inactive")
+            self._gesture_value.setText("Nenhum")
+            self._cursor_value.setText("Inativo")
 
     def _calibrate_and_smooth_cursor(self, cursor: tuple[float, float]) -> tuple[float, float]:
         raw_x = float(cursor[0])
@@ -1448,7 +2190,7 @@ class GestureCameraPreview(QFrame):
         return self._smoothed_cursor
 
     def _set_sensitivity_level(self, level: str) -> None:
-        self._sensitivity = self._sensitivity_levels.get(level, self._sensitivity_levels["Medium"])
+        self._sensitivity = self._sensitivity_levels.get(level, self._sensitivity_levels["Média"])
 
     def _move_cursor(self, cursor):
         try:
@@ -1512,279 +2254,6 @@ def _active_net_label() -> str:
         pass
     return "No active adapter"
 
-class HudCanvas(QWidget):
-    def __init__(self, face_path: str, parent=None):
-        super().__init__(parent)
-        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
-        self.setMinimumSize(300, 300)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-
-        self.muted    = False
-        self.speaking = False
-        self.state    = "INITIALISING"
-
-        self._tick       = 0
-        self._scale      = 1.0
-        self._tgt_scale  = 1.0
-        self._halo       = 55.0
-        self._tgt_halo   = 55.0
-        self._last_t     = time.time()
-        self._scan       = 0.0
-        self._scan2      = 180.0
-        self._rings      = [0.0, 120.0, 240.0]
-        self._pulses: list[float] = [0.0, 50.0, 100.0]
-        self._blink      = True
-        self._blink_tick = 0
-        self._particles: list[list[float]] = []
-        self._face_px: QPixmap | None = None
-        self._load_face(face_path)
-
-        self._tmr = QTimer(self)
-        self._tmr.timeout.connect(self._step)
-        self._tmr.start(16)
-
-    def _load_face(self, path: str):
-        try:
-            from PIL import Image, ImageDraw
-            import io
-            img = Image.open(path).convert("RGBA")
-            sz  = min(img.size)
-            img = img.resize((sz, sz), Image.LANCZOS)
-            mk  = Image.new("L", (sz, sz), 0)
-            ImageDraw.Draw(mk).ellipse((2, 2, sz - 2, sz - 2), fill=255)
-            img.putalpha(mk)
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            px = QPixmap(); px.loadFromData(buf.getvalue())
-            self._face_px = px
-        except Exception:
-            self._face_px = None
-
-    def _step(self):
-        self._tick += 1
-        now = time.time()
-        if now - self._last_t > (0.12 if self.speaking else 0.5):
-            if self.speaking:
-                self._tgt_scale = random.uniform(1.06, 1.14)
-                self._tgt_halo  = random.uniform(145, 190)
-            elif self.muted:
-                self._tgt_scale = random.uniform(0.998, 1.002)
-                self._tgt_halo  = random.uniform(15, 28)
-            elif self.state == "LISTENING":
-                self._tgt_scale = random.uniform(1.008, 1.018)
-                self._tgt_halo  = random.uniform(90, 122)
-            elif self.state == "THINKING":
-                self._tgt_scale = random.uniform(1.012, 1.024)
-                self._tgt_halo  = random.uniform(78, 105)
-            elif self.state in ("EXECUTING", "PROCESSING"):
-                self._tgt_scale = random.uniform(1.016, 1.032)
-                self._tgt_halo  = random.uniform(110, 148)
-            else:
-                self._tgt_scale = random.uniform(1.001, 1.008)
-                self._tgt_halo  = random.uniform(48, 68)
-            self._last_t = now
-
-        sp = 0.38 if self.speaking else 0.15
-        self._scale += (self._tgt_scale - self._scale) * sp
-        self._halo  += (self._tgt_halo  - self._halo)  * sp
-
-        speeds = [1.3, -0.9, 2.0] if self.speaking else [0.55, -0.35, 0.9]
-        for i, spd in enumerate(speeds):
-            self._rings[i] = (self._rings[i] + spd) % 360
-
-        self._scan  = (self._scan  + (3.0 if self.speaking else 1.3)) % 360
-        self._scan2 = (self._scan2 + (-2.0 if self.speaking else -0.75)) % 360
-
-        fw  = min(self.width(), self.height())
-        lim = fw * 0.74
-        spd = 4.2 if self.speaking else 2.0
-        self._pulses = [r + spd for r in self._pulses if r + spd < lim]
-        if len(self._pulses) < 3 and random.random() < (0.07 if self.speaking else 0.025):
-            self._pulses.append(0.0)
-
-        if self.speaking and random.random() < 0.28:
-            cx, cy = self.width() / 2, self.height() / 2
-            ang = random.uniform(0, 2 * math.pi)
-            r_s = fw * 0.28
-            self._particles.append([
-                cx + math.cos(ang) * r_s, cy + math.sin(ang) * r_s,
-                math.cos(ang) * random.uniform(0.9, 2.4),
-                math.sin(ang) * random.uniform(0.9, 2.4) - 0.4, 1.0,
-            ])
-        self._particles = [
-            [p[0]+p[2], p[1]+p[3], p[2]*0.97, p[3]*0.97, p[4]-0.028]
-            for p in self._particles if p[4] > 0
-        ]
-
-        self._blink_tick += 1
-        if self._blink_tick >= 38:
-            self._blink = not self._blink
-            self._blink_tick = 0
-        self.update()
-
-    def _accent_color(self) -> QColor:
-        if self.muted:
-            return QColor(255, 179, 0, 255)
-        if self.speaking:
-            return QColor(255, 179, 0, 255)
-        if self.state == "LISTENING":
-            return QColor(69, 127, 255, 255)
-        if self.state == "THINKING":
-            return QColor(255, 185, 96, 255)
-        if self.state in ("EXECUTING", "PROCESSING"):
-            return QColor(255, 179, 0, 255)
-        return QColor(255, 179, 0, 255)
-
-    def paintEvent(self, _):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.fillRect(self.rect(), QColor(2, 3, 5, 20))
-
-        accent = self._accent_color()
-        W, H = self.width(), self.height()
-        cx, cy = W / 2, H / 2
-        fw = min(W, H)
-
-        # fine tactical grid and red signal noise
-        p.setPen(QPen(QColor(255, 255, 255, 8), 1))
-        for x in range(0, W, 48):
-            for y in range(0, H, 48):
-                p.drawPoint(x, y)
-        p.setPen(QPen(QColor(accent.red(), accent.green(), accent.blue(), 48), 1))
-        for side in (-1, 1):
-            base_x = cx + side * fw * 0.37
-            base_y = cy
-            for i in range(68):
-                x = base_x + side * (i * 1.4)
-                h = 4 + abs(math.sin(self._tick * 0.04 + i * 0.35)) * (8 + (i % 9) * 2)
-                if i % 11 == 0:
-                    h *= 1.8
-                p.drawLine(QPointF(x, base_y - h), QPointF(x, base_y + h))
-            p.drawLine(QPointF(base_x - side * 130, base_y), QPointF(base_x + side * 155, base_y))
-
-        r_face = fw * 0.34
-
-        # halo glow
-        for i in range(10):
-            r   = r_face * (1.8 - i * 0.08)
-            frc = 1.0 - i / 10
-            a   = max(0, min(255, int(self._halo * 0.055 * frc)))
-            col = QColor(255, 179, 0, a)
-            p.setPen(QPen(col, 1.2)); p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawEllipse(QRectF(cx - r, cy - r, r * 2, r * 2))
-
-        # pulse rings
-        for pr in self._pulses:
-            a   = max(0, int(230 * (1.0 - pr / (fw * 0.74))))
-            col = QColor(255, 179, 0, a)
-            p.setPen(QPen(col, 1.5)); p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawEllipse(QRectF(cx - pr, cy - pr, pr * 2, pr * 2))
-
-        # spinning arc rings
-        for idx, (r_frac, w_r, arc_l, gap) in enumerate(
-            [(0.48, 1.9, 115, 78), (0.42, 1.4, 78, 55), (0.35, 1.0, 56, 40)]
-        ):
-            ring_r = fw * r_frac
-            base   = self._rings[idx]
-            a_val  = max(0, min(180, int(self._halo * 0.45 * (1.0 - idx * 0.18))))
-            col    = QColor(accent.red(), accent.green(), accent.blue(), a_val)
-            p.setPen(QPen(col, w_r)); p.setBrush(Qt.BrushStyle.NoBrush)
-            angle = base
-            rect  = QRectF(cx - ring_r, cy - ring_r, ring_r * 2, ring_r * 2)
-            while angle < base + 360:
-                p.drawArc(rect, int(angle * 16), int(arc_l * 16))
-                angle += arc_l + gap
-
-        # scanners
-        sr = fw * 0.50
-        sa = min(200, int(self._halo * 0.8))
-        ex = 75 if self.speaking else 44
-        p.setPen(QPen(QColor(accent.red(), accent.green(), accent.blue(), sa), 1.5))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        srect = QRectF(cx - sr, cy - sr, sr * 2, sr * 2)
-        p.drawArc(srect, int(self._scan * 16), int(ex * 16))
-        p.setPen(QPen(QColor(255, 255, 255, max(28, sa // 4)), 1.0))
-        p.drawArc(srect, int(self._scan2 * 16), int(ex * 16))
-
-        # tick marks
-        t_out, t_in = fw * 0.497, fw * 0.474
-        p.setPen(QPen(QColor(245, 248, 255, 145), 1))
-        for deg in range(0, 360, 10):
-            rad = math.radians(deg)
-            inn = t_in if deg % 30 == 0 else t_in + 6
-            p.drawLine(
-                QPointF(cx + t_out * math.cos(rad), cy - t_out * math.sin(rad)),
-                QPointF(cx + inn  * math.cos(rad), cy - inn  * math.sin(rad)),
-            )
-
-        # crosshair
-        ch_r, gap_h = fw * 0.51, fw * 0.16
-        p.setPen(QPen(QColor(accent.red(), accent.green(), accent.blue(), int(self._halo * 0.5)), 1))
-        p.drawLine(QPointF(cx - ch_r, cy), QPointF(cx - gap_h, cy))
-        p.drawLine(QPointF(cx + gap_h, cy), QPointF(cx + ch_r, cy))
-        p.drawLine(QPointF(cx, cy - ch_r), QPointF(cx, cy - gap_h))
-        p.drawLine(QPointF(cx, cy + gap_h), QPointF(cx, cy + ch_r))
-
-        # corner brackets
-        bl = 28
-        bc = QColor(accent.red(), accent.green(), accent.blue(), 120)
-        hl, hr = cx - fw // 2, cx + fw // 2
-        ht, hb = cy - fw // 2, cy + fw // 2
-        p.setPen(QPen(bc, 1.5))
-        for bx, by, dx, dy in [(hl,ht,1,1),(hr,ht,-1,1),(hl,hb,1,-1),(hr,hb,-1,-1)]:
-            p.drawLine(QPointF(bx, by), QPointF(bx + dx * bl, by))
-            p.drawLine(QPointF(bx, by), QPointF(bx, by + dy * bl))
-
-        # face text only: remove the center orb circle overlay
-        title_font = QFont("Segoe UI", int(max(20, fw * 0.052)), QFont.Weight.Bold)
-        p.setFont(title_font)
-        y_title = cy - 25
-        p.setPen(QColor(245, 248, 255, 235))
-        p.drawText(QRectF(cx - 120, y_title, 130, 48), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, "Brah")
-        p.setPen(QColor(255, 98, 98, 245))
-        p.drawText(QRectF(cx + 8, y_title, 90, 48), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "ma")
-        p.setFont(QFont("Segoe UI", int(max(8, fw * 0.018)), QFont.Weight.Bold))
-        p.setPen(QColor(190, 196, 205, 190))
-        p.drawText(QRectF(cx - 90, cy + 18, 180, 22), Qt.AlignmentFlag.AlignCenter, "AI ASSISTANT")
-
-        # keep the center clean: no extra particles
-
-        # status text
-        sy = cy + fw * 0.40
-        if self.muted:
-            txt, col = "MIC STATUS\nMUTED", QColor(255, 179, 0, 235)
-        elif self.speaking:
-            txt, col = "MIC STATUS\nSPEAKING", QColor(255, 255, 255, 235)
-        elif self.state == "THINKING":
-            txt, col = "AI CORE\nTHINKING", QColor(255, 185, 96, 235)
-        elif self.state in ("PROCESSING", "EXECUTING"):
-            txt, col = "AI CORE\nEXECUTING", QColor(255, 179, 0, 235)
-        elif self.state == "LISTENING":
-            txt, col = "MIC STATUS\nLISTENING", QColor(69, 127, 255, 220)
-        else:
-            txt, col = f"AI CORE\n{self.state}", QColor(255, 255, 255, 220)
-
-        p.setPen(QPen(col, 1))
-        p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-        top_status, bottom_status = txt.split("\n", 1)
-        p.drawText(QRectF(0, sy, W, 18), Qt.AlignmentFlag.AlignCenter, top_status)
-        p.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
-        p.drawText(QRectF(0, sy + 18, W, 24), Qt.AlignmentFlag.AlignCenter, bottom_status)
-
-        # waveform
-        wy = sy + 30
-        N, bw = 36, 8
-        wx0 = (W - N * bw) / 2
-        for i in range(N):
-            if self.muted:
-                hgt, cl = 2, qcol(C.MUTED_C)
-            elif self.speaking:
-                hgt = random.randint(3, 20)
-                cl  = qcol(C.PRI) if hgt > 12 else qcol(C.PRI_DIM)
-            else:
-                hgt = int(3 + 2 * math.sin(self._tick * 0.09 + i * 0.6))
-                cl  = QColor(accent.red(), accent.green(), accent.blue(), 90 if self.state == "LISTENING" else 60)
-            p.fillRect(QRectF(wx0 + i * bw, wy + 20 - hgt, bw - 1, hgt), cl)
 
 class MetricBar(QWidget):
 
@@ -1950,7 +2419,7 @@ class TaskCard(QFrame):
         lay.setSpacing(10)
 
         row = QHBoxLayout()
-        self._title = QLabel("Task Workspace")
+        self._title = QLabel("Área de Tarefas")
         self._title.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
         self._title.setStyleSheet(f"color: {C.PRI}; background: transparent;")
 
@@ -1963,25 +2432,25 @@ class TaskCard(QFrame):
         row.addWidget(self._pct)
         lay.addLayout(row)
 
-        self._command_lbl = QLabel("Command: waiting for input")
+        self._command_lbl = QLabel("Comando: aguardando entrada")
         self._command_lbl.setWordWrap(True)
         self._command_lbl.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
         self._command_lbl.setStyleSheet(f"color: {C.WHITE}; background: transparent;")
         lay.addWidget(self._command_lbl)
 
-        self._plan_lbl = QLabel("Plan: Brahma Echo will generate a task plan after you send a command.")
+        self._plan_lbl = QLabel("Plano: o ULTRON vai gerar um plano de tarefas após você enviar um comando.")
         self._plan_lbl.setWordWrap(True)
         self._plan_lbl.setFont(QFont("Segoe UI", 9))
         self._plan_lbl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
         lay.addWidget(self._plan_lbl)
 
-        self._status_lbl = QLabel("Status: Idle")
+        self._status_lbl = QLabel("Status: Ocioso")
         self._status_lbl.setWordWrap(True)
         self._status_lbl.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
         self._status_lbl.setStyleSheet(f"color: {C.WHITE}; background: transparent;")
         lay.addWidget(self._status_lbl)
 
-        self._output_lbl = QLabel("Output: Ready to work.")
+        self._output_lbl = QLabel("Saída: Pronto para trabalhar.")
         self._output_lbl.setWordWrap(True)
         self._output_lbl.setFont(QFont("Segoe UI", 9))
         self._output_lbl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
@@ -2007,7 +2476,7 @@ class TaskCard(QFrame):
         )
         lay.addWidget(self._bar)
 
-        self._foot = QLabel("Working on it...")
+        self._foot = QLabel("Trabalhando nisso...")
         self._foot.setFont(QFont("Segoe UI", 9))
         self._foot.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
         lay.addWidget(self._foot)
@@ -2021,33 +2490,33 @@ class TaskCard(QFrame):
         self._title.setText(title)
         self._status_lbl.setText(desc)
         self._output_lbl.setText(desc)
-        self._plan_lbl.setText("Plan: Brahma Echo will generate a task plan after you send a command.")
-        self._command_lbl.setText("Command: waiting for input")
+        self._plan_lbl.setText("Plano: o ULTRON vai gerar um plano de tarefas após você enviar um comando.")
+        self._command_lbl.setText("Comando: aguardando entrada")
         self._pct.setText(f"{percent}%")
         self._bar.setValue(max(0, min(100, percent)))
 
     def _format_plan(self, plan: list[str] | str | None) -> str:
         if not plan:
-            return "Plan: • Understand the request\n       • Execute the right tools\n       • Return the result"
+            return "Plano: • Entender a solicitação\n       • Executar as ferramentas certas\n       • Retornar o resultado"
         if isinstance(plan, str):
             text = plan.strip()
-            return f"Plan: {text}" if text.lower().startswith("plan:") else f"Plan: {text}"
+            return f"Plano: {text}" if text.lower().startswith("plano:") else f"Plano: {text}"
         items = [str(item).strip() for item in plan if str(item).strip()]
         if not items:
-            return "Plan: • Understand the request\n       • Execute the right tools\n       • Return the result"
+            return "Plano: • Entender a solicitação\n       • Executar as ferramentas certas\n       • Retornar o resultado"
         return "Plan:\n" + "\n".join(f"• {item}" for item in items)
 
     def start_workspace(self, command: str, plan: list[str] | str | None = None, source: str = "local"):
         self._active = True
         self._workspace_locked = False
-        self._title.setText("Task Workspace")
-        self._command_lbl.setText(f"Command: {command or 'waiting for input'}")
+        self._title.setText("Área de Tarefas")
+        self._command_lbl.setText(f"Comando: {command or 'aguardando entrada'}")
         self._plan_lbl.setText(self._format_plan(plan))
-        self._status_lbl.setText("Status: Planning task...")
-        self._output_lbl.setText("Output: Waiting for execution.")
+        self._status_lbl.setText("Status: Planejando tarefa...")
+        self._output_lbl.setText("Saída: Aguardando execução.")
         self._pct.setText("8%")
         self._bar.setValue(8)
-        self._foot.setText(f"Source: {source}")
+        self._foot.setText(f"Origem: {source}")
         # self.show() intentionally removed to prevent flashing on quick/normal chats
 
     def update_workspace(self, *, title: str | None = None, command: str | None = None, plan: list[str] | str | None = None,
@@ -2056,13 +2525,13 @@ class TaskCard(QFrame):
         if title:
             self._title.setText(title)
         if command:
-            self._command_lbl.setText(f"Command: {command}")
+            self._command_lbl.setText(f"Comando: {command}")
         if plan is not None:
             self._plan_lbl.setText(self._format_plan(plan))
         if status:
             self._status_lbl.setText(f"Status: {status}" if not status.lower().startswith("status:") else status)
         if output:
-            self._output_lbl.setText(f"Output: {output}" if not output.lower().startswith("output:") else output)
+            self._output_lbl.setText(f"Saída: {output}" if not output.lower().startswith("saída:") else output)
         if percent is not None:
             pct = max(0, min(100, int(percent)))
             self._pct.setText(f"{pct}%")
@@ -2073,29 +2542,29 @@ class TaskCard(QFrame):
         if percent is not None and int(percent) > 10:
             self.show()
 
-    def finish_workspace(self, result: str, status: str = "Task completed.", percent: int = 100):
+    def finish_workspace(self, result: str, status: str = "Tarefa concluída.", percent: int = 100):
         self._active = False
         self._workspace_locked = True
-        self._title.setText("Task Complete")
+        self._title.setText("Tarefa Concluída")
         self._status_lbl.setText(f"Status: {status}")
-        self._output_lbl.setText(f"Output: {result or 'Done.'}")
+        self._output_lbl.setText(f"Saída: {result or 'Concluído.'}")
         self._pct.setText(f"{max(0, min(100, percent))}%")
         self._bar.setValue(max(0, min(100, percent)))
-        self._foot.setText("Resetting workspace shortly...")
+        self._foot.setText("Redefinindo a área de tarefas em instantes...")
         self.show()
         QTimer.singleShot(5000, self.clear_workspace)
 
     def clear_workspace(self):
         self._active = False
         self._workspace_locked = False
-        self._title.setText("Ready")
-        self._command_lbl.setText("Command: waiting for input")
-        self._plan_lbl.setText("Plan: Brahma Echo will generate a task plan after you send a command.")
-        self._status_lbl.setText("Status: Idle")
-        self._output_lbl.setText("Output: Ready to work.")
+        self._title.setText("Pronto")
+        self._command_lbl.setText("Comando: aguardando entrada")
+        self._plan_lbl.setText("Plano: o ULTRON vai gerar um plano de tarefas após você enviar um comando.")
+        self._status_lbl.setText("Status: Ocioso")
+        self._output_lbl.setText("Saída: Pronto para trabalhar.")
         self._pct.setText("0%")
         self._bar.setValue(0)
-        self._foot.setText("Working on it...")
+        self._foot.setText("Trabalhando nisso...")
         self.hide()
 
 
@@ -2199,14 +2668,17 @@ class EventCard(QFrame):
         icon_lbl.setStyleSheet(f"background: transparent; color: {accent};")
         lay.addWidget(icon_lbl)
 
-        full_text = f"{title}: {detail}" if detail and detail != title else title
+        clean_detail = (detail or "").strip()
+        if len(clean_detail) > 160:
+            clean_detail = clean_detail[:157] + "..."
+        full_text = f"{title}: {clean_detail}" if clean_detail and clean_detail != title else title
         title_lbl = QLabel(full_text)
         title_lbl.setFont(QFont("Segoe UI", 9))
+        title_lbl.setWordWrap(True)
+        title_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         title_lbl.setStyleSheet("color: rgba(255,255,255,0.85); background: transparent;")
-        lay.addWidget(title_lbl)
-        
-        lay.addStretch(1)
-        
+        lay.addWidget(title_lbl, 1)
+
         stamp_lbl = QLabel(stamp)
         stamp_lbl.setFont(QFont("Segoe UI", 7))
         stamp_lbl.setStyleSheet("color: rgba(255,255,255,0.4); background: transparent;")
@@ -2270,8 +2742,8 @@ class ArtifactCard(QFrame):
 
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
-        self._open_btn = QPushButton("Open")
-        self._reveal_btn = QPushButton("Reveal Folder")
+        self._open_btn = QPushButton("Abrir")
+        self._reveal_btn = QPushButton("Mostrar Pasta")
         self._open_btn.clicked.connect(self._open_file)
         self._reveal_btn.clicked.connect(self._reveal_file)
         if not self._path or not Path(self._path).exists():
@@ -2310,9 +2782,20 @@ class ChatBubble(QFrame):
         self._typing_index = 0
         self._typing_timer: QTimer | None = None
         self.setObjectName("ChatBubble")
-        self.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Minimum)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         self.setMinimumHeight(1)
-        bg_style = "background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(26, 22, 16, 0.7), stop:1 rgba(14, 11, 7, 0.9)); border: 1px solid rgba(255, 179, 0, 0.22); border-radius: 16px;" if role != "user" else "background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(255, 255, 255, 0.03), stop:1 rgba(255, 255, 255, 0.06)); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 16px;"
+        max_w = 340
+        if parent and hasattr(parent, "viewport"):
+            max_w = max(200, int(parent.viewport().width() * 0.84))
+        self.setMaximumWidth(max_w)
+        if role == "user":
+            self.setMinimumWidth(120)
+
+        bg_style = (
+            "background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(20, 16, 12, 0.45), stop:1 rgba(10, 8, 5, 0.60)); border: 1px solid rgba(255, 179, 0, 0.25); border-radius: 16px;"
+            if role != "user"
+            else "background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 rgba(255, 179, 0, 0.22), stop:1 rgba(210, 140, 0, 0.32)); border: 1px solid rgba(255, 179, 0, 0.55); border-radius: 16px;"
+        )
         self.setStyleSheet(f"QFrame#ChatBubble {{ {bg_style} }}")
 
         outer = QVBoxLayout(self)
@@ -2321,12 +2804,12 @@ class ChatBubble(QFrame):
 
         head = QHBoxLayout()
         head.setContentsMargins(0, 0, 0, 0)
-        head.setSpacing(10)
+        head.setSpacing(8)
 
         if role == "assistant":
             avatar = _framed_logo(24, 24, bg="rgba(12,14,20,245)", border="rgba(255,179,0,0.50)", radius=12, inset=4)
             head.addWidget(avatar)
-            name_lbl = QLabel(name or "Brahma Echo")
+            name_lbl = QLabel(name or "ULTRON")
             name_lbl.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
             name_lbl.setStyleSheet("color: #ffffff; background: transparent;")
             head.addWidget(name_lbl)
@@ -2336,7 +2819,11 @@ class ChatBubble(QFrame):
             name_lbl.setStyleSheet("color: #ffffff; background: transparent;")
             head.addWidget(name_lbl)
         elif role == "user":
-            name_lbl = QLabel(name or "You")
+            user_icon = QLabel("👤")
+            user_icon.setFont(QFont("Segoe UI", 9))
+            user_icon.setStyleSheet("color: #ffb300; background: transparent;")
+            head.addWidget(user_icon)
+            name_lbl = QLabel(name or "Você")
             name_lbl.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
             name_lbl.setStyleSheet("color: #ffffff; background: transparent;")
             head.addWidget(name_lbl)
@@ -2510,10 +2997,10 @@ class ConversationFeed(QScrollArea):
         lay = QVBoxLayout(frame)
         lay.setContentsMargins(14, 12, 14, 12)
         lay.setSpacing(10)
-        title = QLabel("Try asking Brahma Echo")
+        title = QLabel("Experimente pedir ao ULTRON")
         title.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
         title.setStyleSheet("color: #ffffff; background: transparent;")
-        subtitle = QLabel("Create a presentation, analyze a screen, build a website, organize files, or run browser automation.")
+        subtitle = QLabel("Crie uma apresentação, analise uma tela, construa um site, organize arquivos ou execute automação de navegador.")
         subtitle.setWordWrap(True)
         subtitle.setStyleSheet("color: rgba(255,255,255,0.64); background: transparent;")
         lay.addWidget(title)
@@ -2521,16 +3008,16 @@ class ConversationFeed(QScrollArea):
         grid = QGridLayout()
         grid.setSpacing(8)
         self._empty_widget_buttons = []
-        for idx, suggestion in enumerate([
-            "Create Presentation",
-            "Analyze Screen",
-            "Build Website",
-            "Organize Downloads",
-            "Browser Automation",
+        for idx, (suggestion, command) in enumerate([
+            ("Criar Apresentação", "Create Presentation"),
+            ("Analisar Tela", "Analyze Screen"),
+            ("Construir Site", "Build Website"),
+            ("Organizar Downloads", "Organize Downloads"),
+            ("Automação de Navegador", "Browser Automation"),
         ]):
             btn = QPushButton(suggestion)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.clicked.connect(lambda _=False, s=suggestion: self._emit_empty_suggestion(s))
+            btn.clicked.connect(lambda _=False, s=command: self._emit_empty_suggestion(s))
             self._empty_widget_buttons.append(btn)
             grid.addWidget(btn, idx // 2, idx % 2)
         lay.addLayout(grid)
@@ -2556,6 +3043,9 @@ class ConversationFeed(QScrollArea):
         self._message_count = 0
 
     def add_message(self, role: str, name: str, text: str, stamp: str, attachments: list[dict] | None = None, animate: bool = False, event_type: str | None = None):
+        vw = self.viewport().width()
+        if hasattr(self, "_content") and self._content is not None and vw > 20:
+            self._content.setFixedWidth(vw)
         if self._layout.count() and self._layout.itemAt(self._layout.count() - 1).spacerItem() is not None:
             self._layout.takeAt(self._layout.count() - 1)
         if role == "system":
@@ -2570,9 +3060,7 @@ class ConversationFeed(QScrollArea):
         else:
             bubble = ChatBubble(role, name, text, stamp, attachments=attachments, parent=self, animate=animate)
             self._layout.addWidget(bubble, alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        
 
-                
         self._layout.addStretch(1)
         self._message_count += 1
         self._sync_empty_state()
@@ -2580,50 +3068,52 @@ class ConversationFeed(QScrollArea):
 
     def _build_event_card(self, text: str, stamp: str, event_type: str | None = None) -> QWidget:
         low = (event_type or text or "").lower()
-        title = "System Event"
+        title = "Evento do Sistema"
         icon = "●"
         accent = "#ffb300"
-        if "discord" in low and "connected" in low:
-            title, icon, accent = "Discord Connected", "◉", "#5865F2"
-        elif "presentation" in low:
-            title, icon, accent = "Presentation Generated", "▣", "#ff7a45"
-        elif "website" in low:
-            title, icon, accent = "Website Created", "⌂", "#37ff5f"
-        elif "spreadsheet" in low:
-            title, icon, accent = "Spreadsheet Generated", "▦", "#6fd6ff"
-        elif "browser" in low:
-            title, icon, accent = "Browser Automation Completed", "↗", "#ffbf00"
-        elif "organ" in low and "file" in low:
-            title, icon, accent = "File Organization Completed", "🗂", "#37ff5f"
-        elif "screen" in low and "analysis" in low:
-            title, icon, accent = "Screen Analysis Completed", "◫", "#6fd6ff"
+        if "discord" in low and ("connected" in low or "conectado" in low):
+            title, icon, accent = "Discord Conectado", "◉", "#5865F2"
+        elif "presentation" in low or "apresenta" in low:
+            title, icon, accent = "Apresentação Gerada", "▣", "#ff7a45"
+        elif "website" in low or "site" in low:
+            title, icon, accent = "Site Criado", "⌂", "#37ff5f"
+        elif "spreadsheet" in low or "planilha" in low:
+            title, icon, accent = "Planilha Gerada", "▦", "#6fd6ff"
+        elif "browser" in low or "navegador" in low:
+            title, icon, accent = "Automação de Navegador Concluída", "↗", "#ffbf00"
+        elif ("organ" in low and "file" in low) or ("organiz" in low and "arquivo" in low):
+            title, icon, accent = "Organização de Arquivos Concluída", "🗂", "#37ff5f"
+        elif ("screen" in low and "analysis" in low) or ("tela" in low and "análise" in low):
+            title, icon, accent = "Análise de Tela Concluída", "◫", "#6fd6ff"
         return EventCard(title, text, stamp, icon=icon, accent=accent, parent=self)
 
     def _build_artifact_card(self, text: str, attachments: list[dict] | None = None, stamp: str = "") -> QWidget:
         attachment = (attachments or [{}])[0] if attachments else {}
         path = str(attachment.get("path") or attachment.get("file") or attachment.get("name") or "").strip()
-        title = str(attachment.get("name") or attachment.get("title") or Path(path).name or "Generated File").strip()
+        title = str(attachment.get("name") or attachment.get("title") or Path(path).name or "Arquivo Gerado").strip()
         suffix = Path(path or title).suffix.lstrip(".").upper() or (str(attachment.get("type") or "FILE")).upper()
-        status = "Ready"
+        status = "Pronto"
         return ArtifactCard(title, file_type=suffix, status=status, path=path or title, parent=self)
 
     def scroll_to_bottom(self):
         bar = self.verticalScrollBar()
         bar.setValue(bar.maximum())
 
-    def load_messages(self, messages: list[dict[str, Any]]):
+    def load_messages(self, messages: list[dict[str, Any]], max_display: int = 40):
         self.clear_messages()
-        for msg in messages:
+        # Cap batch to recent messages to prevent UI thread freeze with large histories
+        display_messages = messages[-max_display:] if len(messages) > max_display else messages
+        for msg in display_messages:
             role = (msg.get("role") or "assistant").strip().lower()
             content = msg.get("content") or ""
             stamp = _fmt_time_stamp(msg.get("timestamp"))
             attachments = msg.get("attachments") or []
             name = {
-                "user": "You",
-                "assistant": "Brahma Echo",
-                "system": "System",
-                "file": "Files",
-            }.get(role, "Brahma Echo")
+                "user": "Você",
+                "assistant": "ULTRON",
+                "system": "Sistema",
+                "file": "Arquivos",
+            }.get(role, "ULTRON")
             self.add_message(role, name, content, stamp, attachments=attachments, animate=False)
         self._sync_empty_state()
         QTimer.singleShot(0, self.scroll_to_bottom)
@@ -2645,10 +3135,16 @@ class ConversationFeed(QScrollArea):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        for i in range(self._layout.count()):
-            widget = self._layout.itemAt(i).widget()
-            if hasattr(widget, "_fit_to_content"):
-                widget._fit_to_content()
+        vw = self.viewport().width()
+        if hasattr(self, "_content") and self._content is not None and vw > 20:
+            self._content.setFixedWidth(vw)
+            for i in range(self._layout.count()):
+                w = self._layout.itemAt(i).widget()
+                if w and isinstance(w, ChatBubble):
+                    max_w = max(180, int(vw * 0.84))
+                    w.setMaximumWidth(max_w)
+                elif w and hasattr(w, "_fit_to_content"):
+                    w._fit_to_content()
         QTimer.singleShot(0, self.scroll_to_bottom)
 
 
@@ -2676,7 +3172,7 @@ class TaskDock(QFrame):
 
         header = QHBoxLayout()
         header.setSpacing(8)
-        self._title = QLabel("TASK WORKSPACE")
+        self._title = QLabel("ÁREA DE TAREFAS")
         self._title.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
         self._title.setStyleSheet(f"color: {C.PRI}; background: transparent; letter-spacing: 1px;")
         header.addWidget(self._title)
@@ -2708,7 +3204,7 @@ class TaskDock(QFrame):
         self._task_card = TaskCard()
         lay.addWidget(self._task_card)
 
-        self._mini_hint = QLabel("TASK")
+        self._mini_hint = QLabel("TAREFA")
         self._mini_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._mini_hint.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
         self._mini_hint.setStyleSheet(
@@ -2734,7 +3230,7 @@ class TaskDock(QFrame):
         self._content.setVisible(not self._collapsed)
         self._mini_hint.setVisible(self._collapsed)
         self._toggle_btn.setText(">" if self._collapsed else "<")
-        self._toggle_btn.setToolTip("Open task workspace" if self._collapsed else "Collapse task workspace")
+        self._toggle_btn.setToolTip("Abrir a área de tarefas" if self._collapsed else "Recolher a área de tarefas")
         self._title.setVisible(not self._collapsed)
         self.setFixedWidth(self._collapsed_w if self._collapsed else self._expanded_w)
 
@@ -2746,7 +3242,7 @@ class TaskDock(QFrame):
     def update_workspace(self, **kwargs):
         self._task_card.update_workspace(**kwargs)
 
-    def finish_workspace(self, result: str, status: str = "Task completed.", percent: int = 100):
+    def finish_workspace(self, result: str, status: str = "Tarefa concluída.", percent: int = 100):
         self._task_card.finish_workspace(result, status, percent)
 
     def clear_workspace(self):
@@ -2810,26 +3306,29 @@ class WorkspaceSidebar(QWidget):
 
         header = QHBoxLayout()
         header.setSpacing(10)
-        self._title = QLabel("CHAT + TASK WORKSPACE")
-        self._title.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
+        self._title = QLabel("ÁREA DE TRABALHO ULTRON")
+        self._title.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
         self._title.setStyleSheet("color: #FFFFFF; background: transparent; letter-spacing: 1px;")
         header.addWidget(self._title)
         header.addStretch()
-        self._close_btn = QPushButton("BRAHMA ECHO")
+        self._close_btn = QPushButton("✕")
+        self._close_btn.setToolTip("Fechar Área de Trabalho")
         self._close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._close_btn.setFixedHeight(30)
-        self._close_btn.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        self._close_btn.setFixedSize(30, 30)
+        self._close_btn.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
         self._close_btn.setStyleSheet(
             """
             QPushButton {
-                background: rgba(15,15,20,220);
-                color: #FFFFFF;
-                border: 1px solid rgba(255, 179, 0,120);
-                border-radius: 10px;
-                padding: 0 12px;
+                background: rgba(255, 255, 255, 0.06);
+                color: rgba(255, 255, 255, 0.85);
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                border-radius: 15px;
+                padding: 0;
             }
             QPushButton:hover {
-                border: 1px solid rgba(255, 179, 0,200);
+                background: rgba(255, 82, 82, 0.25);
+                color: #FF5252;
+                border: 1px solid rgba(255, 82, 82, 0.50);
             }
             """
         )
@@ -2840,7 +3339,7 @@ class WorkspaceSidebar(QWidget):
         self._tab_row = QHBoxLayout()
         self._tab_row.setSpacing(8)
         self._chat_tab_btn = self._make_tab_button("CHAT", True)
-        self._history_tab_btn = self._make_tab_button("HISTORY", False)
+        self._history_tab_btn = self._make_tab_button("HISTÓRICO", False)
         self._chat_tab_btn.clicked.connect(lambda: self._set_tab(0))
         self._history_tab_btn.clicked.connect(lambda: self._set_tab(1))
         self._tab_row.addWidget(self._chat_tab_btn)
@@ -2932,7 +3431,7 @@ class WorkspaceSidebar(QWidget):
         mem_lay = QVBoxLayout(self._memory_frame)
         mem_lay.setContentsMargins(12, 10, 12, 10)
         mem_lay.setSpacing(6)
-        mem_title = QLabel("Using Memory:")
+        mem_title = QLabel("Usando Memória:")
         mem_title.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
         mem_title.setStyleSheet("color: #FFFFFF; background: transparent;")
         self._memory_items = QLabel("")
@@ -2945,9 +3444,62 @@ class WorkspaceSidebar(QWidget):
         self._feed = ConversationFeed()
         lay.addWidget(self._feed, 1)
 
-        # Keep an internal input stub for signal safety, but do not render a command bar here.
-        self._input = QLineEdit(self)
-        self._input.hide()
+        # Sleek modern chat input container for Workspace
+        input_container = QFrame()
+        input_container.setStyleSheet(
+            f"QFrame {{ "
+            f"  background: rgba(14, 17, 24, 0.75); "
+            f"  border: 1px solid rgba(255, 179, 0, 0.35); "
+            f"  border-radius: 14px; "
+            f"}}"
+        )
+        input_row = QHBoxLayout(input_container)
+        input_row.setContentsMargins(10, 6, 10, 6)
+        input_row.setSpacing(8)
+
+        self._attach_btn = QPushButton("📎")
+        self._attach_btn.setFixedSize(30, 30)
+        self._attach_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._attach_btn.setToolTip("Anexar arquivo")
+        self._attach_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; color: {C.WHITE}; border: none; font-size: 14px; }}"
+            f"QPushButton:hover {{ color: {C.PRI}; }}"
+        )
+        self._attach_btn.clicked.connect(self.attach_requested.emit)
+        input_row.addWidget(self._attach_btn)
+
+        self._input = QLineEdit()
+        self._input.setPlaceholderText("Envie uma mensagem ao ULTRON...")
+        self._input.setFont(QFont("Segoe UI", 10))
+        self._input.setStyleSheet(
+            f"QLineEdit {{ background: transparent; color: {C.WHITE}; border: none; padding: 2px 4px; selection-background-color: rgba(255, 179, 0, 0.25); }}"
+        )
+        self._input.returnPressed.connect(self._send)
+        input_row.addWidget(self._input, 1)
+
+        self._mic_btn = QPushButton("🎙")
+        self._mic_btn.setFixedSize(30, 30)
+        self._mic_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._mic_btn.setToolTip("Alternar Voz")
+        self._mic_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; color: {C.WHITE}; border: none; font-size: 14px; }}"
+            f"QPushButton:hover {{ color: {C.PRI}; }}"
+        )
+        self._mic_btn.clicked.connect(self.mic_requested.emit)
+        input_row.addWidget(self._mic_btn)
+
+        self._send_btn = QPushButton("➤")
+        self._send_btn.setFixedSize(32, 30)
+        self._send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._send_btn.setToolTip("Enviar mensagem (Enter)")
+        self._send_btn.setStyleSheet(
+            f"QPushButton {{ background: rgba(255, 179, 0, 0.25); color: {C.PRI}; border: 1px solid rgba(255, 179, 0, 0.50); border-radius: 8px; font-weight: bold; font-size: 13px; }}"
+            f"QPushButton:hover {{ background: rgba(255, 179, 0, 0.45); color: #FFFFFF; border-color: {C.PRI}; }}"
+        )
+        self._send_btn.clicked.connect(self._send)
+        input_row.addWidget(self._send_btn)
+
+        lay.addWidget(input_container)
 
         return page
 
@@ -2959,7 +3511,7 @@ class WorkspaceSidebar(QWidget):
         lay.setSpacing(10)
 
         self._history_search = QLineEdit()
-        self._history_search.setPlaceholderText("Search conversations...")
+        self._history_search.setPlaceholderText("Pesquisar conversas...")
         self._history_search.setFont(QFont("Segoe UI", 10))
         self._history_search.setFixedHeight(38)
         self._history_search.setStyleSheet(
@@ -3036,7 +3588,7 @@ class WorkspaceSidebar(QWidget):
         groups = self._store.grouped_conversations(search)
         current = self._active_conversation_id
         if not groups:
-            empty = QLabel("No conversations yet.")
+            empty = QLabel("Ainda não há conversas.")
             empty.setStyleSheet("color: rgba(255,255,255,0.60); background: transparent;")
             self._history_layout.addWidget(empty)
             self._history_layout.addStretch(1)
@@ -3176,6 +3728,11 @@ class WorkspaceSidebar(QWidget):
         x = screen.right() + 8
         return QRectF(x, y, w, h)
 
+    def focus_input(self):
+        self._set_tab(0)
+        if hasattr(self, "_input") and self._input.isVisible():
+            self._input.setFocus(Qt.FocusReason.OtherFocusReason)
+
     def show_workspace(self, animate: bool = True):
         self._collapsed = False
         self._panel.show()
@@ -3195,6 +3752,7 @@ class WorkspaceSidebar(QWidget):
         else:
             self.setGeometry(dock.toRect())
         self._panel.setGeometry(0, 0, self.width(), self.height())
+        QTimer.singleShot(100, self.focus_input)
 
     def hide_workspace(self, animate: bool = True):
         self._collapsed = True
@@ -3244,7 +3802,7 @@ class WorkspaceSidebar(QWidget):
         if not raw:
             return
         low = raw.lower()
-        if low.startswith(("you:", "brahma echo:")):
+        if low.startswith(("you:", "ultron:", "brahma echo:")):
             return
         if low.startswith("sys:"):
             self.record_chat_event({"role": "system", "text": raw.split(":", 1)[1].strip(), "source": "local"})
@@ -3261,13 +3819,13 @@ class WorkspaceSidebar(QWidget):
         if role == "user":
             convo_id = self._store.record_chat("user", text, conversation_id=convo_id, attachments=attachments)
             self._active_conversation_id = convo_id
-            self._feed.add_message("user", "You", text, _fmt_time_stamp(stamp), attachments=attachments)
+            self._feed.add_message("user", "Você", text, _fmt_time_stamp(stamp), attachments=attachments)
             memories = self._store.search_memories(text)
             self._show_memory_banner(memories)
         elif role == "assistant":
             convo_id = self._store.record_chat("assistant", text, conversation_id=convo_id, attachments=attachments)
             self._active_conversation_id = convo_id
-            self._feed.add_message("assistant", "Brahma Echo", text, _fmt_time_stamp(stamp), attachments=attachments, animate=True)
+            self._feed.add_message("assistant", "ULTRON", text, _fmt_time_stamp(stamp), attachments=attachments, animate=True)
             self._hide_memory_banner()
         elif role == "system":
             convo_id = self._store.record_chat("system", text, conversation_id=convo_id, attachments=attachments)
@@ -3309,7 +3867,7 @@ class WorkspaceSidebar(QWidget):
             self._task_card.show()
             self._task_card.finish_workspace(
                 data.get("result") or data.get("output") or "Done.",
-                data.get("status") or "Task completed.",
+                data.get("status") or "Tarefa concluída.",
                 int(data.get("percent") or 100),
             )
             self.record_chat_event({
@@ -3353,16 +3911,8 @@ class InlineChatWorkspace(QFrame):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(10)
 
-        header = QHBoxLayout()
-        header.setSpacing(8)
-        title = QLabel("CHAT + TASK WORKSPACE")
-        title.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
-        title.setStyleSheet("color: #FFFFFF; background: transparent; letter-spacing: 1px;")
-        header.addWidget(title)
-        header.addStretch(1)
-        root.addLayout(header)
-
         tabs = QHBoxLayout()
+        tabs.setContentsMargins(0, 0, 0, 4)
         tabs.setSpacing(8)
         self._chat_btn = self._mk_tab("CHAT", True)
         self._history_btn = self._mk_tab("HISTORY", False)
@@ -3437,7 +3987,7 @@ class InlineChatWorkspace(QFrame):
 
         today_bar = QHBoxLayout()
         today_bar.addStretch()
-        today_pill = QLabel("Today")
+        today_pill = QLabel("Hoje")
         today_pill.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
         today_pill.setStyleSheet("""
             QLabel {
@@ -3468,7 +4018,7 @@ class InlineChatWorkspace(QFrame):
         mlay = QVBoxLayout(self._memory_frame)
         mlay.setContentsMargins(12, 10, 12, 10)
         mlay.setSpacing(6)
-        title = QLabel("Using Memory:")
+        title = QLabel("Usando Memória:")
         title.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
         title.setStyleSheet("color: #FFFFFF; background: transparent;")
         self._memory_lbl = QLabel("")
@@ -3481,16 +4031,72 @@ class InlineChatWorkspace(QFrame):
         self._feed = ConversationFeed()
         lay.addWidget(self._feed, 1)
 
+        input_container = QFrame()
+        input_container.setStyleSheet(
+            f"QFrame {{ "
+            f"  background: rgba(14, 17, 24, 0.40); "
+            f"  border: 1px solid rgba(255, 179, 0, 0.32); "
+            f"  border-radius: 12px; "
+            f"}}"
+        )
+        input_row = QHBoxLayout(input_container)
+        input_row.setContentsMargins(8, 6, 8, 6)
+        input_row.setSpacing(6)
+
+        self._attach_btn = QPushButton("📎")
+        self._attach_btn.setFixedSize(28, 28)
+        self._attach_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._attach_btn.setToolTip("Anexar arquivo")
+        self._attach_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; color: {C.WHITE}; border: none; font-size: 13px; }}"
+            f"QPushButton:hover {{ color: {C.PRI}; }}"
+        )
+        self._attach_btn.clicked.connect(self.attach_requested.emit)
+        input_row.addWidget(self._attach_btn)
+
+        self._input = QLineEdit()
+        self._input.setPlaceholderText("Envie uma mensagem ao ULTRON...")
+        self._input.setFont(QFont("Segoe UI", 10))
+        self._input.setStyleSheet(
+            f"QLineEdit {{ background: transparent; color: {C.WHITE}; border: none; padding: 0 4px; selection-background-color: rgba(255, 179, 0, 0.25); }}"
+        )
+        self._input.returnPressed.connect(self._send)
+        input_row.addWidget(self._input, 1)
+
+        self._mic_btn = QPushButton("🎙")
+        self._mic_btn.setFixedSize(28, 28)
+        self._mic_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._mic_btn.setToolTip("Alternar Voz")
+        self._mic_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; color: {C.WHITE}; border: none; font-size: 13px; }}"
+            f"QPushButton:hover {{ color: {C.PRI}; }}"
+        )
+        self._mic_btn.clicked.connect(self.mic_requested.emit)
+        input_row.addWidget(self._mic_btn)
+
+        self._send_btn = QPushButton("➤")
+        self._send_btn.setFixedSize(30, 28)
+        self._send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._send_btn.setToolTip("Enviar mensagem")
+        self._send_btn.setStyleSheet(
+            f"QPushButton {{ background: rgba(255, 179, 0, 0.22); color: {C.PRI}; border: 1px solid rgba(255, 179, 0, 0.45); border-radius: 7px; font-weight: bold; font-size: 13px; }}"
+            f"QPushButton:hover {{ background: rgba(255, 179, 0, 0.40); color: #FFFFFF; border-color: {C.PRI}; }}"
+        )
+        self._send_btn.clicked.connect(self._send)
+        input_row.addWidget(self._send_btn)
+
+        lay.addWidget(input_container)
+
         footer = QHBoxLayout()
-        footer.setContentsMargins(4, 4, 4, 4)
-        self._footer_status = QLabel("Brahma Echo is listening...")
-        self._footer_status.setFont(QFont("Segoe UI", 9))
-        self._footer_status.setStyleSheet("color: rgba(255, 255, 255, 0.70); background: transparent;")
+        footer.setContentsMargins(4, 2, 4, 2)
+        self._footer_status = QLabel("ULTRON está pronto")
+        self._footer_status.setFont(QFont("Segoe UI", 8))
+        self._footer_status.setStyleSheet("color: rgba(255, 255, 255, 0.55); background: transparent;")
         footer.addWidget(self._footer_status)
         footer.addStretch(1)
 
         waveform = QLabel("〰〰〰")
-        waveform.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        waveform.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
         waveform.setStyleSheet("color: #ffb300; background: transparent; letter-spacing: 2px;")
         footer.addWidget(waveform)
         lay.addLayout(footer)
@@ -3504,7 +4110,7 @@ class InlineChatWorkspace(QFrame):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(10)
         self._search = QLineEdit()
-        self._search.setPlaceholderText("Search conversations...")
+        self._search.setPlaceholderText("Pesquisar conversas...")
         self._search.setFont(QFont("Segoe UI", 10))
         self._search.setFixedHeight(38)
         self._search.setStyleSheet("QLineEdit { background: rgba(10,11,14,205); color: #FFFFFF; border: 1px solid rgba(255, 179, 0,100); border-radius: 12px; padding: 0 12px; }")
@@ -3543,7 +4149,7 @@ class InlineChatWorkspace(QFrame):
         self._clear_layout(self._history_layout)
         groups = self._store.grouped_conversations(search)
         if not groups:
-            empty = QLabel("No conversations yet.")
+            empty = QLabel("Ainda não há conversas.")
             empty.setStyleSheet("color: rgba(255,255,255,0.60); background: transparent;")
             self._history_layout.addWidget(empty)
             self._history_layout.addStretch(1)
@@ -3599,16 +4205,27 @@ class InlineChatWorkspace(QFrame):
         text = (data.get("text") or data.get("content") or "").strip()
         if not role or not text:
             return
+
+        now = time.time()
+        if not hasattr(self, "_last_chat_events"):
+            self._last_chat_events = []
+        for prev_role, prev_text, prev_time in self._last_chat_events[-6:]:
+            if prev_role == role and prev_text == text and (now - prev_time < 2.5):
+                return
+        self._last_chat_events.append((role, text, now))
+        if len(self._last_chat_events) > 20:
+            self._last_chat_events = self._last_chat_events[-10:]
+
         convo_id = data.get("conversation_id") or self._ensure_conversation(text if role == "user" else None)
         attachments = data.get("attachments") or []
         stamp = _fmt_time_stamp(data.get("timestamp"))
         if role == "user":
             self._store.record_chat("user", text, conversation_id=convo_id, attachments=attachments)
-            self._feed.add_message("user", "You", text, stamp, attachments=attachments)
+            self._feed.add_message("user", "Você", text, stamp, attachments=attachments)
             self._show_memories(self._store.search_memories(text))
         elif role == "assistant":
             self._store.record_chat("assistant", text, conversation_id=convo_id, attachments=attachments)
-            self._feed.add_message("assistant", "Brahma Echo", text, stamp, attachments=attachments)
+            self._feed.add_message("assistant", "ULTRON", text, stamp, attachments=attachments)
             self._hide_memories()
         elif role == "system":
             self._store.record_chat("system", text, conversation_id=convo_id, attachments=attachments)
@@ -3623,9 +4240,11 @@ class InlineChatWorkspace(QFrame):
         if not raw:
             return
         low = raw.lower()
-        if low.startswith(("you:", "brahma echo:")):
-            return
-        if low.startswith("sys:"):
+        if low.startswith("you:"):
+            self.record_chat_event({"role": "user", "text": raw.split(":", 1)[1].strip()})
+        elif low.startswith(("ultron:", "brahma echo:")):
+            self.record_chat_event({"role": "assistant", "text": raw.split(":", 1)[1].strip()})
+        elif low.startswith("sys:"):
             self.record_chat_event({"role": "system", "text": raw.split(":", 1)[1].strip()})
         elif low.startswith("file:"):
             self.record_chat_event({"role": "file", "text": raw.split(":", 1)[1].strip()})
@@ -3655,7 +4274,7 @@ class InlineChatWorkspace(QFrame):
         elif action == "finish":
             self._task_card.finish_workspace(
                 data.get("result") or data.get("output") or "Done.",
-                data.get("status") or "Task completed.",
+                data.get("status") or "Tarefa concluída.",
                 int(data.get("percent") or 100),
             )
             self.record_chat_event({
@@ -3668,12 +4287,26 @@ class InlineChatWorkspace(QFrame):
             self._task_card.clear_workspace()
 
     def _send(self):
-        text = self._input.text().strip()
+        text = self._input.text().strip() if hasattr(self, "_input") else ""
         if not text:
             return
         self._input.clear()
-        self._ensure_conversation(text)
+        convo_id = self._ensure_conversation(text)
+        self.record_chat_event({"role": "user", "text": text, "conversation_id": convo_id})
         self.command_submitted.emit(text)
+
+    def focus_input(self):
+        if hasattr(self, "_input"):
+            self._input.setFocus()
+
+    def new_conversation(self):
+        self._active_conversation_id = self._store.create_conversation("New Conversation")
+        self._feed.load_messages([])
+        self._hide_memories()
+        self._refresh_history()
+        self._set_tab(0)
+        self.focus_input()
+
 
 
 class LauncherControlPanel(QDialog):
@@ -3720,12 +4353,12 @@ class LauncherControlPanel(QDialog):
         lay.setContentsMargins(18, 16, 18, 16)
         lay.setSpacing(10)
 
-        title = QLabel("BRAHMA ECHO CONTROL")
+        title = QLabel("CONTROLE DO ULTRON")
         title.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
         title.setStyleSheet("color: #FFFFFF; background: transparent; letter-spacing: 1px;")
         lay.addWidget(title)
 
-        sub = QLabel("Desktop launcher controls")
+        sub = QLabel("Controles do inicializador de desktop")
         sub.setFont(QFont("Segoe UI", 9))
         sub.setStyleSheet("color: rgba(255,255,255,0.65); background: transparent;")
         lay.addWidget(sub)
@@ -3757,15 +4390,15 @@ class LauncherControlPanel(QDialog):
             """)
             return btn
 
-        self._open_btn = mk_btn("Open Workspace")
-        self._close_btn = mk_btn("Close Workspace")
-        self._startup_btn = mk_btn("Show Workspace On Startup", checkable=True, checked=bool(startup_workspace))
-        self._show_icon_btn = mk_btn("Show Floating Icon")
-        self._hide_icon_btn = mk_btn("Hide Floating Icon")
-        self._restart_btn = mk_btn("Restart Brahma Echo")
-        self._quit_btn = mk_btn("Quit Brahma Echo")
-        self._open_app_btn = mk_btn("Open App")
-        self._open_dev_btn = mk_btn("Open Developer Mode")
+        self._open_btn = mk_btn("Abrir Área de Trabalho")
+        self._close_btn = mk_btn("Fechar Área de Trabalho")
+        self._startup_btn = mk_btn("Mostrar Área de Trabalho ao Iniciar", checkable=True, checked=bool(startup_workspace))
+        self._show_icon_btn = mk_btn("Mostrar Ícone Flutuante")
+        self._hide_icon_btn = mk_btn("Ocultar Ícone Flutuante")
+        self._restart_btn = mk_btn("Reiniciar ULTRON")
+        self._quit_btn = mk_btn("Sair do ULTRON")
+        self._open_app_btn = mk_btn("Abrir App")
+        self._open_dev_btn = mk_btn("Abrir Modo Desenvolvedor")
 
         self._open_btn.clicked.connect(lambda: self._invoke(self._on_open))
         self._close_btn.clicked.connect(lambda: self._invoke(self._on_close))
@@ -3806,15 +4439,15 @@ class LauncherControlPanel(QDialog):
         flay = QVBoxLayout(frame)
         flay.setContentsMargins(18, 16, 18, 16)
         flay.setSpacing(10)
-        lbl = QLabel("Hide Brahma Echo icon?")
+        lbl = QLabel("Ocultar o ícone do ULTRON?")
         lbl.setStyleSheet("color: #FFFFFF; background: transparent; font: 700 11pt 'Segoe UI';")
-        sub = QLabel("You can restore it from the system tray.")
+        sub = QLabel("Você pode restaurá-lo pela bandeja do sistema.")
         sub.setStyleSheet("color: rgba(255,255,255,0.65); background: transparent;")
         flay.addWidget(lbl)
         flay.addWidget(sub)
         row = QHBoxLayout()
-        cancel = QPushButton("Cancel")
-        hide = QPushButton("Hide")
+        cancel = QPushButton("Cancelar")
+        hide = QPushButton("Ocultar")
         for btn in (cancel, hide):
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setMinimumHeight(34)
@@ -3864,8 +4497,707 @@ class SmallPanelCard(QFrame):
         self._body_lbl.setStyleSheet(f"color: {accent}; background: transparent;")
         lay.addWidget(self._body_lbl)
 
-    def set_body(self, body: str):
-        self._body_lbl.setText(body)
+class BrahmaTelemetryWing(QFrame):
+    """
+    Brahma Right Wing: Live Operations, Research Streams, and Sources.
+    Auto-dismisses in 10 seconds unless pinned or hovered.
+    Adapts dynamically to the active theme color (Amber Gold by default).
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("BrahmaTelemetryWing")
+        self.setFixedWidth(310)
+        self.setMinimumHeight(320)
+        self.setMaximumHeight(520)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.MinimumExpanding)
+        self._pinned = False
+        self._paused = False
+        self._total_duration_ms = 10000
+        self._remaining_ms = 10000
+        self._sources_list = []
+        self._theme_pri = "#ffb300"
+        self._theme_rgb = (255, 179, 0)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 16, 18, 14)
+        lay.setSpacing(10)
+
+        # Header Row: [⚡ OPERATIONS] + Tool Tag + Pin + Close
+        header_row = QHBoxLayout()
+        header_row.setSpacing(6)
+
+        self._hud_tag = QLabel("⚡ [OPERAÇÕES]")
+        self._hud_tag.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        header_row.addWidget(self._hud_tag)
+
+        self._tool_tag = QLabel("TELEMETRIA")
+        self._tool_tag.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        header_row.addWidget(self._tool_tag)
+        header_row.addStretch()
+
+        self._pin_btn = QPushButton("📌")
+        self._pin_btn.setFixedSize(26, 26)
+        self._pin_btn.setToolTip("Fixar cartão (impede o fechamento automático)")
+        self._pin_btn.clicked.connect(self.toggle_pin)
+        header_row.addWidget(self._pin_btn)
+
+        self._close_btn = QPushButton("✕")
+        self._close_btn.setFixedSize(26, 26)
+        self._close_btn.setToolTip("Fechar")
+        self._close_btn.clicked.connect(self.dismiss)
+        header_row.addWidget(self._close_btn)
+        lay.addLayout(header_row)
+
+        # Operation Title
+        self._title_lbl = QLabel("EXECUÇÃO DE TAREFA AO VIVO")
+        self._title_lbl.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+        self._title_lbl.setStyleSheet("color: #ffffff;")
+        self._title_lbl.setWordWrap(True)
+        lay.addWidget(self._title_lbl)
+
+        # Active Step Box
+        self._step_box = QFrame()
+        step_lay = QVBoxLayout(self._step_box)
+        step_lay.setContentsMargins(12, 9, 12, 9)
+        step_lay.setSpacing(4)
+
+        step_hdr = QHBoxLayout()
+        self._pulse_dot = QLabel("◉")
+        self._pulse_dot.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        step_hdr.addWidget(self._pulse_dot)
+        self._step_status_lbl = QLabel("ETAPA ATIVA")
+        self._step_status_lbl.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        step_hdr.addWidget(self._step_status_lbl)
+        step_hdr.addStretch()
+        step_lay.addLayout(step_hdr)
+
+        self._step_text_lbl = QLabel("Inicializando operação...")
+        self._step_text_lbl.setFont(QFont("Segoe UI", 9))
+        self._step_text_lbl.setStyleSheet("color: #E2E8F0;")
+        self._step_text_lbl.setWordWrap(True)
+        step_lay.addWidget(self._step_text_lbl)
+        lay.addWidget(self._step_box)
+
+        # Sources / References List
+        self._sources_hdr = QLabel("FONTES E CANAIS AO VIVO")
+        self._sources_hdr.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        lay.addWidget(self._sources_hdr)
+
+        self._sources_container = QWidget()
+        self._sources_container.setStyleSheet("background: transparent;")
+        self._sources_lay = QVBoxLayout(self._sources_container)
+        self._sources_lay.setContentsMargins(0, 0, 0, 0)
+        self._sources_lay.setSpacing(5)
+        lay.addWidget(self._sources_container)
+
+        lay.addStretch()
+
+        # Bottom 10-Second Fuse
+        fuse_row = QHBoxLayout()
+        self._fuse_lbl = QLabel("10s")
+        self._fuse_lbl.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        fuse_row.addWidget(self._fuse_lbl)
+        self._fuse_bar = QProgressBar()
+        self._fuse_bar.setRange(0, 100)
+        self._fuse_bar.setValue(100)
+        self._fuse_bar.setTextVisible(False)
+        self._fuse_bar.setFixedHeight(4)
+        fuse_row.addWidget(self._fuse_bar, stretch=1)
+        lay.addLayout(fuse_row)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(100)
+        self._timer.timeout.connect(self._on_tick)
+
+        self._opacity_fx = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(self._opacity_fx)
+        self._anim = QPropertyAnimation(self._opacity_fx, b"opacity", self)
+
+        self.apply_theme()
+        if hasattr(C, "register_listener"):
+            C.register_listener(self.apply_theme)
+
+        self.hide()
+
+    def apply_theme(self):
+        pri = getattr(C, "PRI", "#ffb300") or "#ffb300"
+        try:
+            r = int(pri[1:3], 16)
+            g = int(pri[3:5], 16)
+            b = int(pri[5:7], 16)
+        except Exception:
+            pri = "#ffb300"
+            r, g, b = 255, 179, 0
+
+        self._theme_pri = pri
+        self._theme_rgb = (r, g, b)
+
+        self.setStyleSheet(f"""
+            QFrame#BrahmaTelemetryWing {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 rgba(10, 15, 24, 238),
+                    stop:0.6 rgba(6, 10, 18, 222),
+                    stop:1 rgba(3, 5, 12, 212));
+                border: 1px solid rgba({r}, {g}, {b}, 0.45);
+                border-radius: 18px;
+            }}
+            QLabel {{
+                background: transparent;
+            }}
+            QPushButton {{
+                background: rgba({r}, {g}, {b}, 0.10);
+                border: 1px solid rgba({r}, {g}, {b}, 0.28);
+                border-radius: 6px;
+                color: #ffffff;
+                font-family: 'Segoe UI';
+                font-size: 11px;
+                font-weight: 600;
+                padding: 4px 8px;
+            }}
+            QPushButton:hover {{
+                background: rgba({r}, {g}, {b}, 0.26);
+                border: 1px solid {pri};
+                color: {pri};
+            }}
+        """)
+
+        self._hud_tag.setStyleSheet(f"color: {pri}; letter-spacing: 1px; font-weight: bold;")
+        self._tool_tag.setStyleSheet(f"""
+            background: rgba({r}, {g}, {b}, 0.14);
+            color: {pri};
+            border: 1px solid rgba({r}, {g}, {b}, 0.38);
+            border-radius: 9px;
+            padding: 1px 7px;
+            font-weight: bold;
+        """)
+        self._step_box.setStyleSheet(f"""
+            background: rgba({r}, {g}, {b}, 0.07);
+            border: 1px solid rgba({r}, {g}, {b}, 0.22);
+            border-radius: 10px;
+        """)
+        self._pulse_dot.setStyleSheet(f"color: {pri}; font-weight: bold;")
+        self._step_status_lbl.setStyleSheet(f"color: rgba({r}, {g}, {b}, 0.85); font-weight: bold;")
+        self._sources_hdr.setStyleSheet("color: rgba(255, 255, 255, 0.60); letter-spacing: 0.5px; font-weight: bold;")
+        self._fuse_lbl.setStyleSheet(f"color: rgba({r}, {g}, {b}, 0.75); font-weight: bold;")
+        self._fuse_bar.setStyleSheet(f"""
+            QProgressBar {{
+                background: rgba(255, 255, 255, 0.08);
+                border: none;
+                border-radius: 2px;
+            }}
+            QProgressBar::chunk {{
+                background: {pri};
+                border-radius: 2px;
+            }}
+        """)
+        if self._pinned:
+            self._pin_btn.setStyleSheet(f"background: rgba({r}, {g}, {b}, 0.35); border: 1px solid {pri}; color: {pri};")
+        else:
+            self._pin_btn.setStyleSheet("")
+
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        self._paused = True
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        self._paused = False
+
+    def toggle_pin(self):
+        self._pinned = not self._pinned
+        r, g, b = self._theme_rgb
+        pri = self._theme_pri
+        self._pin_btn.setStyleSheet(f"background: rgba({r}, {g}, {b}, 0.35); border: 1px solid {pri}; color: {pri};" if self._pinned else "")
+        if self._pinned:
+            self._fuse_lbl.setText("FIXADO")
+            self._fuse_bar.setValue(100)
+        else:
+            self._fuse_lbl.setText("10s")
+
+    def show_operation(self, title: str, step: str, sources: list = None, tool: str = None):
+        self.apply_theme()
+        r, g, b = self._theme_rgb
+        pri = self._theme_pri
+        self._title_lbl.setText(title or "EXECUÇÃO DE TAREFA AO VIVO")
+        self._step_text_lbl.setText(step or "Executando operação...")
+        if tool:
+            self._tool_tag.setText(str(tool).upper()[:14])
+
+        # Clear and repopulate sources
+        while self._sources_lay.count():
+            item = self._sources_lay.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        sources = sources or []
+        if not sources:
+            default_item = QLabel("• Núcleo do sistema processando dados")
+            default_item.setFont(QFont("Segoe UI", 8))
+            default_item.setStyleSheet("color: rgba(255, 255, 255, 0.6);")
+            self._sources_lay.addWidget(default_item)
+        else:
+            for s in sources[:4]:
+                s_str = str(s).strip()
+                if s_str.startswith("http"):
+                    import urllib.parse
+                    domain = urllib.parse.urlparse(s_str).netloc or s_str[:25]
+                    text = f"🌐 {domain}"
+                else:
+                    text = f"📄 {s_str[:32]}"
+                pill = QLabel(text)
+                pill.setFont(QFont("Segoe UI", 8))
+                pill.setStyleSheet(f"""
+                    background: rgba(255, 255, 255, 0.05);
+                    color: #E2E8F0;
+                    border: 1px solid rgba({r}, {g}, {b}, 0.25);
+                    border-radius: 6px;
+                    padding: 3px 7px;
+                """)
+                self._sources_lay.addWidget(pill)
+
+        self._remaining_ms = self._total_duration_ms
+        self._paused = False
+        if not self._pinned:
+            self._timer.start()
+
+        # Fade-in animation
+        was_visible = self.isVisible()
+        self.show()
+        if not was_visible:
+            sound_mgr.play_deploy_whoosh()
+        else:
+            sound_mgr.play_telemetry_chirp()
+        self._anim.stop()
+        try:
+            self._anim.finished.disconnect()
+        except Exception:
+            pass
+        self._anim.setDuration(250)
+        self._anim.setStartValue(self._opacity_fx.opacity())
+        self._anim.setEndValue(1.0)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._anim.start()
+
+    def _on_tick(self):
+        if self._pinned or self._paused:
+            return
+        self._remaining_ms -= 100
+        pct = max(0, int((self._remaining_ms / self._total_duration_ms) * 100))
+        self._fuse_bar.setValue(pct)
+        sec_left = max(0, int(math.ceil(self._remaining_ms / 1000.0)))
+        self._fuse_lbl.setText(f"{sec_left}s")
+        if self._remaining_ms <= 0:
+            self._timer.stop()
+            self.dismiss()
+
+    def set_body(self, text: str):
+        if hasattr(self, "_step_lbl") and text:
+            self._step_lbl.setText(str(text))
+            # No chirp per text update — it fired many times per task and became
+            # noise in normal use.
+
+    def dismiss(self):
+        self._timer.stop()
+        self._anim.stop()
+        try:
+            self._anim.finished.disconnect()
+        except Exception:
+            pass
+        self._anim.setDuration(250)
+        self._anim.setStartValue(self._opacity_fx.opacity())
+        self._anim.setEndValue(0.0)
+        self._anim.setEasingCurve(QEasingCurve.Type.InCubic)
+        self._anim.finished.connect(self.hide)
+        self._anim.start()
+
+
+class BrahmaResultWing(QFrame):
+    """
+    Brahma Left Wing: Final Results, Generated Deliverables (PDF/Word/Media/Code),
+    Executive Summary Bullets, and Quick Action Buttons.
+    Auto-dismisses in 10 seconds unless pinned or hovered.
+    Adapts dynamically to the active theme color (Amber Gold by default).
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("BrahmaResultWing")
+        self.setFixedWidth(310)
+        self.setMinimumHeight(320)
+        self.setMaximumHeight(540)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.MinimumExpanding)
+        self._pinned = False
+        self._paused = False
+        self._total_duration_ms = 10000
+        self._remaining_ms = 10000
+        self._active_file_path = None
+        self._theme_pri = "#ffb300"
+        self._theme_rgb = (255, 179, 0)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 16, 18, 14)
+        lay.setSpacing(10)
+
+        # Header: [✨ DELIVERABLE] + Status Badge + Pin + Close
+        header_row = QHBoxLayout()
+        header_row.setSpacing(6)
+
+        self._hud_tag = QLabel("✨ [ENTREGÁVEL]")
+        self._hud_tag.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        header_row.addWidget(self._hud_tag)
+
+        self._status_badge = QLabel("CONCLUÍDO")
+        self._status_badge.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        header_row.addWidget(self._status_badge)
+        header_row.addStretch()
+
+        self._pin_btn = QPushButton("📌")
+        self._pin_btn.setFixedSize(26, 26)
+        self._pin_btn.setToolTip("Fixar cartão (impede o fechamento automático)")
+        self._pin_btn.clicked.connect(self.toggle_pin)
+        header_row.addWidget(self._pin_btn)
+
+        self._close_btn = QPushButton("✕")
+        self._close_btn.setFixedSize(26, 26)
+        self._close_btn.setToolTip("Fechar")
+        self._close_btn.clicked.connect(self.dismiss)
+        header_row.addWidget(self._close_btn)
+        lay.addLayout(header_row)
+
+        # Title Label
+        self._title_lbl = QLabel("RESULTADO DA MISSÃO")
+        self._title_lbl.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+        self._title_lbl.setStyleSheet("color: #ffffff;")
+        self._title_lbl.setWordWrap(True)
+        lay.addWidget(self._title_lbl)
+
+        # File Card Section (Visible when deliverable is a file)
+        self._file_card = QFrame()
+        file_lay = QHBoxLayout(self._file_card)
+        file_lay.setContentsMargins(12, 8, 12, 8)
+        file_lay.setSpacing(10)
+
+        self._file_icon_lbl = QLabel("📄")
+        self._file_icon_lbl.setFont(QFont("Segoe UI", 16))
+        file_lay.addWidget(self._file_icon_lbl)
+
+        file_info_lay = QVBoxLayout()
+        file_info_lay.setSpacing(2)
+        self._file_name_lbl = QLabel("document.pdf")
+        self._file_name_lbl.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        self._file_name_lbl.setStyleSheet("color: #ffffff;")
+        self._file_name_lbl.setWordWrap(True)
+        file_info_lay.addWidget(self._file_name_lbl)
+
+        self._file_size_lbl = QLabel("Pronto para abrir")
+        self._file_size_lbl.setFont(QFont("Segoe UI", 8))
+        self._file_size_lbl.setStyleSheet("color: rgba(255, 255, 255, 0.6);")
+        file_info_lay.addWidget(self._file_size_lbl)
+        file_lay.addLayout(file_info_lay, stretch=1)
+
+        self._btn_open_file = QPushButton("Abrir")
+        self._btn_open_file.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_open_file.clicked.connect(self._on_open_file_clicked)
+        file_lay.addWidget(self._btn_open_file)
+
+        lay.addWidget(self._file_card)
+        self._file_card.hide()
+
+        # Summary / Bullets Scroll Area
+        self._bullets_scroll = QScrollArea()
+        self._bullets_scroll.setWidgetResizable(True)
+        self._bullets_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._bullets_scroll.setStyleSheet("background: transparent; border: none;")
+        self._bullets_container = QWidget()
+        self._bullets_container.setStyleSheet("background: transparent;")
+        self._bullets_lay = QVBoxLayout(self._bullets_container)
+        self._bullets_lay.setContentsMargins(0, 0, 4, 0)
+        self._bullets_lay.setSpacing(5)
+        self._bullets_scroll.setWidget(self._bullets_container)
+        lay.addWidget(self._bullets_scroll, stretch=1)
+
+        # Actions Row: [Reveal in Folder] [Copy Result]
+        self._actions_row = QHBoxLayout()
+        self._actions_row.setSpacing(8)
+
+        self._btn_explorer = QPushButton("📁 Mostrar na Pasta")
+        self._btn_explorer.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_explorer.clicked.connect(self._on_reveal_clicked)
+        self._actions_row.addWidget(self._btn_explorer)
+
+        self._btn_copy = QPushButton("📋 Copiar Resultado")
+        self._btn_copy.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_copy.clicked.connect(self._on_copy_clicked)
+        self._actions_row.addWidget(self._btn_copy)
+        lay.addLayout(self._actions_row)
+
+        # Bottom 10-Second Fuse
+        fuse_row = QHBoxLayout()
+        self._fuse_lbl = QLabel("10s")
+        self._fuse_lbl.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        fuse_row.addWidget(self._fuse_lbl)
+        self._fuse_bar = QProgressBar()
+        self._fuse_bar.setRange(0, 100)
+        self._fuse_bar.setValue(100)
+        self._fuse_bar.setTextVisible(False)
+        self._fuse_bar.setFixedHeight(4)
+        fuse_row.addWidget(self._fuse_bar, stretch=1)
+        lay.addLayout(fuse_row)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(100)
+        self._timer.timeout.connect(self._on_tick)
+
+        self._opacity_fx = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(self._opacity_fx)
+        self._anim = QPropertyAnimation(self._opacity_fx, b"opacity", self)
+        self._raw_result_text = ""
+
+        self.apply_theme()
+        if hasattr(C, "register_listener"):
+            C.register_listener(self.apply_theme)
+
+        self.hide()
+
+    def apply_theme(self):
+        pri = getattr(C, "PRI", "#ffb300") or "#ffb300"
+        try:
+            r = int(pri[1:3], 16)
+            g = int(pri[3:5], 16)
+            b = int(pri[5:7], 16)
+        except Exception:
+            pri = "#ffb300"
+            r, g, b = 255, 179, 0
+
+        self._theme_pri = pri
+        self._theme_rgb = (r, g, b)
+
+        self.setStyleSheet(f"""
+            QFrame#BrahmaResultWing {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 rgba(14, 18, 26, 240),
+                    stop:0.6 rgba(9, 13, 20, 225),
+                    stop:1 rgba(4, 7, 12, 215));
+                border: 1px solid rgba({r}, {g}, {b}, 0.45);
+                border-radius: 18px;
+            }}
+            QLabel {{
+                background: transparent;
+            }}
+            QPushButton {{
+                background: rgba({r}, {g}, {b}, 0.10);
+                border: 1px solid rgba({r}, {g}, {b}, 0.28);
+                border-radius: 6px;
+                color: #ffffff;
+                font-family: 'Segoe UI';
+                font-size: 11px;
+                font-weight: 600;
+                padding: 4px 8px;
+            }}
+            QPushButton:hover {{
+                background: rgba({r}, {g}, {b}, 0.26);
+                border: 1px solid {pri};
+                color: {pri};
+            }}
+        """)
+
+        self._hud_tag.setStyleSheet(f"color: {pri}; letter-spacing: 1px; font-weight: bold;")
+        self._status_badge.setStyleSheet(f"""
+            background: rgba({r}, {g}, {b}, 0.15);
+            color: {pri};
+            border: 1px solid rgba({r}, {g}, {b}, 0.40);
+            border-radius: 9px;
+            padding: 1px 7px;
+            font-weight: bold;
+        """)
+        self._file_card.setStyleSheet(f"""
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba({r}, {g}, {b}, 0.25);
+            border-radius: 10px;
+        """)
+        self._fuse_lbl.setStyleSheet(f"color: rgba({r}, {g}, {b}, 0.75); font-weight: bold;")
+        self._fuse_bar.setStyleSheet(f"""
+            QProgressBar {{
+                background: rgba(255, 255, 255, 0.08);
+                border: none;
+                border-radius: 2px;
+            }}
+            QProgressBar::chunk {{
+                background: {pri};
+                border-radius: 2px;
+            }}
+        """)
+        if self._pinned:
+            self._pin_btn.setStyleSheet(f"background: rgba({r}, {g}, {b}, 0.35); border: 1px solid {pri}; color: {pri};")
+        else:
+            self._pin_btn.setStyleSheet("")
+
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        self._paused = True
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        self._paused = False
+
+    def toggle_pin(self):
+        self._pinned = not self._pinned
+        r, g, b = self._theme_rgb
+        pri = self._theme_pri
+        self._pin_btn.setStyleSheet(f"background: rgba({r}, {g}, {b}, 0.35); border: 1px solid {pri}; color: {pri};" if self._pinned else "")
+        if self._pinned:
+            self._fuse_lbl.setText("FIXADO")
+            self._fuse_bar.setValue(100)
+        else:
+            self._fuse_lbl.setText("10s")
+
+    def show_deliverable(self, title: str, summary: str = "", bullets: list = None,
+                         file_path: str = None, kind: str = "result", actions: list = None, data: dict = None):
+        self.apply_theme()
+        self._title_lbl.setText(title or "RESULTADO DA MISSÃO")
+        self._active_file_path = file_path
+        self._raw_result_text = summary or "\n".join(bullets or [])
+
+        # File card handling
+        if file_path and Path(file_path).exists():
+            p = Path(file_path)
+            self._file_name_lbl.setText(p.name)
+            suf = p.suffix.lower()
+            icon_map = {
+                ".pdf": ("📄", "Documento PDF"),
+                ".docx": ("📝", "Documento Word"),
+                ".xlsx": ("📊", "Planilha"),
+                ".pptx": ("📈", "Apresentação de Slides"),
+                ".mp4": ("🎬", "Arquivo de Vídeo"),
+                ".py": ("💻", "Script Python"),
+                ".png": ("🖼️", "Imagem"),
+                ".jpg": ("🖼️", "Imagem"),
+            }
+            icon, ftype = icon_map.get(suf, ("📁", "Arquivo"))
+            self._file_icon_lbl.setText(icon)
+            try:
+                sz_mb = p.stat().st_size / (1024 * 1024)
+                if sz_mb >= 0.1:
+                    self._file_size_lbl.setText(f"{ftype} • {sz_mb:.1f} MB")
+                else:
+                    sz_kb = p.stat().st_size / 1024
+                    self._file_size_lbl.setText(f"{ftype} • {sz_kb:.0f} KB")
+            except Exception:
+                self._file_size_lbl.setText(ftype)
+            self._file_card.show()
+            self._btn_explorer.show()
+        else:
+            self._file_card.hide()
+            self._btn_explorer.hide()
+
+        # Clear and repopulate bullets
+        while self._bullets_lay.count():
+            item = self._bullets_lay.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        bullets = bullets or []
+        if not bullets and summary:
+            for sent in summary.split(". "):
+                clean_s = sent.strip()
+                if clean_s and len(clean_s) > 10:
+                    bullets.append(clean_s + ("." if not clean_s.endswith(".") else ""))
+
+        for b in bullets[:6]:
+            b_lbl = QLabel(f"• {b}")
+            b_lbl.setFont(QFont("Segoe UI", 9))
+            b_lbl.setStyleSheet("color: #E2E8F0;")
+            b_lbl.setWordWrap(True)
+            self._bullets_lay.addWidget(b_lbl)
+
+        self._remaining_ms = self._total_duration_ms
+        self._paused = False
+        if not self._pinned:
+            self._timer.start()
+
+        # Fade-in animation
+        self.show()
+        if kind == "deliverable" or file_path:
+            sound_mgr.play_mission_complete()
+        else:
+            sound_mgr.play_deploy_whoosh()
+        self._anim.stop()
+        try:
+            self._anim.finished.disconnect()
+        except Exception:
+            pass
+        self._anim.setDuration(250)
+        self._anim.setStartValue(self._opacity_fx.opacity())
+        self._anim.setEndValue(1.0)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._anim.start()
+
+    def _on_tick(self):
+        if self._pinned or self._paused:
+            return
+        self._remaining_ms -= 100
+        pct = max(0, int((self._remaining_ms / self._total_duration_ms) * 100))
+        self._fuse_bar.setValue(pct)
+        sec_left = max(0, int(math.ceil(self._remaining_ms / 1000.0)))
+        self._fuse_lbl.setText(f"{sec_left}s")
+        if self._remaining_ms <= 0:
+            self._timer.stop()
+            self.dismiss()
+
+    def dismiss(self):
+        self._timer.stop()
+        self._anim.stop()
+        try:
+            self._anim.finished.disconnect()
+        except Exception:
+            pass
+        self._anim.setDuration(250)
+        self._anim.setStartValue(self._opacity_fx.opacity())
+        self._anim.setEndValue(0.0)
+        self._anim.setEasingCurve(QEasingCurve.Type.InCubic)
+        self._anim.finished.connect(self.hide)
+        self._anim.start()
+
+    def _on_open_file_clicked(self):
+        if self._active_file_path:
+            p = Path(self._active_file_path).resolve()
+            if p.exists():
+                try:
+                    if sys.platform == "win32":
+                        os.startfile(str(p))
+                    else:
+                        import subprocess
+                        subprocess.Popen(["xdg-open", str(p)])
+                except Exception as e:
+                    print(f"[BrahmaResultWing] Open file error: {e}")
+
+    def _on_reveal_clicked(self):
+        if self._active_file_path:
+            p = Path(self._active_file_path).resolve()
+            try:
+                import subprocess
+                if sys.platform == "win32":
+                    if p.exists():
+                        subprocess.Popen(["explorer.exe", f"/select,{str(p)}"])
+                    elif p.parent.exists():
+                        subprocess.Popen(["explorer.exe", str(p.parent)])
+                else:
+                    subprocess.Popen(["xdg-open", str(p.parent)])
+            except Exception as e:
+                print(f"[BrahmaResultWing] Reveal error: {e}")
+
+    def set_body(self, text: str):
+        if hasattr(self, "_summary_lbl") and text:
+            self._summary_lbl.setText(str(text))
+
+    def _on_copy_clicked(self):
+        if self._raw_result_text:
+            try:
+                import pyperclip
+                pyperclip.copy(self._raw_result_text)
+                self._btn_copy.setText("✓ Copiado!")
+                QTimer.singleShot(1500, lambda: self._btn_copy.setText("📋 Copiar Resultado"))
+            except Exception:
+                pass
 
 
 class StatCard(QFrame):
@@ -3981,11 +5313,11 @@ class LogWidget(QScrollArea):
         raw = (text or "").strip()
         tl = raw.lower()
         if tl.startswith("you:"):
-            return "user", "You", raw[4:].strip()
+            return "user", "Você", raw[4:].strip()
+        if tl.startswith("ultron:"):
+            return "assistant", "ULTRON", raw[len("ULTRON:"):].strip()
         if tl.startswith("brahma echo:"):
-            return "assistant", "Brahma Echo", raw[len("Brahma Echo:"):].strip()
-        if tl.startswith("brahma echo:"):
-            return "assistant", "Brahma Echo", raw[len("Brahma Echo:"):].strip()
+            return "assistant", "ULTRON", raw[len("brahma echo:"):].strip()
         if tl.startswith("file:"):
             return "file", "File", raw[5:].strip()
         if tl.startswith("err:"):
@@ -4090,7 +5422,7 @@ class FileDropZone(QWidget):
 
     def _browse(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select a file for Brahma Echo", str(Path.home()),
+            self, "Selecione um arquivo para o ULTRON", str(Path.home()),
             "All Files (*.*);;"
             "Images (*.jpg *.jpeg *.png *.gif *.webp *.bmp *.svg);;"
             "Documents (*.pdf *.docx *.txt *.md *.pptx);;"
@@ -4151,7 +5483,7 @@ class _DropCanvas(QWidget):
         p.setFont(QFont("Courier New", 8))
         p.setPen(QPen(qcol(C.PRI_DIM if not hover else C.TEXT), 1))
         p.drawText(QRectF(0, cy + 8, W, 16), Qt.AlignmentFlag.AlignCenter,
-                   "Drop file here  or  Click to Browse")
+                   "Solte o arquivo aqui  ou  Clique para Procurar")
         p.setFont(QFont("Courier New", 7))
         p.setPen(QPen(qcol("#1a4a5a"), 1))
         p.drawText(QRectF(0, cy + 24, W, 14), Qt.AlignmentFlag.AlignCenter,
@@ -4164,7 +5496,7 @@ class _DropCanvas(QWidget):
         p.drawText(QRectF(0, cy - 24, W, 32), Qt.AlignmentFlag.AlignCenter, "⬇")
         p.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
         p.setPen(QPen(qcol(C.PRI), 1))
-        p.drawText(QRectF(0, cy + 12, W, 16), Qt.AlignmentFlag.AlignCenter, "Release to load")
+        p.drawText(QRectF(0, cy + 12, W, 16), Qt.AlignmentFlag.AlignCenter, "Solte para carregar")
 
     def _paint_file(self, p, W, H):
         path = Path(self._z._current_file)
@@ -4244,7 +5576,7 @@ class SetupOverlay(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        
+
         # Heavy dark overlay to completely hide dashboard UI and make a full faded background
         painter.fillRect(self.rect(), QColor(3, 5, 8, 245))
 
@@ -4308,14 +5640,14 @@ class SetupOverlay(QWidget):
 
     def _start_stage1(self):
         self._s1_lines = [
-            ("Scanning local configuration...", "#ffb300", False),
-            ("✓  " + self._detected.capitalize() + " detected", "#37ff5f", False),
-            ("✓  GPU acceleration enabled", "#37ff5f", False),
-            ("✓  Network online", "#37ff5f", False),
-            ("Looking for AI provider...", "#ffb300", False),
-            ("✕  No provider configured", "#ff3b30", True),
+            ("Escaneando a configuração local...", "#ffb300", False),
+            ("✓  " + self._detected.capitalize() + " detectado", "#37ff5f", False),
+            ("✓  Aceleração por GPU ativada", "#37ff5f", False),
+            ("✓  Rede online", "#37ff5f", False),
+            ("Procurando provedor de IA...", "#ffb300", False),
+            ("✕  Nenhum provedor configurado", "#ff3b30", True),
             ("", "", False),
-            ("One final step is required\nbefore I can think.", "#ffffff", True),
+            ("Um último passo é necessário\nantes que eu possa pensar.", "#ffffff", True),
         ]
         self._s1_idx = 0
         self._s1_text_parts = []
@@ -4361,13 +5693,13 @@ class SetupOverlay(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addStretch(2)
 
-        title = QLabel("DEFINE YOUR ASSISTANT")
+        title = QLabel("DEFINA SEU ASSISTENTE")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
         title.setStyleSheet("color: rgba(255,255,255,0.7); background: transparent; letter-spacing: 2px;")
         lay.addWidget(title)
-        
-        sub = QLabel("Every assistant needs an identity.")
+
+        sub = QLabel("Todo assistente precisa de uma identidade.")
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sub.setFont(QFont("Segoe UI", 10))
         sub.setStyleSheet("color: rgba(255,255,255,0.4); background: transparent;")
@@ -4376,15 +5708,15 @@ class SetupOverlay(QWidget):
 
         form_lay = QGridLayout()
         form_lay.setSpacing(16)
-        
-        lbl_ast = QLabel("Assistant Name")
+
+        lbl_ast = QLabel("Nome do Assistente")
         lbl_ast.setStyleSheet("color: #ffaa30;")
         self._inp_ast = QLineEdit(identity.get_assistant_name())
         self._inp_ast.setStyleSheet("background: rgba(255,255,255,0.1); color: #fff; padding: 6px; border-radius: 4px;")
         form_lay.addWidget(lbl_ast, 0, 0)
         form_lay.addWidget(self._inp_ast, 0, 1)
 
-        lbl_app = QLabel("Application Name")
+        lbl_app = QLabel("Nome do Aplicativo")
         lbl_app.setStyleSheet("color: #ffaa30;")
         self._inp_app = QLineEdit(identity.get_application_name())
         self._inp_app.setStyleSheet("background: rgba(255,255,255,0.1); color: #fff; padding: 6px; border-radius: 4px;")
@@ -4396,18 +5728,18 @@ class SetupOverlay(QWidget):
         container.setLayout(form_lay)
         lay.addWidget(container, 0, Qt.AlignmentFlag.AlignCenter)
 
-        btn = QPushButton("CONTINUE →")
+        btn = QPushButton("CONTINUAR →")
         btn.setFixedSize(160, 40)
         btn.setStyleSheet("background: rgba(255, 170, 48, 0.2); color: #ffaa30; border: 1px solid #ffaa30; border-radius: 20px;")
         btn.clicked.connect(self._save_identity_and_next)
         lay.addWidget(btn, 0, Qt.AlignmentFlag.AlignCenter)
-        
+
         lay.addStretch(2)
         self._stack.addWidget(page)
 
     def _save_identity_and_next(self):
-        identity.set_assistant_name(self._inp_ast.text().strip() or "Brahma")
-        identity.set_application_name(self._inp_app.text().strip() or "Brahma Echo")
+        identity.set_assistant_name(self._inp_ast.text().strip() or "Ultron")
+        identity.set_application_name(self._inp_app.text().strip() or "ULTRON")
         self._stack.setCurrentIndex(2)
 
     # ── STAGE 1.2: Owner Profile ────────────────────────────────
@@ -4418,13 +5750,13 @@ class SetupOverlay(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addStretch(2)
 
-        title = QLabel("WHO AM I ASSISTING?")
+        title = QLabel("A QUEM ESTOU ASSISTINDO?")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
         title.setStyleSheet("color: rgba(255,255,255,0.7); background: transparent; letter-spacing: 2px;")
         lay.addWidget(title)
-        
-        sub = QLabel("Tell me a little about yourself so I can work better with you.")
+
+        sub = QLabel("Conte um pouco sobre você para que eu possa trabalhar melhor com você.")
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sub.setFont(QFont("Segoe UI", 10))
         sub.setStyleSheet("color: rgba(255,255,255,0.4); background: transparent;")
@@ -4433,18 +5765,18 @@ class SetupOverlay(QWidget):
 
         form_lay = QGridLayout()
         form_lay.setSpacing(16)
-        
-        lbl_own = QLabel("Your Name")
+
+        lbl_own = QLabel("Seu Nome")
         lbl_own.setStyleSheet("color: #ffaa30;")
         self._inp_own = QLineEdit(identity.get_owner_name())
         self._inp_own.setStyleSheet("background: rgba(255,255,255,0.1); color: #fff; padding: 6px; border-radius: 4px;")
         form_lay.addWidget(lbl_own, 0, 0)
         form_lay.addWidget(self._inp_own, 0, 1)
 
-        lbl_role = QLabel("Your Role")
+        lbl_role = QLabel("Seu Papel")
         lbl_role.setStyleSheet("color: #ffaa30;")
         self._inp_role = QLineEdit(identity.get_owner_role())
-        self._inp_role.setPlaceholderText("e.g. Student, Developer")
+        self._inp_role.setPlaceholderText("ex.: Estudante, Desenvolvedor")
         self._inp_role.setStyleSheet("background: rgba(255,255,255,0.1); color: #fff; padding: 6px; border-radius: 4px;")
         form_lay.addWidget(lbl_role, 1, 0)
         form_lay.addWidget(self._inp_role, 1, 1)
@@ -4454,12 +5786,12 @@ class SetupOverlay(QWidget):
         container.setLayout(form_lay)
         lay.addWidget(container, 0, Qt.AlignmentFlag.AlignCenter)
 
-        btn = QPushButton("CONTINUE →")
+        btn = QPushButton("CONTINUAR →")
         btn.setFixedSize(160, 40)
         btn.setStyleSheet("background: rgba(255, 170, 48, 0.2); color: #ffaa30; border: 1px solid #ffaa30; border-radius: 20px;")
         btn.clicked.connect(self._save_owner_and_next)
         lay.addWidget(btn, 0, Qt.AlignmentFlag.AlignCenter)
-        
+
         lay.addStretch(2)
         self._stack.addWidget(page)
 
@@ -4476,7 +5808,7 @@ class SetupOverlay(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addStretch(2)
 
-        title = QLabel("HOW SHOULD I ASSIST YOU?")
+        title = QLabel("COMO DEVO ASSISTIR VOCÊ?")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
         title.setStyleSheet("color: rgba(255,255,255,0.7); background: transparent; letter-spacing: 2px;")
@@ -4489,24 +5821,24 @@ class SetupOverlay(QWidget):
         self._combo_mode.setStyleSheet("background: rgba(255,255,255,0.1); color: #fff; padding: 6px; border-radius: 4px;")
         self._combo_mode.setFixedWidth(300)
         lay.addWidget(self._combo_mode, 0, Qt.AlignmentFlag.AlignCenter)
-        
-        sub = QLabel("Custom Instructions (Optional)")
+
+        sub = QLabel("Instruções Personalizadas (Opcional)")
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sub.setStyleSheet("color: #ffaa30; margin-top: 10px;")
         lay.addWidget(sub)
-        
+
         self._inp_custom = QTextEdit(identity.get_custom_instructions())
         self._inp_custom.setFixedSize(400, 80)
         self._inp_custom.setStyleSheet("background: rgba(255,255,255,0.1); color: #fff; padding: 6px; border-radius: 4px;")
         lay.addWidget(self._inp_custom, 0, Qt.AlignmentFlag.AlignCenter)
 
         lay.addSpacing(20)
-        btn = QPushButton("CONTINUE →")
+        btn = QPushButton("CONTINUAR →")
         btn.setFixedSize(160, 40)
         btn.setStyleSheet("background: rgba(255, 170, 48, 0.2); color: #ffaa30; border: 1px solid #ffaa30; border-radius: 20px;")
         btn.clicked.connect(self._save_behavior_and_next)
         lay.addWidget(btn, 0, Qt.AlignmentFlag.AlignCenter)
-        
+
         lay.addStretch(2)
         self._stack.addWidget(page)
 
@@ -4523,30 +5855,30 @@ class SetupOverlay(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addStretch(2)
 
-        title = QLabel("WHO USES THIS COMPUTER?")
+        title = QLabel("QUEM USA ESTE COMPUTADOR?")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
         title.setStyleSheet("color: rgba(255,255,255,0.7); background: transparent; letter-spacing: 2px;")
         lay.addWidget(title)
         lay.addSpacing(20)
-        
-        btn_personal = QPushButton("THIS IS MY PERSONAL COMPUTER")
+
+        btn_personal = QPushButton("ESTE É O MEU COMPUTADOR PESSOAL")
         btn_personal.setFixedSize(300, 50)
         btn_personal.setStyleSheet("background: rgba(255, 170, 48, 0.1); color: #ffaa30; border: 1px solid #ffaa30; border-radius: 8px;")
         btn_personal.clicked.connect(lambda: self._save_shared_and_next(False))
         lay.addWidget(btn_personal, 0, Qt.AlignmentFlag.AlignCenter)
-        
+
         lay.addSpacing(10)
-        
-        btn_shared = QPushButton("THIS IS A SHARED COMPUTER")
+
+        btn_shared = QPushButton("ESTE É UM COMPUTADOR COMPARTILHADO")
         btn_shared.setFixedSize(300, 50)
         btn_shared.setStyleSheet("background: rgba(255,255,255, 0.05); color: #fff; border: 1px solid rgba(255,255,255,0.2); border-radius: 8px;")
         btn_shared.clicked.connect(lambda: self._save_shared_and_next(True))
         lay.addWidget(btn_shared, 0, Qt.AlignmentFlag.AlignCenter)
-        
+
         lay.addStretch(2)
         self._stack.addWidget(page)
-        
+
     def _save_shared_and_next(self, shared: bool):
         identity.set_shared_computer(shared)
         self._stack.setCurrentIndex(5)
@@ -4566,7 +5898,7 @@ class SetupOverlay(QWidget):
 
         lay.addStretch(3)
 
-        title = QLabel("SELECT PRIMARY INTELLIGENCE")
+        title = QLabel("SELECIONE A INTELIGÊNCIA PRINCIPAL")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
         title.setStyleSheet("color: rgba(255,255,255,0.5); background: transparent; border: none; letter-spacing: 4px;")
@@ -4601,19 +5933,19 @@ class SetupOverlay(QWidget):
         gt.setStyleSheet("color: #ffb300; background: transparent; border: none;")
         glay.addWidget(gt)
 
-        gs = QLabel("★★★★★  Recommended")
+        gs = QLabel("★★★★★  Recomendado")
         gs.setFont(QFont("Segoe UI", 9))
         gs.setStyleSheet("color: rgba(255,179,0,0.7); background: transparent; border: none;")
         glay.addWidget(gs)
 
-        gd = QLabel("Primary Intelligence")
+        gd = QLabel("Inteligência Principal")
         gd.setFont(QFont("Segoe UI", 9))
         gd.setStyleSheet("color: rgba(255,255,255,0.35); background: transparent; border: none;")
         glay.addWidget(gd)
 
         glay.addStretch()
 
-        gc = QLabel("Connect →")
+        gc = QLabel("Conectar →")
         gc.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
         gc.setStyleSheet("color: #ffb300; background: transparent; border: none;")
         glay.addWidget(gc)
@@ -4651,19 +5983,19 @@ class SetupOverlay(QWidget):
         ot.setStyleSheet("color: rgba(255,255,255,0.8); background: transparent; border: none;")
         olay.addWidget(ot)
 
-        od = QLabel("Multiple Models")
+        od = QLabel("Vários Modelos")
         od.setFont(QFont("Segoe UI", 9))
         od.setStyleSheet("color: rgba(255,255,255,0.3); background: transparent; border: none;")
         olay.addWidget(od)
 
-        od2 = QLabel("Optional · Secondary")
+        od2 = QLabel("Opcional · Secundária")
         od2.setFont(QFont("Segoe UI", 9))
         od2.setStyleSheet("color: rgba(255,255,255,0.2); background: transparent; border: none;")
         olay.addWidget(od2)
 
         olay.addStretch()
 
-        oc = QLabel("Configure Later →")
+        oc = QLabel("Configurar Depois →")
         oc.setFont(QFont("Segoe UI", 11))
         oc.setStyleSheet("color: rgba(255,255,255,0.35); background: transparent; border: none;")
         olay.addWidget(oc)
@@ -4706,7 +6038,7 @@ class SetupOverlay(QWidget):
         self._s3_title.setStyleSheet("color: #ffb300; background: transparent; border: none;")
         blay.addWidget(self._s3_title)
 
-        self._s3_sub = QLabel("Paste your Neural Key")
+        self._s3_sub = QLabel("Cole sua Chave Neural")
         self._s3_sub.setFont(QFont("Segoe UI", 10))
         self._s3_sub.setStyleSheet("color: rgba(255,255,255,0.4); background: transparent; border: none;")
         blay.addWidget(self._s3_sub)
@@ -4717,7 +6049,7 @@ class SetupOverlay(QWidget):
         input_row = QHBoxLayout()
         self._key_input = QLineEdit()
         self._key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self._key_input.setPlaceholderText("Paste API key here...")
+        self._key_input.setPlaceholderText("Cole a chave de API aqui...")
         self._key_input.setFont(QFont("Consolas", 12))
         self._key_input.setFixedHeight(48)
         self._key_input.setStyleSheet("""
@@ -4761,7 +6093,7 @@ class SetupOverlay(QWidget):
 
         status_row.addStretch()
 
-        hint = QLabel("<a href='https://aistudio.google.com/app/apikey' style='color: rgba(255,179,0,0.5); text-decoration: none; font-size: 10px;'>Get API Key →</a>")
+        hint = QLabel("<a href='https://aistudio.google.com/app/apikey' style='color: rgba(255,179,0,0.5); text-decoration: none; font-size: 10px;'>Obter Chave de API →</a>")
         hint.setOpenExternalLinks(True)
         hint.setStyleSheet("background: transparent; border: none;")
         status_row.addWidget(hint)
@@ -4780,10 +6112,10 @@ class SetupOverlay(QWidget):
         intro_lay.setSpacing(12)
 
         self._intro_lines = []
-        for txt in ["Identity confirmed.", "Hello.", "I'm Brahma Echo.", "Ready whenever you are."]:
+        for txt in ["Identidade confirmada.", "Olá.", "Eu sou o ULTRON.", "Pronto quando você estiver."]:
             lbl = QLabel(txt)
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            if txt == "I'm Brahma Echo.":
+            if txt == "Eu sou o ULTRON.":
                 lbl.setFont(QFont("Segoe UI", 24, QFont.Weight.Bold))
                 lbl.setStyleSheet("color: #ffb300; background: transparent; border: none;")
             else:
@@ -4795,7 +6127,7 @@ class SetupOverlay(QWidget):
 
         intro_lay.addSpacing(20)
 
-        self._launch_btn = QPushButton("Launch Brahma Echo →")
+        self._launch_btn = QPushButton("Iniciar ULTRON →")
         self._launch_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._launch_btn.setFixedSize(220, 48)
         self._launch_btn.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
@@ -4821,7 +6153,7 @@ class SetupOverlay(QWidget):
         if len(text) > 10 and not hasattr(self, "_authenticating"):
             self._authenticating = True
             self._key_input.setReadOnly(True)
-            self._s3_sub.setText("Authenticating...")
+            self._s3_sub.setText("Autenticando...")
             self._s3_sub.setStyleSheet("color: #ffb300; background: transparent; border: none;")
             self._auth_step = 0
             self._auth_timer = QTimer(self)
@@ -4843,11 +6175,11 @@ class SetupOverlay(QWidget):
             self._auth_step += 1
         else:
             self._auth_timer.stop()
-            self._s3_status.setText("✓ Identity Verified")
+            self._s3_status.setText("✓ Identidade Verificada")
             self._s3_status.setStyleSheet("color: #37ff5f; background: transparent; border: none;")
             self._s3_title.setText("✓ Google Gemini")
             self._s3_title.setStyleSheet("color: #37ff5f; background: transparent; border: none;")
-            self._s3_sub.setText("Gemini 2.5 Pro  ·  Ready")
+            self._s3_sub.setText("Gemini 2.5 Pro  ·  Pronto")
             self._s3_sub.setStyleSheet("color: rgba(55,255,95,0.6); background: transparent; border: none;")
             self._key_input.setStyleSheet("""
                 QLineEdit {
@@ -4887,12 +6219,12 @@ class SetupOverlay(QWidget):
         prom_lay.setContentsMargins(32, 28, 32, 24)
         prom_lay.setSpacing(8)
 
-        q_title = QLabel("Secondary Intelligence")
+        q_title = QLabel("Inteligência Secundária")
         q_title.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
         q_title.setStyleSheet("color: #ffffff; background: transparent; border: none;")
         prom_lay.addWidget(q_title)
 
-        q_sub = QLabel("Would you like to configure OpenRouter as well?\nThis is optional and can be done later in Settings.")
+        q_sub = QLabel("Deseja configurar o OpenRouter também?\nIsto é opcional e pode ser feito depois em Configurações.")
         q_sub.setFont(QFont("Segoe UI", 10))
         q_sub.setWordWrap(True)
         q_sub.setStyleSheet("color: rgba(255,255,255,0.4); background: transparent; border: none;")
@@ -4903,7 +6235,7 @@ class SetupOverlay(QWidget):
         btn_row = QHBoxLayout()
         btn_row.setSpacing(12)
 
-        skip_btn = QPushButton("Skip")
+        skip_btn = QPushButton("Pular")
         skip_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         skip_btn.setFixedHeight(42)
         skip_btn.setFont(QFont("Segoe UI", 11))
@@ -4923,7 +6255,7 @@ class SetupOverlay(QWidget):
         skip_btn.clicked.connect(self._skip_or)
         btn_row.addWidget(skip_btn)
 
-        yes_btn = QPushButton("Configure OpenRouter")
+        yes_btn = QPushButton("Configurar OpenRouter")
         yes_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         yes_btn.setFixedHeight(42)
         yes_btn.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
@@ -4977,7 +6309,7 @@ class SetupOverlay(QWidget):
         or_title.setStyleSheet("color: rgba(255,255,255,0.8); background: transparent; border: none;")
         or_blay.addWidget(or_title)
 
-        or_sub = QLabel("Paste your OpenRouter API Key")
+        or_sub = QLabel("Cole sua Chave de API do OpenRouter")
         or_sub.setFont(QFont("Segoe UI", 10))
         or_sub.setStyleSheet("color: rgba(255,255,255,0.4); background: transparent; border: none;")
         or_blay.addWidget(or_sub)
@@ -5008,7 +6340,7 @@ class SetupOverlay(QWidget):
         or_blay.addStretch()
 
         or_btn_row = QHBoxLayout()
-        or_skip = QPushButton("Skip")
+        or_skip = QPushButton("Pular")
         or_skip.setCursor(Qt.CursorShape.PointingHandCursor)
         or_skip.setFixedHeight(42)
         or_skip.setFont(QFont("Segoe UI", 11))
@@ -5019,7 +6351,7 @@ class SetupOverlay(QWidget):
         or_skip.clicked.connect(self._skip_or)
         or_btn_row.addWidget(or_skip)
 
-        or_save = QPushButton("Save & Continue")
+        or_save = QPushButton("Salvar e Continuar")
         or_save.setCursor(Qt.CursorShape.PointingHandCursor)
         or_save.setFixedHeight(42)
         or_save.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
@@ -5066,19 +6398,19 @@ class SetupOverlay(QWidget):
         c_blay.setContentsMargins(32, 28, 32, 28)
         c_blay.setSpacing(6)
 
-        c_title = QLabel("CHOOSE AESTHETIC")
+        c_title = QLabel("ESCOLHA A ESTÉTICA")
         c_title.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
         c_title.setStyleSheet("color: rgba(255,255,255,0.8); background: transparent; border: none;")
         c_blay.addWidget(c_title)
 
-        c_sub = QLabel("Select your preferred neural color palette.")
+        c_sub = QLabel("Selecione sua paleta de cores neural preferida.")
         c_sub.setFont(QFont("Segoe UI", 10))
         c_sub.setStyleSheet("color: rgba(255,255,255,0.4); background: transparent; border: none;")
         c_blay.addWidget(c_sub)
 
         c_blay.addSpacing(12)
-        
-        self._setup_color_btn = QPushButton("Pick Custom Color")
+
+        self._setup_color_btn = QPushButton("Escolher Cor Personalizada")
         self._setup_color_btn.setFixedHeight(48)
         self._setup_color_btn.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
         self._setup_color_btn.setStyleSheet(f"""
@@ -5096,7 +6428,7 @@ class SetupOverlay(QWidget):
 
         c_btn_row = QHBoxLayout()
         c_btn_row.addStretch()
-        c_continue = QPushButton("Continue →")
+        c_continue = QPushButton("Continuar →")
         c_continue.setCursor(Qt.CursorShape.PointingHandCursor)
         c_continue.setFixedHeight(42)
         c_continue.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
@@ -5115,13 +6447,13 @@ class SetupOverlay(QWidget):
         """)
         c_continue.clicked.connect(self._finish_color_stage)
         c_btn_row.addWidget(c_continue)
-        
+
         c_blay.addLayout(c_btn_row)
 
         lay.insertWidget(lay.count() - 1, self._color_box, 0, Qt.AlignmentFlag.AlignCenter)
-        
+
     def _pick_setup_color(self):
-        color = QColorDialog.getColor(QColor(C.PRI), self, "Select App Theme Color")
+        color = QColorDialog.getColor(QColor(C.PRI), self, "Selecione a Cor do Tema do App")
         if color.isValid():
             hex_col = color.name()
             self._setup_color_btn.setStyleSheet(f"QPushButton {{ background: {hex_col}; color: #ffffff; border: 1px solid rgba(255, 255, 255, 0.2); border-radius: 12px; }}")
@@ -5136,13 +6468,13 @@ class SetupOverlay(QWidget):
                 C.load_theme(hex_col)
             except:
                 pass
-                
+
     def _finish_color_stage(self):
         self._color_box.hide()
         self._show_intro_final()
 
     def _show_intro_final(self):
-        """Show the Brahma Echo intro sequence."""
+        """Show the ULTRON intro sequence."""
         page = self._stack.widget(6)
         lay = page.layout()
         self._intro_widget.setParent(None)
@@ -5197,7 +6529,7 @@ class SetupOverlay(QWidget):
         c4lay.setContentsMargins(30, 24, 30, 24)
         c4lay.setSpacing(8)
 
-        self._s4_title = QLabel("ESTABLISHING NEURAL LINK")
+        self._s4_title = QLabel("ESTABELECENDO VÍNCULO NEURAL")
         self._s4_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._s4_title.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
         self._s4_title.setStyleSheet("color: rgba(255,179,0,0.7); background: transparent; border: none; letter-spacing: 3px;")
@@ -5205,7 +6537,7 @@ class SetupOverlay(QWidget):
         c4lay.addSpacing(12)
 
         self._module_labels = {}
-        for mod in ["MEMORY", "VOICE", "VISION", "AUTOMATION", "REASONING"]:
+        for mod in ["MEMÓRIA", "VOZ", "VISÃO", "AUTOMAÇÃO", "RACIOCÍNIO"]:
             row = QHBoxLayout()
             name_lbl = QLabel(mod)
             name_lbl.setFont(QFont("Consolas", 11))
@@ -5231,7 +6563,7 @@ class SetupOverlay(QWidget):
         self._call_js("if(window.setReactorSpeed) window.setReactorSpeed(5.0);")
 
         self._ignite_step = 0
-        self._module_order = ["MEMORY", "VOICE", "VISION", "AUTOMATION", "REASONING"]
+        self._module_order = ["MEMÓRIA", "VOZ", "VISÃO", "AUTOMAÇÃO", "RACIOCÍNIO"]
         self._ignite_timer = QTimer(self)
         self._ignite_timer.timeout.connect(self._ignite_tick)
         self._ignite_timer.start(600)
@@ -5248,7 +6580,7 @@ class SetupOverlay(QWidget):
             self._ignite_step += 1
         else:
             self._ignite_timer.stop()
-            self._s4_title.setText("NEURAL LINK ESTABLISHED")
+            self._s4_title.setText("VÍNCULO NEURAL ESTABELECIDO")
             self._s4_title.setStyleSheet("color: #37ff5f; background: transparent; border: none; letter-spacing: 3px; font-weight: bold;")
             self._s4_container.setStyleSheet("""
                 QFrame {
@@ -5306,7 +6638,7 @@ class CommandBar(QWidget):
         lay.setContentsMargins(6, 4, 6, 4)
         lay.setSpacing(6)
 
-        # Brahma Echo mini logo
+        # ULTRON mini logo
         logo_frame = QFrame()
         logo_frame.setFixedSize(32, 32)
         logo_frame.setStyleSheet("""
@@ -5327,7 +6659,7 @@ class CommandBar(QWidget):
 
         # Input field
         self._input = QLineEdit()
-        self._input.setPlaceholderText("Tell Brahma Echo what to do...")
+        self._input.setPlaceholderText("Diga ao ULTRON o que fazer...")
         self._input.setFont(QFont("Segoe UI", 9))
         self._input.setFixedHeight(32)
         self._input.setStyleSheet(f"""
@@ -5365,7 +6697,7 @@ class CommandBar(QWidget):
         attach = QPushButton()
         attach.setFixedSize(28, 28)
         attach.setCursor(Qt.CursorShape.PointingHandCursor)
-        attach.setToolTip("Attach file")
+        attach.setToolTip("Anexar arquivo")
         attach.setIcon(QIcon(_icon_pixmap("attach", 13)))
         attach.setIconSize(QSize(13, 13))
         attach.setStyleSheet(btn_style_ghost)
@@ -5375,7 +6707,7 @@ class CommandBar(QWidget):
         mic = QPushButton()
         mic.setFixedSize(28, 28)
         mic.setCursor(Qt.CursorShape.PointingHandCursor)
-        mic.setToolTip("Voice input")
+        mic.setToolTip("Entrada de voz")
         mic.setIcon(QIcon(_icon_pixmap("mic", 13)))
         mic.setIconSize(QSize(13, 13))
         mic.setStyleSheet(btn_style_ghost)
@@ -5385,7 +6717,7 @@ class CommandBar(QWidget):
         dev = QPushButton("DEV")
         dev.setFixedSize(40, 28)
         dev.setCursor(Qt.CursorShape.PointingHandCursor)
-        dev.setToolTip("Developer mode")
+        dev.setToolTip("Modo desenvolvedor")
         dev.setStyleSheet(f"""
             QPushButton {{
                 background: rgba(255, 179, 0, 0.06);
@@ -5408,7 +6740,7 @@ class CommandBar(QWidget):
         send = QPushButton()
         send.setFixedSize(32, 32)
         send.setCursor(Qt.CursorShape.PointingHandCursor)
-        send.setToolTip("Send")
+        send.setToolTip("Enviar")
         send.setIcon(QIcon(_icon_pixmap("send", 14)))
         send.setIconSize(QSize(14, 14))
         send.setStyleSheet(f"""
@@ -5463,7 +6795,7 @@ class CommandBar(QWidget):
 class DeveloperModeDialog(QDialog):
     def __init__(self, parent=None, settings: dict | None = None):
         super().__init__(parent)
-        self.setWindowTitle("Developer Mode")
+        self.setWindowTitle("Modo Desenvolvedor")
         self.setMinimumWidth(420)
         self.setStyleSheet(f"""
             QDialog {{ background: rgba(8,10,14,235); color: {C.WHITE}; border: 1px solid {C.BORDER_B}; }}
@@ -5496,12 +6828,12 @@ class DeveloperModeDialog(QDialog):
         root.setSpacing(12)
         root.setContentsMargins(16, 16, 16, 16)
 
-        title = QLabel("Developer Co-pilot")
+        title = QLabel("Co-piloto de Desenvolvimento")
         title.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
         title.setStyleSheet(f"color: {C.PRI};")
         root.addWidget(title)
 
-        desc = QLabel("Pick a workspace folder Brahma Echo should use when building websites or other workspace-based tasks.")
+        desc = QLabel("Escolha uma pasta de trabalho que o ULTRON deve usar ao construir sites ou outras tarefas baseadas em pasta.")
         desc.setWordWrap(True)
         desc.setStyleSheet(f"color: {C.TEXT_DIM};")
         root.addWidget(desc)
@@ -5509,31 +6841,31 @@ class DeveloperModeDialog(QDialog):
         folder_row = QHBoxLayout()
         folder_row.setSpacing(8)
         self._workspace_edit = QLineEdit(self._workspace)
-        self._workspace_edit.setPlaceholderText("Select a folder...")
+        self._workspace_edit.setPlaceholderText("Selecione uma pasta...")
         self._workspace_edit.setReadOnly(True)
         folder_row.addWidget(self._workspace_edit, stretch=1)
 
-        browse = QPushButton("Browse")
+        browse = QPushButton("Procurar")
         browse.clicked.connect(self._browse_folder)
         folder_row.addWidget(browse)
         root.addLayout(folder_row)
 
-        self._enabled_box = QCheckBox("Turn developer mode on")
+        self._enabled_box = QCheckBox("Ativar o modo desenvolvedor")
         self._enabled_box.setChecked(self._enabled)
         root.addWidget(self._enabled_box)
 
         btn_row = QHBoxLayout()
         btn_row.addStretch()
-        cancel = QPushButton("Cancel")
+        cancel = QPushButton("Cancelar")
         cancel.clicked.connect(self.reject)
-        save = QPushButton("Save")
+        save = QPushButton("Salvar")
         save.clicked.connect(self._save_and_close)
         btn_row.addWidget(cancel)
         btn_row.addWidget(save)
         root.addLayout(btn_row)
 
     def _browse_folder(self):
-        path = QFileDialog.getExistingDirectory(self, "Select developer workspace", self._workspace or str(BASE_DIR))
+        path = QFileDialog.getExistingDirectory(self, "Selecione a pasta de trabalho do desenvolvedor", self._workspace or str(BASE_DIR))
         if path:
             self._workspace_edit.setText(path)
 
@@ -5562,25 +6894,25 @@ class ScanningOverlay(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        
+
         self._text = "SCANNING SCREEN"
         self._sub = "Analyzing display..."
         self._result_text = ""
-        
+
         self._time = 0.0
         self._dt = 0.016
         self._fade_out_opacity = 1.0
         self._is_finishing = False
         self._finish_time = 0.0
-        
+
         self._tmr = QTimer(self)
         self._tmr.timeout.connect(self._tick)
         self._tmr.start(16)
 
         self._particles = []
-        self._boxes = [] 
+        self._boxes = []
         self._context_lines = []
-        
+
         self.GOLD = QColor("#F4B400")
 
     def set_message(self, text: str, sub: str | None = None):
@@ -5595,18 +6927,18 @@ class ScanningOverlay(QWidget):
         self._fade_out_opacity = 1.0
         self._is_finishing = False
         self._finish_time = 0.0
-        
+
         screen = QApplication.primaryScreen()
         geo = screen.geometry() if screen else QRectF(0, 0, 1920, 1080).toRect()
         self.setGeometry(geo)
-        
+
         # Capture screen for OpenCV
         if screen:
             pixmap = screen.grabWindow(0)
             self._generate_layout(pixmap)
         else:
             self._generate_layout(None)
-        
+
         self.show()
         self.raise_()
         self.setFocus()
@@ -5615,7 +6947,7 @@ class ScanningOverlay(QWidget):
         if not self._is_finishing:
             self._is_finishing = True
             self._finish_time = self._time
-            
+
             self._result_text = "Workspace Recognized\\nVisual Studio Code · Browser · Terminal"
 
     def force_hide(self):
@@ -5630,7 +6962,7 @@ class ScanningOverlay(QWidget):
     def _generate_layout(self, pixmap):
         random.seed(42)
         w, h = self.width(), self.height()
-        
+
         # Particles
         self._particles = []
         for _ in range(120):
@@ -5641,10 +6973,10 @@ class ScanningOverlay(QWidget):
                 'vy': random.uniform(-1, 1),
                 'life': random.uniform(0, math.pi * 2)
             })
-            
+
         self._boxes = []
         self._context_lines = []
-        
+
         if pixmap is not None:
             try:
                 # Convert QPixmap to CV2
@@ -5654,36 +6986,36 @@ class ScanningOverlay(QWidget):
                 ptr = qimg.constBits()
                 ptr.setsize(height * width * 3)
                 arr = np.array(ptr).reshape(height, width, 3)
-                
+
                 gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
                 edges = cv2.Canny(gray, 50, 150)
-                
+
                 kernel = np.ones((5,5), np.uint8)
                 dilated = cv2.dilate(edges, kernel, iterations=1)
-                
+
                 contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                
+
                 # Sort contours by area
                 contours = sorted(contours, key=cv2.contourArea, reverse=True)
-                
+
                 # Take top 30 elements to avoid crowding
                 for cnt in contours[:30]:
                     x, y, cw, ch = cv2.boundingRect(cnt)
                     area = cw * ch
                     if area < 150: continue # Skip tiny noise
-                    
+
                     category = "UNKNOWN"
                     start_time = 1.0
                     label = "UI Element"
-                    
+
                     if cw > 400 and ch > 300:
                         category = "WINDOW"
                         start_time = 2.5
-                        label = random.choice(["Dashboard Panel", "Task Workspace", "Editor Window"])
+                        label = random.choice(["Painel", "Área de Tarefas", "Janela do Editor"])
                     elif cw > 80 and ch < 40:
                         category = "OCR"
                         start_time = 0.5 + random.uniform(0, 0.5)
-                        label = random.choice(["System Online", "Settings", "Microphone", "User Profile"])
+                        label = random.choice(["Sistema Online", "Configurações", "Microfone", "Perfil do Usuário"])
                     elif cw < 60 and ch < 60:
                         category = "ICON"
                         start_time = 1.5 + random.uniform(0, 0.5)
@@ -5694,7 +7026,7 @@ class ScanningOverlay(QWidget):
                         label = "Action Button"
                     else:
                         continue # Skip weird shapes
-                        
+
                     self._boxes.append({
                         'x': x, 'y': y, 'w': cw, 'h': ch,
                         'category': category,
@@ -5703,10 +7035,10 @@ class ScanningOverlay(QWidget):
                         'start_time': start_time,
                         'has_product': (category == "WINDOW" and random.random() > 0.8)
                     })
-                    
+
             except Exception as e:
                 print(f"[ScanningOverlay] CV2 Error: {e}")
-                
+
         # Fallback if no boxes found or CV failed
         if len(self._boxes) == 0:
             for _ in range(5):
@@ -5736,7 +7068,7 @@ class ScanningOverlay(QWidget):
         self._time += self._dt
         if self._is_finishing:
             dt_finish = self._time - self._finish_time
-            if dt_finish > 1.5: 
+            if dt_finish > 1.5:
                 self._fade_out_opacity = max(0.0, 1.0 - (dt_finish - 1.5) * 2.0)
                 if self._fade_out_opacity <= 0.0:
                     self.hide()
@@ -5748,25 +7080,25 @@ class ScanningOverlay(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setOpacity(self._fade_out_opacity)
-        
+
         W, H = self.width(), self.height()
         p.fillRect(self.rect(), QColor(5, 5, 5, 210))
-        
+
         phase1_progress = min(1.0, self._time / 1.5)
         phase6_progress = min(1.0, max(0.0, (self._time - 4.5) / 1.5))
-        
+
         self._draw_particles(p, W, H, phase6_progress)
         self._draw_scan_waves(p, W, H, phase1_progress)
-        
+
         if self._time > 0.5 and not self._is_finishing:
             self._draw_all_boxes(p)
-            
+
         if self._time > 3.5 and not self._is_finishing:
             self._draw_context_lines(p)
-            
+
         if self._time > 4.5 and not self._is_finishing:
             self._draw_neural_net(p, W, H, phase6_progress)
-            
+
         self._draw_center_status(p, W, H)
 
     def _draw_particles(self, p, W, H, converge_progress):
@@ -5780,18 +7112,18 @@ class ScanningOverlay(QWidget):
             if part['x'] > W: part['x'] = 0
             if part['y'] < 0: part['y'] = H
             if part['y'] > H: part['y'] = 0
-            
+
             x, y = part['x'], part['y']
             if converge_progress > 0:
                 e = _ease_in_out_sine(converge_progress)
                 x = x + (cx - x) * e * 0.8
                 y = y + (cy - y) * e * 0.8
-                
+
             alpha = int(100 + math.sin(part['life']) * 50)
             p.setBrush(QColor(244, 180, 0, alpha))
             size = 1.5 + math.sin(part['life']) * 1.0
             p.drawEllipse(QRectF(x - size, y - size, size * 2, size * 2))
-            
+
     def _draw_scan_waves(self, p, W, H, progress):
         if progress >= 1.0 or self._is_finishing: return
         e = _ease_out_expo(progress)
@@ -5807,25 +7139,25 @@ class ScanningOverlay(QWidget):
         grad2.setColorAt(0.5, QColor(244, 180, 0, 150))
         grad2.setColorAt(1.0, QColor(244, 180, 0, 0))
         p.fillRect(QRectF(x - 50, 0, 100, H), grad2)
-        
+
     def _draw_all_boxes(self, p):
         p.setBrush(Qt.BrushStyle.NoBrush)
         for box in self._boxes:
             dt = self._time - box['start_time']
             if dt < 0: continue
-            
+
             out_dt = self._time - 4.5
             alpha_mult = max(0.0, 1.0 - out_dt) if out_dt > 0 else 1.0
             if alpha_mult <= 0: continue
-            
+
             prog = min(1.0, dt / 0.8)
             e = _ease_out_expo(prog)
-            
+
             x, y, w, h = box['x'], box['y'], box['w'], box['h']
             cat = box['category']
-            
+
             alpha = int(255 * alpha_mult)
-            
+
             # Styles based on category
             if cat == "OCR":
                 br = (w / 4) * e
@@ -5841,7 +7173,7 @@ class ScanningOverlay(QWidget):
                     p.drawLine(QPointF(x + w, y + h), QPointF(x + w, y + h - br))
                 else:
                     p.drawRect(QRectF(x, y, w, h))
-                    
+
             elif cat == "WINDOW":
                 br = 30 * e
                 p.setPen(QPen(QColor(244, 180, 0, int(200 * alpha_mult)), 2))
@@ -5853,25 +7185,25 @@ class ScanningOverlay(QWidget):
                 p.drawLine(QPointF(x, y + h), QPointF(x, y + h - br))
                 p.drawLine(QPointF(x + w, y + h), QPointF(x + w - br, y + h))
                 p.drawLine(QPointF(x + w, y + h), QPointF(x + w, y + h - br))
-                
+
             elif cat == "BUTTON":
                 p.setPen(QPen(QColor(244, 180, 0, int(100 * e * alpha_mult)), 1))
                 p.setBrush(QColor(244, 180, 0, int(20 * e * alpha_mult)))
                 p.drawRoundedRect(QRectF(x, y, w, h), 6, 6)
                 p.setBrush(Qt.BrushStyle.NoBrush)
-                
+
             elif cat == "ICON":
                 p.setPen(QPen(QColor(244, 180, 0, int(200 * e * alpha_mult)), 1))
                 p.drawEllipse(QRectF(x + w/2 - 4*e, y + h/2 - 4*e, 8*e, 8*e))
-                
+
             if dt > 0.8:
                 text_prog = min(1.0, (dt - 0.8) / 0.5)
                 te = _ease_out_expo(text_prog)
-                
+
                 conf = box['conf']
                 label = box['label']
                 if conf < 75: label = f"Possible {label}"
-                
+
                 p.setFont(QFont("Inter", 8, QFont.Weight.Bold))
                 p.setPen(QColor(244, 180, 0, int(255 * te * alpha_mult)))
                 ly = y - 6 + (1.0 - te) * 10
@@ -5880,26 +7212,26 @@ class ScanningOverlay(QWidget):
             if box['has_product'] and dt > 2.0:
                 card_prog = min(1.0, (dt - 2.0) / 0.5)
                 ce = _ease_out_expo(card_prog)
-                
+
                 cx, cy = x + w + 20, y + 20
                 cw, ch = 220, 90
-                
+
                 p.setPen(QPen(QColor(244, 180, 0, int(150 * ce * alpha_mult)), 1, Qt.PenStyle.DashLine))
                 p.drawLine(QPointF(x + w, y + 40), QPointF(cx, cy + ch/2))
-                
+
                 p.setPen(QPen(QColor(244, 180, 0, int(100 * ce * alpha_mult)), 1))
                 p.setBrush(QColor(10, 10, 5, int(220 * ce * alpha_mult)))
                 p.drawRoundedRect(QRectF(cx, cy, cw, ch), 6, 6)
                 p.setBrush(Qt.BrushStyle.NoBrush)
-                
+
                 if card_prog > 0.8:
                     p.setPen(QColor(255, 255, 255, int(255 * alpha_mult)))
                     p.setFont(QFont("Inter", 10, QFont.Weight.Bold))
-                    p.drawText(QRectF(cx + 12, cy + 10, cw, 20), Qt.AlignmentFlag.AlignLeft, "Detected Interface")
-                    
+                    p.drawText(QRectF(cx + 12, cy + 10, cw, 20), Qt.AlignmentFlag.AlignLeft, "Interface Detectada")
+
                     p.setPen(QColor(244, 180, 0, int(255 * alpha_mult)))
                     p.setFont(QFont("Inter", 8))
-                    p.drawText(QRectF(cx + 12, cy + 32, cw, 20), Qt.AlignmentFlag.AlignLeft, f"{label} Verified")
+                    p.drawText(QRectF(cx + 12, cy + 32, cw, 20), Qt.AlignmentFlag.AlignLeft, f"{label} Verificado")
 
     def _draw_context_lines(self, p):
         dt = self._time - 3.5
@@ -5999,25 +7331,25 @@ class BootSequenceOverlay(QWidget):
         self.setWindowOpacity(1.0)
         print("DEBUG: BootSequenceOverlay created!")
 
-        
+
         self._time = 0.0
         self._dt = 0.016
-        
+
         # Physics / State
         self._dots = []
         self._ambient_particles = []
-        
+
         self._tmr = QTimer(self)
         self._tmr.timeout.connect(self._tick)
         self._tmr.start(16)
         self._start_time = time.time()
-        
+
         self._status_messages = [
-            "Initializing Neural Engine...",
-            "Loading Intelligence...",
-            "Preparing Workspace..."
+            "Inicializando o Motor Neural...",
+            "Carregando Inteligência...",
+            "Preparando Área de Trabalho..."
         ]
-        
+
     def _init_dots(self, cx, cy):
         import random
         import math
@@ -6032,7 +7364,7 @@ class BootSequenceOverlay(QWidget):
                 'delay': random.uniform(0.0, 0.4),
                 'dur': random.uniform(0.4, 0.6)
             })
-            
+
     def _init_ambient(self, cx, cy):
         import random
         self._ambient_particles = []
@@ -6045,21 +7377,21 @@ class BootSequenceOverlay(QWidget):
                 'size': random.uniform(1.0, 3.0),
                 'alpha': random.uniform(0.1, 0.6)
             })
-            
+
     def _tick(self):
         self._time += self._dt
         rect = self.rect()
         cx, cy = rect.width() / 2, rect.height() / 2
-        
+
         if not self._dots:
             self._init_dots(cx, cy)
         if not self._ambient_particles:
             self._init_ambient(cx, cy)
-            
+
         for p in self._ambient_particles:
             p['x'] += p['vx'] * self._dt
             p['y'] += p['vy'] * self._dt
-            
+
             # Pulse push
             if 3.3 <= self._time <= 3.6:
                 dx = p['x'] - cx
@@ -6069,41 +7401,41 @@ class BootSequenceOverlay(QWidget):
                     force = (400 - dist) / 400.0
                     p['x'] += (dx / dist) * force * 20
                     p['y'] += (dy / dist) * force * 20
-                    
+
         self.update()
-        
+
         if self._time >= 4.0:
             self._tmr.stop()
             self.finished.emit()
-            
+
     def _ease_out_expo(self, t):
         return 1 - math.pow(2, -10 * t) if t < 1 else 1
-        
+
     def paintEvent(self, event):
         try:
             painter = QPainter(self)
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-            
+
             rect = self.rect()
             cx, cy = rect.width() / 2, rect.height() / 2
-            
+
             # Background
             # Phase 6 transition -> alpha fades to 0
             bg_alpha = 1.0
             if self._time >= 3.8:
                 bg_alpha = max(0.0, 1.0 - (self._time - 3.8) / 0.2)
-                
+
             painter.fillRect(rect, QColor(5, 5, 5, int(255 * bg_alpha)))
-            
+
             # Ambient particles
             for p in self._ambient_particles:
                 painter.setPen(Qt.PenStyle.NoPen)
                 painter.setBrush(QColor(255, 200, 87, int(255 * p['alpha'] * bg_alpha)))
                 painter.drawEllipse(QPointF(p['x'], p['y']), p['size'], p['size'])
-                
+
             # Group all center drawing to allow scaling for Phase 5 & 6
             painter.translate(cx, cy)
-            
+
             scale = 1.0
             if 3.3 <= self._time < 3.8:
                 # Spring compression
@@ -6113,9 +7445,9 @@ class BootSequenceOverlay(QWidget):
                 # Massive scale up
                 t = (self._time - 3.8) / 0.2
                 scale = 1.0 + math.pow(t, 4) * 20.0
-                
+
             painter.scale(scale, scale)
-            
+
             # Phase 1: Convergence
             if self._time < 1.0:
                 for d in self._dots:
@@ -6127,45 +7459,45 @@ class BootSequenceOverlay(QWidget):
                     e = self._ease_out_expo(t)
                     x = (d['sx'] - d['cx']) * (1 - e)
                     y = (d['sy'] - d['cy']) * (1 - e)
-                    
+
                     # Faint trail
                     painter.setPen(Qt.PenStyle.NoPen)
                     painter.setBrush(QColor(255, 200, 87, int(200 * (1-e))))
                     painter.drawEllipse(QPointF(x, y), 2.5, 2.5)
-                    
+
             # Phase 2: Core
             if 1.0 <= self._time < 1.5:
                 t = (self._time - 1.0) / 0.5
                 rad = 8 + math.sin(t * math.pi) * 12
                 alpha = int(255 * math.sin(t * math.pi))
-                
+
                 grad = QRadialGradient(0, 0, rad * 3)
                 grad.setColorAt(0, QColor(255, 255, 255, alpha))
                 grad.setColorAt(0.3, QColor(255, 200, 87, int(alpha * 0.8)))
                 grad.setColorAt(1, QColor(255, 200, 87, 0))
-                
+
                 painter.setPen(Qt.PenStyle.NoPen)
                 painter.setBrush(QBrush(grad))
                 painter.drawEllipse(QPointF(0, 0), rad * 3, rad * 3)
-                
+
                 painter.setBrush(QColor(255, 255, 255, alpha))
                 painter.drawEllipse(QPointF(0, 0), rad, rad)
-                
+
             # Phase 3 & beyond: Orbital Construction & Text
             if self._time >= 1.5:
                 t_draw = min(1.0, (self._time - 1.5) / 1.0) # 1.5 to 2.5
                 ring_rad = 140
-                
+
                 # Glow behind ring
                 glow_pen = QPen(QColor(255, 200, 87, int(80 * bg_alpha)), 8)
                 painter.setPen(glow_pen)
                 painter.drawArc(QRectF(-ring_rad, -ring_rad, ring_rad*2, ring_rad*2), 90 * 16, int(-360 * t_draw * 16))
-                
+
                 # Sharp ring
                 sharp_pen = QPen(QColor(255, 200, 87, int(220 * bg_alpha)), 2)
                 painter.setPen(sharp_pen)
                 painter.drawArc(QRectF(-ring_rad, -ring_rad, ring_rad*2, ring_rad*2), 90 * 16, int(-360 * t_draw * 16))
-                
+
                 # Leading spark
                 if t_draw < 1.0:
                     angle = math.pi / 2 - (t_draw * 2 * math.pi)
@@ -6174,49 +7506,49 @@ class BootSequenceOverlay(QWidget):
                     painter.setPen(Qt.PenStyle.NoPen)
                     painter.setBrush(QColor(255, 255, 255))
                     painter.drawEllipse(QPointF(sx, sy), 4, 4)
-                    
+
                 # Phase 4: Text
                 if self._time >= 2.5:
                     t_text = min(1.0, (self._time - 2.5) / 0.8) # 2.5 to 3.3
-                    
+
                     # Text fade in
                     alpha = int(255 * t_text * bg_alpha)
-                    
+
                     painter.setPen(QColor(255, 255, 255, alpha))
                     font1 = QFont("Segoe UI", 32, QFont.Weight.Black)
                     font1.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 4)
                     painter.setFont(font1)
-                    
+
                     # Manual vertical layout for text
                     painter.drawText(QRectF(-ring_rad, -60, ring_rad*2, 60), Qt.AlignmentFlag.AlignCenter, "BRAHMA")
-                    
+
                     painter.setPen(QColor(255, 200, 87, alpha))
                     font2 = QFont("Segoe UI", 16, QFont.Weight.Medium)
                     font2.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 2)
                     painter.setFont(font2)
                     painter.drawText(QRectF(-ring_rad, 0, ring_rad*2, 40), Qt.AlignmentFlag.AlignCenter, "Echo")
-                    
+
                     # Status message cycling
                     msg_idx = int(((self._time - 2.5) / 1.5) * len(self._status_messages))
                     msg_idx = min(len(self._status_messages)-1, msg_idx)
                     msg = self._status_messages[msg_idx]
-                    
+
                     painter.setPen(QColor(150, 150, 150, alpha))
                     font3 = QFont("Segoe UI", 10, QFont.Weight.Normal)
                     painter.setFont(font3)
                     painter.drawText(QRectF(-ring_rad, ring_rad + 20, ring_rad*2, 30), Qt.AlignmentFlag.AlignCenter, msg)
-                    
+
                 # Phase 5: Pulse
                 if 3.3 <= self._time < 3.8:
                     t_pulse = (self._time - 3.3) / 0.5
                     pulse_rad = ring_rad + (t_pulse * 300)
                     pulse_alpha = int(255 * (1 - t_pulse))
-                    
+
                     pen = QPen(QColor(255, 200, 87, pulse_alpha), 2)
                     painter.setPen(pen)
                     painter.setBrush(Qt.BrushStyle.NoBrush)
                     painter.drawEllipse(QPointF(0, 0), pulse_rad, pulse_rad)
-                    
+
             painter.end()
         except Exception as e:
             import traceback
@@ -6283,17 +7615,17 @@ class IncomingAlertDialog(QDialog):
         lay.setContentsMargins(18, 16, 18, 16)
         lay.setSpacing(10)
 
-        heading = QLabel("Incoming Call" if self._kind == "call" else "Incoming Message")
+        heading = QLabel("Chamada Recebida" if self._kind == "call" else "Mensagem Recebida")
         heading.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
         heading.setStyleSheet(f"color: {C.WHITE}; background: transparent;")
         lay.addWidget(heading)
 
-        app_lbl = QLabel(f"From {self._app}")
+        app_lbl = QLabel(f"De {self._app}")
         app_lbl.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
         app_lbl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
         lay.addWidget(app_lbl)
 
-        body = self._preview or self._title or "A notification was detected."
+        body = self._preview or self._title or "Uma notificação foi detectada."
         body_lbl = QLabel(body)
         body_lbl.setWordWrap(True)
         body_lbl.setFont(QFont("Segoe UI", 10))
@@ -6410,14 +7742,14 @@ class MeetingOverlay(QWidget):
         top = QHBoxLayout()
         top.setSpacing(10)
 
-        self._badge = QLabel("MEETING MODE")
+        self._badge = QLabel("MODO REUNIÃO")
         self._badge.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
         self._badge.setStyleSheet(
             f"color: {C.WHITE}; background: rgba(255,255,255,0.06); border: 1px solid {C.BORDER_B}; border-radius: 10px; padding: 4px 10px;"
         )
         top.addWidget(self._badge)
 
-        self._title = QLabel("Watching the meeting")
+        self._title = QLabel("Observando a reunião")
         self._title.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
         self._title.setStyleSheet(f"color: {C.WHITE}; background: transparent;")
         top.addWidget(self._title)
@@ -6427,7 +7759,7 @@ class MeetingOverlay(QWidget):
         self._min_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._min_btn.setFixedSize(28, 28)
         self._min_btn.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
-        self._min_btn.setToolTip("Minimize meeting bar")
+        self._min_btn.setToolTip("Minimizar barra de reunião")
         self._min_btn.setStyleSheet(f"""
             QPushButton {{
                 background: rgba(255,255,255,0.06);
@@ -6443,7 +7775,7 @@ class MeetingOverlay(QWidget):
         self._min_btn.clicked.connect(self._toggle_collapsed)
         top.addWidget(self._min_btn)
 
-        self._stop_btn = QPushButton("Stop")
+        self._stop_btn = QPushButton("Parar")
         self._stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._stop_btn.setFixedHeight(28)
         self._stop_btn.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
@@ -6467,7 +7799,7 @@ class MeetingOverlay(QWidget):
         self._close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._close_btn.setFixedSize(28, 28)
         self._close_btn.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
-        self._close_btn.setToolTip("Close meeting bar")
+        self._close_btn.setToolTip("Fechar barra de reunião")
         self._close_btn.setStyleSheet(f"""
             QPushButton {{
                 background: rgba(255,255,255,0.06);
@@ -6484,19 +7816,19 @@ class MeetingOverlay(QWidget):
         top.addWidget(self._close_btn)
         lay.addLayout(top)
 
-        self._summary = QLabel("Waiting for a meeting to start...")
+        self._summary = QLabel("Aguardando o início de uma reunião...")
         self._summary.setWordWrap(True)
         self._summary.setFont(QFont("Segoe UI", 10))
         self._summary.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
         lay.addWidget(self._summary)
 
-        self._speech = QLabel("They said: nothing yet.")
+        self._speech = QLabel("Eles disseram: nada ainda.")
         self._speech.setWordWrap(True)
         self._speech.setFont(QFont("Segoe UI", 10))
         self._speech.setStyleSheet(f"color: {C.WHITE}; background: transparent;")
         lay.addWidget(self._speech)
 
-        self._answer = QLabel("Brahma Echo will show the live answer here.")
+        self._answer = QLabel("ULTRON mostrará a resposta ao vivo aqui.")
         self._answer.setWordWrap(True)
         self._answer.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
         self._answer.setStyleSheet(f"color: {C.WHITE}; background: transparent;")
@@ -6505,18 +7837,18 @@ class MeetingOverlay(QWidget):
         self._apply_collapsed_state(False)
 
     def set_content(self, title: str, summary: str, answer: str, active: bool = True, speech: str = ""):
-        self._title.setText(title or "Watching the meeting")
-        self._summary.setText(summary or "Watching the meeting screen.")
-        self._speech.setText(f"They said: {speech or 'nothing yet.'}")
-        self._answer.setText(answer or "No question detected yet.")
-        self._badge.setText("MEETING LIVE" if active else "MEETING MODE")
+        self._title.setText(title or "Observando a reunião")
+        self._summary.setText(summary or "Observando a tela da reunião.")
+        self._speech.setText(f"Eles disseram: {speech or 'nada ainda.'}")
+        self._answer.setText(answer or "Nenhuma pergunta detectada ainda.")
+        self._badge.setText("REUNIÃO AO VIVO" if active else "MODO REUNIÃO")
 
     def _apply_collapsed_state(self, collapsed: bool):
         self._collapsed = bool(collapsed)
         for widget in (self._summary, self._speech, self._answer):
             widget.setVisible(not self._collapsed)
         self._min_btn.setText("?" if self._collapsed else "-")
-        self._min_btn.setToolTip("Restore meeting bar" if self._collapsed else "Minimize meeting bar")
+        self._min_btn.setToolTip("Restaurar barra de reunião" if self._collapsed else "Minimizar barra de reunião")
         self.setFixedHeight(self._collapsed_height if self._collapsed else self._expanded_height)
 
     def set_collapsed(self, collapsed: bool):
@@ -6535,6 +7867,18 @@ class FloatingLauncher(QWidget):
     action_requested = pyqtSignal(str)
     position_changed = pyqtSignal(int, int)
 
+    _STATE_THEMES = {
+        "idle": (255, 179, 0),        # Amber Gold
+        "listening": (0, 229, 255),    # Electric Cyan
+        "thinking": (179, 136, 255),   # Holographic Violet
+        "speaking": (0, 230, 118),     # Vivid Emerald
+        "executing": (255, 145, 0),    # Dynamic Orange
+        "processing": (255, 145, 0),   # Dynamic Orange
+        "working": (255, 145, 0),
+        "muted": (160, 160, 160),      # Cool Silver
+        "error": (255, 82, 82),        # Alert Crimson
+    }
+
     def __init__(self):
         super().__init__(None)
         self.setWindowFlags(
@@ -6544,15 +7888,14 @@ class FloatingLauncher(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFixedSize(90, 90)
+        self.setFixedSize(88, 88)
         self._state = "idle"
-        self._status_line = "Ready"
+        self._status_line = "Pronto"
         self._hovered = False
 
         # Animation state
         self._anim_angle = 0.0
         self._ring2_angle = 0.0
-        self._ring3_angle = 0.0
         self._breath_val = 0.0
         self._breath_dir = 1
         self._particle_angles = [i * 45.0 for i in range(8)]
@@ -6560,39 +7903,91 @@ class FloatingLauncher(QWidget):
 
         self._anim_timer = QTimer(self)
         self._anim_timer.timeout.connect(self._anim_tick)
-        self._anim_timer.start(25)  # 40fps for smoother feel
+        self._anim_timer.start(25)  # 40fps
 
         self._single_timer = QTimer(self)
         self._single_timer.setSingleShot(True)
-        self._single_timer.timeout.connect(self.single_clicked.emit)
+        self._single_timer.timeout.connect(self._on_single_click_timeout)
+
+        # Kinetic spring physics & audio reactivity
+        self._audio_lvl = 0.0
+        self._gaze_x = 0.0
+        self._gaze_y = 0.0
+        self._target_snap_x = 0
+        self._spring_timer = QTimer(self)
+        self._spring_timer.setInterval(16)
+        self._spring_timer.timeout.connect(self._spring_step)
+
         self._dragging = False
         self._drag_button = None
         self._drag_offset = QPoint(0, 0)
         self._press_pos = QPoint(0, 0)
         self._apply_state_style()
 
+    def set_audio_level(self, lvl: float):
+        self._audio_lvl = max(0.0, min(1.0, float(lvl)))
+        self.update()
+
+    def _spring_step(self):
+        curr_x = self.x()
+        diff = self._target_snap_x - curr_x
+        if abs(diff) < 2:
+            self.move(self._target_snap_x, self.y())
+            self._spring_timer.stop()
+            self.position_changed.emit(self.x(), self.y())
+        else:
+            step = int(diff * 0.28)
+            if step == 0:
+                step = 1 if diff > 0 else -1
+            self.move(curr_x + step, self.y())
+
+    def _on_single_click_timeout(self):
+        self.single_clicked.emit()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        if hasattr(self, "_anim_timer") and self._anim_timer.isActive():
+            self._anim_timer.stop()
+        if hasattr(self, "_spring_timer") and self._spring_timer.isActive():
+            self._spring_timer.stop()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if hasattr(self, "_anim_timer") and not self._anim_timer.isActive():
+            self._anim_timer.start(25)
+
     def _anim_tick(self):
+        if not self.isVisible():
+            if hasattr(self, "_anim_timer") and self._anim_timer.isActive():
+                self._anim_timer.stop()
+            return
         import math
-        self._anim_angle = (self._anim_angle + 1.6) % 360.0
-        self._ring2_angle = (self._ring2_angle - 1.1) % 360.0  # counter-rotate
-        self._ring3_angle = (self._ring3_angle + 2.4) % 360.0  # faster third ring
-        self._breath_val += 0.025 * self._breath_dir
+        # State-dependent spin speeds
+        spin_speed = 3.2 if self._state == "thinking" else (2.4 if self._state in ("listening", "speaking") else 1.5)
+        self._anim_angle = (self._anim_angle + spin_speed) % 360.0
+        self._ring2_angle = (self._ring2_angle - spin_speed * 0.75) % 360.0
+
+        breath_step = 0.04 if self._state in ("listening", "speaking", "thinking") else 0.022
+        self._breath_val += breath_step * self._breath_dir
         if self._breath_val >= 1.0:
+            self._breath_val = 1.0
             self._breath_dir = -1
         elif self._breath_val <= 0.0:
+            self._breath_val = 0.0
             self._breath_dir = 1
+
         w, h = self.width(), self.height()
         cx, cy = w / 2.0, h / 2.0
         for i in range(len(self._particle_angles)):
-            speed = 0.8 + i * 0.12
+            speed = 0.9 + i * 0.14
             self._particle_angles[i] = (self._particle_angles[i] + speed) % 360.0
             rad = math.radians(self._particle_angles[i])
-            orbit_r = 37.0 + (i % 3) * 2.5
+            orbit_r = 35.0 + (i % 3) * 2.2 + self._audio_lvl * 5.0
             px = cx + math.cos(rad) * orbit_r
             py = cy + math.sin(rad) * orbit_r
             trail = self._particle_trails[i]
             trail.append((px, py))
-            if len(trail) > 6:
+            if len(trail) > 5:
                 trail.pop(0)
         self.update()
 
@@ -6600,118 +7995,115 @@ class FloatingLauncher(QWidget):
         import math
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         w, h = self.width(), self.height()
         cx, cy = w / 2.0, h / 2.0
 
-        try:
-            ar, ag, ab = int(C.PRI[1:3], 16), int(C.PRI[3:5], 16), int(C.PRI[5:7], 16)
-        except Exception:
-            ar, ag, ab = 255, 179, 0
+        ar, ag, ab = self._STATE_THEMES.get(self._state, (255, 179, 0))
         breath = self._breath_val
-        hover_boost = 1.4 if self._hovered else 1.0
+        hover_boost = 1.35 if self._hovered else 1.0
+        audio_boost = self._audio_lvl * 12.0
 
-        # ── 1. Deep outer ambient glow ──
-        glow_alpha = int((25 + breath * 50) * hover_boost)
-        glow_r = 42.0 + breath * 5.0
+        # ── 1. Pulsing Ambient Glow (Audio Reactive) ──
+        glow_r = (38.0 + breath * 5.5 + audio_boost) * (1.1 if self._hovered else 1.0)
+        glow_alpha = int((30 + breath * 45 + self._audio_lvl * 70) * hover_boost)
         glow = QRadialGradient(cx, cy, glow_r)
-        glow.setColorAt(0.0, QColor(ar, ag, ab, glow_alpha))
-        glow.setColorAt(0.5, QColor(ar, ag, ab, int(glow_alpha * 0.35)))
+        glow.setColorAt(0.0, QColor(ar, ag, ab, min(255, glow_alpha)))
+        glow.setColorAt(0.55, QColor(ar, ag, ab, min(255, int(glow_alpha * 0.35))))
         glow.setColorAt(1.0, QColor(ar, ag, ab, 0))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(glow))
         painter.drawEllipse(QPointF(cx, cy), glow_r, glow_r)
 
-        # ── 2. Outer dashed orbit ring ──
-        dash_pen = QPen(QColor(ar, ag, ab, int(18 + breath * 15)), 0.6)
-        dash_pen.setStyle(Qt.PenStyle.DotLine)
-        painter.setPen(dash_pen)
+        # ── 2. Subtle Outer Orbit Guide Ring ──
+        guide_pen = QPen(QColor(ar, ag, ab, int(25 + breath * 20)), 0.75)
+        guide_pen.setStyle(Qt.PenStyle.DotLine)
+        painter.setPen(guide_pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawEllipse(QPointF(cx, cy), 40.0, 40.0)
+        painter.drawEllipse(QPointF(cx, cy), 39.0, 39.0)
 
-        # ── 3. Triple rotating arcs ──
-        # Ring 1: Primary wide arc
-        a1 = int((160 + breath * 80) * hover_boost)
-        pen1 = QPen(QColor(ar, ag, ab, min(255, a1)), 2.2)
+        # ── 3. High-Tech Dual Rotating Arcs ──
+        # Primary Outer Arc
+        a1 = min(255, int((170 + breath * 75 + self._audio_lvl * 50) * hover_boost))
+        pen1 = QPen(QColor(ar, ag, ab, a1), 2.2 + self._audio_lvl * 1.5)
         pen1.setCapStyle(Qt.PenCapStyle.RoundCap)
         painter.setPen(pen1)
-        rect1 = QRectF(cx - 36, cy - 36, 72, 72)
-        painter.drawArc(rect1, int(self._anim_angle * 16), int(110 * 16))
+        rect1 = QRectF(cx - 35.0, cy - 35.0, 70.0, 70.0)
+        arc_len = 110 if self._state != "thinking" else 140
+        painter.drawArc(rect1, int(self._anim_angle * 16), int(arc_len * 16))
 
-        # Ring 2: Counter-rotating medium arc
-        a2 = int((80 + breath * 50) * hover_boost)
-        pen2 = QPen(QColor(ar, ag, ab, min(255, a2)), 1.4)
+        # Secondary Counter-Rotating Arc
+        a2 = min(255, int((90 + breath * 50) * hover_boost))
+        pen2 = QPen(QColor(ar, ag, ab, a2), 1.3)
         pen2.setCapStyle(Qt.PenCapStyle.RoundCap)
         painter.setPen(pen2)
-        rect2 = QRectF(cx - 33, cy - 33, 66, 66)
-        painter.drawArc(rect2, int(self._ring2_angle * 16), int(90 * 16))
+        rect2 = QRectF(cx - 31.5, cy - 31.5, 63.0, 63.0)
+        painter.drawArc(rect2, int(self._ring2_angle * 16), int(80 * 16))
 
-        # Ring 3: Fast thin inner arc
-        a3 = int((50 + breath * 40) * hover_boost)
-        c3 = QColor(ar, ag, ab).lighter(140)
-        pen3 = QPen(QColor(c3.red(), c3.green(), c3.blue(), min(255, a3)), 0.9)
-        pen3.setCapStyle(Qt.PenCapStyle.RoundCap)
-        painter.setPen(pen3)
-        rect3 = QRectF(cx - 30, cy - 30, 60, 60)
-        painter.drawArc(rect3, int(self._ring3_angle * 16), int(70 * 16))
+        # Orbiting Satellite Beacon
+        sat_rad = math.radians(self._anim_angle + 180.0)
+        sat_x = cx + math.cos(sat_rad) * 35.0
+        sat_y = cy + math.sin(sat_rad) * 35.0
+        sat_color = QColor(ar, ag, ab).lighter(150)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(QColor(sat_color.red(), sat_color.green(), sat_color.blue(), min(255, int(180 * hover_boost)))))
+        painter.drawEllipse(QPointF(sat_x, sat_y), 2.2, 2.2)
 
-        # ── 4. Core dark circle with radial gradient ──
-        core_grad = QRadialGradient(cx, cy - 4.0, 28.0)
-        core_grad.setColorAt(0.0, QColor(18, 16, 10, 250))
-        core_grad.setColorAt(0.85, QColor(8, 7, 5, 252))
-        core_grad.setColorAt(1.0, QColor(ar, ag, ab, 15))
+        # ── 4. Central Glassmorphic Core (with Cursor Parallax) ──
+        gx, gy = self._gaze_x, self._gaze_y
+        core_r = 25.5 + self._audio_lvl * 2.0
+        core_grad = QRadialGradient(cx + gx * 0.5, cy - 4.0 + gy * 0.5, core_r)
+        core_grad.setColorAt(0.0, QColor(20, 22, 30, 246))
+        core_grad.setColorAt(0.85, QColor(10, 11, 16, 252))
+        core_grad.setColorAt(1.0, QColor(ar, ag, ab, 30))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(core_grad))
-        painter.drawEllipse(QPointF(cx, cy), 27.0, 27.0)
+        painter.drawEllipse(QPointF(cx + gx * 0.5, cy + gy * 0.5), core_r, core_r)
 
-        # Inner gold rim
-        rim_alpha = int((40 + breath * 35) * hover_boost)
-        rim_pen = QPen(QColor(ar, ag, ab, min(255, rim_alpha)), 1.0)
+        # Glowing Core Rim
+        rim_alpha = min(255, int((110 + breath * 80 + self._audio_lvl * 60) * hover_boost))
+        rim_pen = QPen(QColor(ar, ag, ab, rim_alpha), 1.2)
         painter.setPen(rim_pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawEllipse(QPointF(cx, cy), 27.0, 27.0)
+        painter.drawEllipse(QPointF(cx + gx * 0.5, cy + gy * 0.5), core_r, core_r)
 
-        # ── 5. Particle trails (comet effect) ──
+        # ── 5. Orbiting Micro-Particle Comet Trails ──
         for i in range(len(self._particle_trails)):
             trail = self._particle_trails[i]
             for t_idx, (px, py) in enumerate(trail):
                 frac = (t_idx + 1) / max(len(trail), 1)
-                t_alpha = int(frac * (60 + breath * 90) * hover_boost)
-                t_size = 0.6 + frac * (1.2 + (i % 3) * 0.4)
+                t_alpha = min(255, int(frac * (50 + breath * 70) * hover_boost))
+                t_size = 0.5 + frac * 1.2
                 painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(QBrush(QColor(ar, ag, ab, min(255, t_alpha))))
+                painter.setBrush(QBrush(QColor(ar, ag, ab, t_alpha)))
                 painter.drawEllipse(QPointF(px, py), t_size, t_size)
-
-            # Bright head
             if trail:
                 hx, hy = trail[-1]
-                head_alpha = int((120 + breath * 130) * hover_boost)
-                head_size = 1.8 + (i % 2) * 0.6
-                chead = QColor(ar, ag, ab).lighter(150)
-                painter.setBrush(QBrush(QColor(chead.red(), chead.green(), chead.blue(), min(255, head_alpha))))
-                painter.drawEllipse(QPointF(hx, hy), head_size, head_size)
+                head_alpha = min(255, int((120 + breath * 120) * hover_boost))
+                head_c = QColor(ar, ag, ab).lighter(140)
+                painter.setBrush(QBrush(QColor(head_c.red(), head_c.green(), head_c.blue(), head_alpha)))
+                painter.drawEllipse(QPointF(hx, hy), 1.6, 1.6)
 
-        # ── 6. Hindi Brahma Echo text "ब्रह्मा इको" ──
-        text_alpha = int((210 + breath * 45) * hover_boost)
-        painter.setPen(QPen(QColor(ar, ag, ab, min(255, text_alpha))))
+        # ── 6. Emblem: Hindi "ब्रह्मा" + Status Dot with Parallax ──
+        text_alpha = min(255, int((215 + breath * 40) * hover_boost))
+        painter.setPen(QPen(QColor(0, 0, 0, 180)))
         painter.setFont(QFont("Nirmala UI", 11, QFont.Weight.Bold))
-        painter.drawText(QRectF(cx - 22, cy - 10, 44, 20), Qt.AlignmentFlag.AlignCenter, "\u092C\u094D\u0930\u0939\u094D\u092E\u093E")
+        painter.drawText(QRectF(cx - 21.0 + gx, cy - 13.0 + gy, 44.0, 22.0), Qt.AlignmentFlag.AlignCenter, "\u092C\u094D\u0930\u0939\u094D\u092E\u093E")
+
+        # Crisp glowing text
+        painter.setPen(QPen(QColor(ar, ag, ab, text_alpha)))
+        painter.setFont(QFont("Nirmala UI", 11, QFont.Weight.Bold))
+        painter.drawText(QRectF(cx - 22.0 + gx, cy - 14.0 + gy, 44.0, 22.0), Qt.AlignmentFlag.AlignCenter, "\u092C\u094D\u0930\u0939\u094D\u092E\u093E")
+
+        # Tiny breathing status beacon directly below text
+        dot_alpha = min(255, int((150 + breath * 105) * hover_boost))
+        dot_color = QColor(ar, ag, ab, dot_alpha)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(dot_color))
+        painter.drawEllipse(QPointF(cx + gx, cy + 12.0 + gy), 2.0, 2.0)
 
         painter.end()
-
-    def _get_accent_color(self):
-        return C.PRI
-
-    def _hex_to_rgb(self, hex_color):
-        hex_color = hex_color.lstrip('#')
-        return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
-
-    def enterEvent(self, event):
-        self._hovered = True
-        super().enterEvent(event)
-
-    def leaveEvent(self, event):
-        self._hovered = False
-        super().leaveEvent(event)
 
     def show_at(self, x: int | None = None, y: int | None = None):
         if x is None or y is None:
@@ -6724,123 +8116,171 @@ class FloatingLauncher(QWidget):
         self.activateWindow()
 
     def set_state(self, state: str, detail: str | None = None):
+        old_state = self._state
         self._state = (state or "idle").strip().lower()
         self._status_line = (detail or self._default_status()).strip() or self._default_status()
         self._apply_state_style()
 
+        # Acoustic cues were fired on EVERY state change, so a normal back-and-
+        # forth conversation chimed on every turn (the "muted"-sounding blip the
+        # user heard each time they stopped talking). Keep only the meaningful
+        # completion cue and stay silent for the routine listening/thinking churn.
+        if self._state != old_state:
+            try:
+                from sound_manager import SoundManager
+                sm = SoundManager.instance()
+                if self._state == "idle" and old_state in ("thinking", "executing", "processing", "speaking"):
+                    sm.play_mission_complete()
+            except Exception:
+                pass
+
     def _default_status(self) -> str:
         return {
-            "idle": "Ready",
-            "listening": "Listening",
-            "thinking": "Thinking...",
-            "executing": "Executing task...",
-            "error": "Error",
-        }.get(self._state, "Ready")
+            "idle": "Pronto",
+            "listening": "Ouvindo",
+            "thinking": "Pensando...",
+            "speaking": "Falando",
+            "executing": "Executando tarefa...",
+            "processing": "Processando...",
+            "muted": "Silenciado",
+            "error": "Erro",
+        }.get(self._state, "Pronto")
 
     def _apply_state_style(self):
-        self.setToolTip(f"Brahma Echo\n{self._status_line}")
+        self.setToolTip(
+            f"ULTRON ({self._status_line})\n"
+            "• Clique único: Área de Chat\n"
+            "• Clique duplo: Abrir App Completo\n"
+            "• Arrastar: Mover (Encaixe Elástico)"
+        )
         self.update()
 
     def _show_menu(self, global_pos):
         menu = QMenu(self)
         menu.setStyleSheet(f"""
             QMenu {{
-                background: rgba(8, 8, 8, 245);
-                color: {C.WHITE};
-                border: 1px solid {C.BORDER_B};
-                border-radius: 10px;
+                background: rgba(14, 16, 22, 248);
+                color: #FFFFFF;
+                border: 1px solid rgba(255, 179, 0, 0.45);
+                border-radius: 12px;
                 padding: 6px;
+                font-family: 'Segoe UI';
+                font-size: 12px;
             }}
             QMenu::item {{
-                padding: 8px 18px;
+                padding: 7px 18px;
                 border-radius: 6px;
             }}
             QMenu::item:selected {{
-                background: rgba(255,255,255,0.08);
+                background: rgba(255, 179, 0, 0.20);
+                color: #FFB300;
+            }}
+            QMenu::separator {{
+                height: 1px;
+                background: rgba(255, 255, 255, 0.10);
+                margin: 4px 6px;
             }}
         """)
 
-        actions = [
-            ("New Task", "new_task"),
-            ("Voice Mode", "voice_mode"),
-            ("Screen Analyzer", "screen_analyzer"),
-            ("Browser Agent", "browser_agent"),
-            ("Settings", "settings"),
-            ("Open Workspace", "open_workspace"),
-        ]
-        for idx, (label, key) in enumerate(actions):
-            action = QAction(label, self)
-            action.triggered.connect(lambda _=False, k=key: self.action_requested.emit(k))
-            menu.addAction(action)
-            if idx != len(actions) - 1:
-                menu.addSeparator()
+        open_full = QAction("Abrir ULTRON (App Completo)", self)
+        open_full.triggered.connect(lambda: self.action_requested.emit("open_app"))
+        menu.addAction(open_full)
+
+        open_ws = QAction("Abrir Área de Chat", self)
+        open_ws.triggered.connect(lambda: self.action_requested.emit("open_workspace"))
+        menu.addAction(open_ws)
+
+        menu.addSeparator()
+
+        voice_mode = QAction("Alternar Modo de Voz", self)
+        voice_mode.triggered.connect(lambda: self.action_requested.emit("voice_mode"))
+        menu.addAction(voice_mode)
+
+        settings_act = QAction("Configurações", self)
+        settings_act.triggered.connect(lambda: self.action_requested.emit("settings"))
+        menu.addAction(settings_act)
+
+        menu.addSeparator()
+
+        hide_act = QAction("Ocultar Ícone Flutuante", self)
+        hide_act.triggered.connect(self.hide)
+        menu.addAction(hide_act)
+
+        quit_act = QAction("Sair do Brahma", self)
+        quit_act.triggered.connect(lambda: self.action_requested.emit("quit"))
+        menu.addAction(quit_act)
+
         menu.exec(global_pos)
 
+    def mousePressEvent(self, event):
+        if event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
+            if hasattr(self, "_spring_timer") and self._spring_timer.isActive():
+                self._spring_timer.stop()
+            self._dragging = False
+            self._press_pos = event.globalPosition().toPoint()
+            self._drag_offset = self._press_pos - self.frameGeometry().topLeft()
+            self._single_timer.stop()
+            self._drag_button = event.button()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        pos = event.globalPosition().toPoint()
+        # Calculate subtle cursor parallax
+        local_x = pos.x() - self.x() - self.width() / 2.0
+        local_y = pos.y() - self.y() - self.height() / 2.0
+        self._gaze_x = max(-2.5, min(2.5, local_x * 0.05))
+        self._gaze_y = max(-2.5, min(2.5, local_y * 0.05))
+
+        if event.buttons() & (Qt.MouseButton.LeftButton | Qt.MouseButton.RightButton):
+            if not self._dragging and (pos - self._press_pos).manhattanLength() > 5:
+                self._dragging = True
+            if self._dragging:
+                screen = QApplication.primaryScreen().availableGeometry()
+                new_pos = pos - self._drag_offset
+                new_x = max(screen.left(), min(new_pos.x(), screen.right() - self.width()))
+                new_y = max(screen.top(), min(new_pos.y(), screen.bottom() - self.height()))
+                self.move(new_x, new_y)
+                self.position_changed.emit(new_x, new_y)
+            event.accept()
+            return
+        self.update()
+        super().mouseMoveEvent(event)
+
     def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton and not self._dragging:
-            self._single_timer.start(180)
-        if event.button() == Qt.MouseButton.LeftButton and self._dragging:
-            self.position_changed.emit(self.x(), self.y())
+        if event.button() == Qt.MouseButton.LeftButton:
+            if not self._dragging:
+                self._single_timer.start(200)
+            else:
+                # Magnetic Spring Edge-Snap
+                screen = QApplication.primaryScreen().availableGeometry()
+                mid_x = (screen.left() + screen.right()) / 2.0
+                if self.x() < mid_x:
+                    self._target_snap_x = screen.left() + 16
+                else:
+                    self._target_snap_x = screen.right() - self.width() - 16
+                self._spring_timer.start(16)
+            self._dragging = False
+            self._drag_button = None
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.RightButton:
             if not self._dragging:
                 self._show_menu(event.globalPosition().toPoint())
             self._dragging = False
             self._drag_button = None
+            event.accept()
+            return
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self._single_timer.stop()
             self.double_clicked.emit()
+            event.accept()
+            return
         super().mouseDoubleClickEvent(event)
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._dragging = False
-            self._press_pos = event.globalPosition().toPoint()
-            self._drag_offset = self._press_pos - self.frameGeometry().topLeft()
-            self._single_timer.stop()
-            self._drag_button = Qt.MouseButton.LeftButton
-            event.accept()
-            return
-        if event.button() == Qt.MouseButton.RightButton:
-            self._dragging = False
-            self._press_pos = event.globalPosition().toPoint()
-            self._drag_offset = self._press_pos - self.frameGeometry().topLeft()
-            self._single_timer.stop()
-            self._drag_button = Qt.MouseButton.RightButton
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):
-        if event.buttons() & Qt.MouseButton.LeftButton:
-            pos = event.globalPosition().toPoint()
-            if not self._dragging and (pos - self._press_pos).manhattanLength() > 6:
-                self._dragging = True
-            if self._dragging:
-                screen = QApplication.primaryScreen().availableGeometry()
-                new_pos = pos - self._drag_offset
-                new_x = max(screen.left(), min(new_pos.x(), screen.right() - self.width()))
-                new_y = max(screen.top(), min(new_pos.y(), screen.bottom() - self.height()))
-                self.move(new_x, new_y)
-                self.position_changed.emit(new_x, new_y)
-            event.accept()
-            return
-        if event.buttons() & Qt.MouseButton.RightButton and self._drag_button == Qt.MouseButton.RightButton:
-            pos = event.globalPosition().toPoint()
-            if not self._dragging and (pos - self._press_pos).manhattanLength() > 6:
-                self._dragging = True
-            if self._dragging:
-                screen = QApplication.primaryScreen().availableGeometry()
-                new_pos = pos - self._drag_offset
-                new_x = max(screen.left(), min(new_pos.x(), screen.right() - self.width()))
-                new_y = max(screen.top(), min(new_pos.y(), screen.bottom() - self.height()))
-                self.move(new_x, new_y)
-                self.position_changed.emit(new_x, new_y)
-            event.accept()
-            return
-        super().mouseMoveEvent(event)
 
     def enterEvent(self, event):
         self._hovered = True
@@ -6849,6 +8289,8 @@ class FloatingLauncher(QWidget):
 
     def leaveEvent(self, event):
         self._hovered = False
+        self._gaze_x = 0.0
+        self._gaze_y = 0.0
         self._apply_state_style()
         super().leaveEvent(event)
 
@@ -6860,8 +8302,8 @@ class FloatingGestureCard(QWidget):
         self.lay = QVBoxLayout(self)
         self.lay.setContentsMargins(0, 0, 0, 0)
         self.lay.setSpacing(8)
-        
-        self.btn = QPushButton("🖐 Gestures")
+
+        self.btn = QPushButton("🖐 Gestos")
         self.btn.setFixedSize(100, 36)
         self.btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn.setStyleSheet(
@@ -6869,18 +8311,18 @@ class FloatingGestureCard(QWidget):
             "QPushButton:hover { color: #ffb300; border: 1px solid #ffb300; }"
         )
         self.btn.clicked.connect(self.toggle_preview)
-        
+
         btn_lay = QHBoxLayout()
         btn_lay.addStretch(1)
         btn_lay.addWidget(self.btn)
         self.lay.addLayout(btn_lay)
-        
+
         self.preview = GestureCameraPreview()
         self.preview.setFixedSize(280, 210)
         self.preview.hide()
-        
+
         self.lay.addWidget(self.preview)
-        
+
     def toggle_preview(self):
         if self.preview.isVisible():
             self.preview.hide()
@@ -6914,14 +8356,22 @@ class MainWindow(QMainWindow):
     discord_config_changed = pyqtSignal(object)
     discord_status_changed = pyqtSignal(str)
     minimized = pyqtSignal()
-    _screen_capture_sig = pyqtSignal()
+    restored = pyqtSignal()
+    _hud_operation_sig = pyqtSignal(dict)
+    _hud_deliverable_sig = pyqtSignal(dict)
+    _confirm_sig = pyqtSignal(str, str, str)
+    _memory_overlay_sig = pyqtSignal(str)
+    _audio_level_sig = pyqtSignal(float)
+
+    def _make_window_icon(self) -> QIcon:
+        return _logo_icon()
 
     def __init__(self, face_path: str):
         super().__init__()
         self.setWindowFlag(Qt.WindowType.Tool, False)
         self.setWindowFlag(Qt.WindowType.Window, True)
         self.setWindowIcon(self._make_window_icon())
-        self.setWindowTitle("Brahma Echo")
+        self.setWindowTitle("ULTRON")
         self.setMinimumSize(_MIN_W, _MIN_H)
         self.resize(_DEFAULT_W, _DEFAULT_H)
 
@@ -6955,6 +8405,7 @@ class MainWindow(QMainWindow):
 
         central = BackgroundWidget(BACKGROUND_IMAGE_FILE if BACKGROUND_IMAGE_FILE.exists() else None)
         central.setStyleSheet("background: transparent;")
+        self._bg_widget = central
         self.setCentralWidget(central)
 
         root = QVBoxLayout(central)
@@ -6968,21 +8419,27 @@ class MainWindow(QMainWindow):
         self._taskbar.setStyleSheet("background: transparent;")
         taskbar_lay = QHBoxLayout(self._taskbar)
         taskbar_lay.setContentsMargins(10, 10, 10, 10)
-        
-        self._btn_dashboard = QPushButton("Dashboard")
+
+        self._btn_dashboard = QPushButton("Painel")
         self._btn_chat = QPushButton("Chat")
-        self._btn_settings = QPushButton("Settings")
+        self._btn_settings = QPushButton("Configurações")
 
         for btn in (self._btn_dashboard, self._btn_chat, self._btn_settings):
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setStyleSheet(f"QPushButton {{ background: rgba(12,14,18,200); color: {C.WHITE}; border: 1px solid {C.BORDER_B}; border-radius: 8px; padding: 5px 15px; font-weight: bold; font-family: 'Segoe UI'; font-size: 13px; }} QPushButton:hover {{ color: {C.PRI}; border: 1px solid {C.PRI}; }}")
-        
+
+        self._status_badge = QLabel("● ONLINE")
+        self._status_badge.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        self._status_badge.setStyleSheet(
+            f"color: {C.PRI}; background: rgba(12,14,18,220); border: 1px solid {C.BORDER_B}; border-radius: 8px; padding: 5px 12px;"
+        )
+        taskbar_lay.addWidget(self._status_badge)
         taskbar_lay.addStretch()
         taskbar_lay.addWidget(self._btn_dashboard)
         taskbar_lay.addWidget(self._btn_chat)
         taskbar_lay.addWidget(self._btn_settings)
         taskbar_lay.addStretch()
-        
+
         root.addWidget(self._taskbar)
 
         self._floating_gesture_card = FloatingGestureCard(self.centralWidget())
@@ -6992,11 +8449,14 @@ class MainWindow(QMainWindow):
         body.addWidget(self._center_panel, stretch=1)
         _attach_pulse_glow(self._center_panel, color=C.PRI, blur_min=6.0, blur_max=14.0, alpha=36, period_ms=4200)
 
+        self._right_collapsed = False
+        self._right_panel = self._build_right_panel_modern()
+        body.addWidget(self._right_panel, stretch=0)
 
-
-        self._btn_dashboard.clicked.connect(lambda: self._center_stack.setCurrentIndex(0))
-        self._btn_chat.clicked.connect(lambda: self._center_stack.setCurrentIndex(4))
-        self._btn_settings.clicked.connect(lambda: self._center_stack.setCurrentIndex(5))
+        self._btn_dashboard.clicked.connect(self._on_nav_dashboard)
+        self._btn_chat.clicked.connect(self._toggle_right_sidebar)
+        self._btn_settings.clicked.connect(self._on_nav_settings)
+        self._update_nav_styles()
 
         root.addLayout(body, stretch=1)
 
@@ -7021,6 +8481,16 @@ class MainWindow(QMainWindow):
         self._scan_sig.connect(self._apply_scan_state)
         self._screen_capture_sig.connect(self._on_screen_capture_requested)
         self.discord_status_changed.connect(self._on_discord_status_update)
+        self._hud_operation_sig.connect(self._apply_hud_operation)
+        self._hud_deliverable_sig.connect(self._apply_hud_deliverable)
+        self._confirm_sig.connect(self._apply_confirm_overlay)
+        self._memory_overlay_sig.connect(self._apply_memory_overlay)
+        self._audio_level_sig.connect(self._on_audio_level_sig)
+        try:
+            from core import confirm as confirm_gate
+            confirm_gate.bind(self.show_confirm, self.hide_confirm, self._log_sig.emit)
+        except Exception:
+            pass
 
         import threading
         self._screen_capture_event = threading.Event()
@@ -7095,13 +8565,13 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "_startup_anim_btn"):
             return
         if platform.system() != "Windows":
-            self._startup_anim_btn.setText("Startup Animation (Windows only)")
+            self._startup_anim_btn.setText("Animação de Inicialização (apenas Windows)")
             self._startup_anim_btn.setEnabled(False)
             return
         if self._startup_animation_enabled():
-            self._startup_anim_btn.setText("Disable Startup Animation")
+            self._startup_anim_btn.setText("Desativar Animação de Inicialização")
         else:
-            self._startup_anim_btn.setText("Enable Startup Animation")
+            self._startup_anim_btn.setText("Ativar Animação de Inicialização")
 
     def _toggle_startup_animation(self):
         if platform.system() != "Windows":
@@ -7165,11 +8635,11 @@ class MainWindow(QMainWindow):
         self._discord_status_lbl.setText(status)
         self._discord_status_lbl.setStyleSheet(f"color: {color}; background: transparent;")
         if hasattr(self, "_discord_start_btn"):
-            self._discord_start_btn.setText("Start Discord Bot")
+            self._discord_start_btn.setText("Iniciar Bot do Discord")
         if hasattr(self, "_discord_stop_btn"):
-            self._discord_stop_btn.setText("Stop Discord Bot")
+            self._discord_stop_btn.setText("Parar Bot do Discord")
         if hasattr(self, "_discord_save_btn"):
-            self._discord_save_btn.setText("Save Settings")
+            self._discord_save_btn.setText("Salvar Configurações")
 
     def _save_discord_token(self):
         if not hasattr(self, "_discord_token_input"):
@@ -7184,8 +8654,8 @@ class MainWindow(QMainWindow):
         self._save_discord_settings(settings)
         self.discord_config_changed.emit(dict(settings))
         if token:
-            self._log.append_log("SYS: Discord bot token saved and bot enabled.")
-            self._refresh_discord_card("Token saved")
+            self._log.append_log("SYS: Token do bot do Discord salvo e bot ativado.")
+            self._refresh_discord_card("Token salvo")
         else:
             self._log.append_log("SYS: Discord bot token cleared.")
             self._discord_enabled = False
@@ -7292,13 +8762,13 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "_startup_btn"):
             return
         if platform.system() != "Windows":
-            self._startup_btn.setText("Start on Startup (Windows only)")
+            self._startup_btn.setText("Iniciar com o Sistema (apenas Windows)")
             self._startup_btn.setEnabled(False)
             return
         if self._startup_enabled():
-            self._startup_btn.setText("Start on Startup: ON")
+            self._startup_btn.setText("Iniciar com o Sistema: ATIVADO")
         else:
-            self._startup_btn.setText("Start on Startup: OFF")
+            self._startup_btn.setText("Iniciar com o Sistema: DESATIVADO")
 
     def _toggle_startup(self):
         if platform.system() != "Windows":
@@ -7316,6 +8786,9 @@ class MainWindow(QMainWindow):
     def _toggle_right_sidebar(self):
         self._right_collapsed = not self._right_collapsed
         self._apply_sidebar_state()
+        if not self._right_collapsed and hasattr(self, "_inline_workspace"):
+            if hasattr(self._inline_workspace, "focus_input"):
+                self._inline_workspace.focus_input()
 
     def _apply_sidebar_state(self):
         if hasattr(self, "_left_content"):
@@ -7325,17 +8798,60 @@ class MainWindow(QMainWindow):
             if hasattr(self, "_left_toggle_btn"):
                 self._left_toggle_btn.setText(">" if self._left_collapsed else "<")
                 self._left_toggle_btn.setToolTip("Expand left sidebar" if self._left_collapsed else "Collapse left sidebar")
+        if hasattr(self, "_right_panel"):
+            if self._right_collapsed:
+                self._right_panel.setVisible(False)
+            else:
+                self._right_panel.setVisible(True)
+                self._right_panel.setFixedWidth(_RIGHT_W)
         if hasattr(self, "_right_content"):
             self._right_content.setVisible(not self._right_collapsed)
         if hasattr(self, "_right_stack"):
             self._right_stack.setVisible(not self._right_collapsed)
-            if hasattr(self, "_right_panel"):
-                self._right_panel.setFixedWidth(56 if self._right_collapsed else _RIGHT_W)
-            if hasattr(self, "_right_toggle_btn"):
-                self._right_toggle_btn.setText("<" if self._right_collapsed else ">")
-                self._right_toggle_btn.setToolTip("Expand right sidebar" if self._right_collapsed else "Collapse right sidebar")
+        if hasattr(self, "_btn_chat"):
+            if not getattr(self, "_right_collapsed", False):
+                self._btn_chat.setStyleSheet(
+                    f"QPushButton {{ background: rgba(255, 179, 0, 0.18); color: {C.PRI}; border: 1px solid {C.PRI}; border-radius: 8px; padding: 5px 15px; font-weight: bold; font-family: 'Segoe UI'; font-size: 13px; }}"
+                )
+            else:
+                self._btn_chat.setStyleSheet(
+                    f"QPushButton {{ background: rgba(12,14,18,200); color: {C.WHITE}; border: 1px solid {C.BORDER_B}; border-radius: 8px; padding: 5px 15px; font-weight: bold; font-family: 'Segoe UI'; font-size: 13px; }} QPushButton:hover {{ color: {C.PRI}; border: 1px solid {C.PRI}; }}"
+                )
         if hasattr(self, "_center_panel"):
             self._center_panel.update()
+        self.resizeEvent(None)
+
+    def _on_nav_dashboard(self):
+        if hasattr(self, "_center_stack"):
+            self._center_stack.setCurrentIndex(0)
+        self._update_nav_styles()
+
+    def _on_nav_settings(self):
+        if hasattr(self, "_center_stack"):
+            self._center_stack.setCurrentIndex(4)
+        self._update_nav_styles()
+
+    def _update_nav_styles(self):
+        cur_idx = self._center_stack.currentIndex() if hasattr(self, "_center_stack") else 0
+        if hasattr(self, "_btn_dashboard"):
+            if cur_idx == 0:
+                self._btn_dashboard.setStyleSheet(
+                    f"QPushButton {{ background: rgba(255, 179, 0, 0.18); color: {C.PRI}; border: 1px solid {C.PRI}; border-radius: 8px; padding: 5px 15px; font-weight: bold; font-family: 'Segoe UI'; font-size: 13px; }}"
+                )
+            else:
+                self._btn_dashboard.setStyleSheet(
+                    f"QPushButton {{ background: rgba(12,14,18,200); color: {C.WHITE}; border: 1px solid {C.BORDER_B}; border-radius: 8px; padding: 5px 15px; font-weight: bold; font-family: 'Segoe UI'; font-size: 13px; }} QPushButton:hover {{ color: {C.PRI}; border: 1px solid {C.PRI}; }}"
+                )
+        if hasattr(self, "_btn_settings"):
+            if cur_idx in (3, 4):
+                self._btn_settings.setStyleSheet(
+                    f"QPushButton {{ background: rgba(255, 179, 0, 0.18); color: {C.PRI}; border: 1px solid {C.PRI}; border-radius: 8px; padding: 5px 15px; font-weight: bold; font-family: 'Segoe UI'; font-size: 13px; }}"
+                )
+            else:
+                self._btn_settings.setStyleSheet(
+                    f"QPushButton {{ background: rgba(12,14,18,200); color: {C.WHITE}; border: 1px solid {C.BORDER_B}; border-radius: 8px; padding: 5px 15px; font-weight: bold; font-family: 'Segoe UI'; font-size: 13px; }} QPushButton:hover {{ color: {C.PRI}; border: 1px solid {C.PRI}; }}"
+                )
+
 
     def set_settings_bridge(self, bridge):
         self._settings_bridge = bridge
@@ -7401,7 +8917,28 @@ class MainWindow(QMainWindow):
             self._overlay.setGeometry(0, 0, cw.width(), cw.height())
         if hasattr(self, '_floating_gesture_card') and self.centralWidget():
             cw = self.centralWidget()
-            self._floating_gesture_card.move(cw.width() - self._floating_gesture_card.width() - 30, 20)
+            rw = self._right_panel.width() if hasattr(self, '_right_panel') and self._right_panel.isVisible() and not getattr(self, '_right_collapsed', False) else 0
+            self._floating_gesture_card.move(cw.width() - rw - self._floating_gesture_card.width() - 20, 20)
+        if getattr(self, '_briefing_overlay', None) and self._briefing_overlay.isVisible():
+            self._position_briefing_overlay()
+        if getattr(self, '_remote_overlay', None) and self._remote_overlay.isVisible():
+            self._position_remote_overlay()
+        if getattr(self, '_confirm_overlay', None) and self._confirm_overlay.isVisible():
+            self._position_confirm_overlay()
+        if getattr(self, '_memory_overlay', None) and self._memory_overlay.isVisible():
+            self._position_memory_overlay()
+
+    def _tick_clock(self):
+        if hasattr(self, "_clock_lbl") and self._clock_lbl is not None:
+            try:
+                self._clock_lbl.setText(time.strftime("%H:%M"))
+            except Exception:
+                pass
+        if hasattr(self, "_date_lbl") and self._date_lbl is not None:
+            try:
+                self._date_lbl.setText(time.strftime("%A • %d %b"))
+            except Exception:
+                pass
 
     def _update_metrics(self):
         if not hasattr(self, "_bar_cpu"):
@@ -7425,7 +8962,7 @@ class MainWindow(QMainWindow):
         mem = snap["mem"]
         if hasattr(self, "_bar_mem"):
             self._bar_mem.set_value(mem, f"{mem:.0f}%")
-        
+
         if hasattr(self, "_uptime_lbl"):
             try:
                 boot = psutil.boot_time()
@@ -7480,7 +9017,7 @@ class MainWindow(QMainWindow):
             self._stat_cam.set_value(
                 "ON" if cam_on else "OFF",
                 100 if cam_on else 0,
-                "Webcam detected" if cam_on else "No camera found",
+                "Webcam detectada" if cam_on else "Nenhuma câmera encontrada",
             )
 
         if hasattr(self, "_uptime_lbl"):
@@ -7501,282 +9038,9 @@ class MainWindow(QMainWindow):
                 self._proc_lbl.setText("PROC  --")
 
 
-    def _build_header(self) -> QWidget:
-        w = QWidget()
-        w.setFixedHeight(54)
-        w.setStyleSheet(f"background: {C.DARK}; border-bottom: 1px solid {C.BORDER_B};")
-        lay = QHBoxLayout(w)
-        lay.setContentsMargins(16, 0, 16, 0)
-
-        def _badge(txt, color=C.TEXT_MED):
-            l = QLabel(txt)
-            l.setFont(QFont("Courier New", 8))
-            l.setStyleSheet(f"color: {color}; background: transparent;")
-            return l
-
-        lay.addWidget(_badge("BRAHMA ECHO", C.PRI_DIM))
-        lay.addStretch()
-
-        mid = QVBoxLayout(); mid.setSpacing(1)
-        title = QLabel("BRAHMA ECHO")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setFont(QFont("Courier New", 17, QFont.Weight.Bold))
-        title.setStyleSheet(f"color: {C.PRI}; background: transparent;")
-        mid.addWidget(title)
-        sub = QLabel("Lite Edition by Suryaansh Tiwari")
-        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        sub.setFont(QFont("Courier New", 7))
-        sub.setStyleSheet(f"color: {C.PRI_DIM}; background: transparent;")
-        mid.addWidget(sub)
-        lay.addLayout(mid)
-        lay.addStretch()
-
-        right_col = QVBoxLayout(); right_col.setSpacing(2)
-        self._clock_lbl = QLabel("00:00:00")
-        self._clock_lbl.setFont(QFont("Courier New", 14, QFont.Weight.Bold))
-        self._clock_lbl.setStyleSheet(f"color: {C.PRI}; background: transparent;")
-        self._clock_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
-        right_col.addWidget(self._clock_lbl)
-        self._date_lbl = QLabel("")
-        self._date_lbl.setFont(QFont("Courier New", 7))
-        self._date_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
-        self._date_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
-        right_col.addWidget(self._date_lbl)
-        lay.addLayout(right_col)
-        return w
-
-    def _tick_clock(self):
-        if hasattr(self, "_clock_lbl") and self._clock_lbl is not None:
-            self._clock_lbl.setText(time.strftime("%H:%M"))
-        if hasattr(self, "_date_lbl") and self._date_lbl is not None:
-            self._date_lbl.setText(time.strftime("%A • %d %b"))
-        if hasattr(self, "_core_lbl") and self._core_lbl is not None:
-            hour = time.localtime().tm_hour
-            if hour < 12:
-                greeting = "Good Morning"
-            elif hour < 18:
-                greeting = "Good Afternoon"
-            else:
-                greeting = "Good Evening"
-            name = os.getenv("USERNAME") or os.getenv("USER") or "Suryaansh"
-            self._core_lbl.setText(f"{greeting}, {name}")
-        if hasattr(self, "_core_sub_lbl") and self._core_sub_lbl is not None:
-            self._core_sub_lbl.setText("Ready to assist.")
-        if hasattr(self, "_core_status_lbl") and self._core_status_lbl is not None:
-            self._core_status_lbl.setText("Brahma Echo is ready. Gemini 2.5 Flash · OpenRouter · Voice Connected · Memory Enabled")
-        if hasattr(self, "_cpu_lbl") and self._cpu_lbl is not None:
-            self._cpu_lbl.setText(f"CPU {int(psutil.cpu_percent(interval=None))}%")
-        if hasattr(self, "_ram_lbl") and self._ram_lbl is not None:
-            self._ram_lbl.setText(f"RAM {int(psutil.virtual_memory().percent)}%")
-
-    def _make_window_icon(self) -> QIcon:
-        return _logo_icon()
-
-    def _build_left_panel(self) -> QWidget:
-        w = QWidget()
-        w.setFixedWidth(_LEFT_W)
-        w.setStyleSheet(f"background: {C.DARK}; border-right: 1px solid {C.BORDER};")
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(8, 10, 8, 10)
-        lay.setSpacing(6)
-
-        hdr = QLabel("â—ˆ SYS MONITOR")
-        hdr.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
-        hdr.setStyleSheet(f"color: {C.PRI}; background: transparent; "
-                          f"border-bottom: 1px solid {C.BORDER}; padding-bottom: 4px;")
-        lay.addWidget(hdr)
-        lay.addSpacing(2)
-
-        self._bar_cpu = MetricBar("CPU", C.PRI)
-        self._bar_mem = MetricBar("MEM", C.ACC2)
-        self._bar_net = MetricBar("NET", C.GREEN)
-        self._bar_gpu = MetricBar("GPU", C.ACC)
-        self._bar_tmp = MetricBar("TMP", "#ff6688")
-
-        for bar in [self._bar_cpu, self._bar_mem, self._bar_net,
-                    self._bar_gpu, self._bar_tmp]:
-            lay.addWidget(bar)
-
-        lay.addSpacing(4)
-
-        info_panel = QWidget()
-        info_panel.setStyleSheet(
-            f"background: {C.PANEL2}; border: 1px solid {C.BORDER}; border-radius: 4px;"
-        )
-        ip_lay = QVBoxLayout(info_panel)
-        ip_lay.setContentsMargins(6, 5, 6, 5)
-        ip_lay.setSpacing(3)
-
-        self._uptime_lbl = QLabel("UP  --:--")
-        self._uptime_lbl.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
-        self._uptime_lbl.setStyleSheet(f"color: {C.GREEN}; background: transparent; border: none;")
-        ip_lay.addWidget(self._uptime_lbl)
-
-        self._proc_lbl = QLabel("PROC  --")
-        self._proc_lbl.setFont(QFont("Courier New", 8))
-        self._proc_lbl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent; border: none;")
-        ip_lay.addWidget(self._proc_lbl)
-
-        os_name = {"Windows": "WIN", "Darwin": "macOS", "Linux": "LINUX"}.get(_OS, _OS.upper())
-        os_lbl = QLabel(f"OS  {os_name}")
-        os_lbl.setFont(QFont("Courier New", 8))
-        os_lbl.setStyleSheet(f"color: {C.ACC2}; background: transparent; border: none;")
-        ip_lay.addWidget(os_lbl)
-
-        lay.addWidget(info_panel)
-        lay.addStretch()
-
-        for txt, col in [
-            ("AI CORE\nACTIVE",     C.GREEN),
-            ("SEC\nCLEARED",        C.PRI),
-            ("PROTOCOL\nXXXVIII",   C.TEXT_DIM),
-        ]:
-            lbl = QLabel(txt)
-            lbl.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
-            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lbl.setStyleSheet(
-                f"color: {col}; background: {C.PANEL2};"
-                f"border: 1px solid {C.BORDER_A}; border-radius: 3px; padding: 4px;"
-            )
-            lay.addWidget(lbl)
-
-        return w
-    def _build_right_panel(self) -> QWidget:
-        w = QWidget()
-        w.setFixedWidth(_RIGHT_W)
-        w.setStyleSheet(f"background: {C.DARK}; border-left: 1px solid {C.BORDER};")
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(8, 8, 8, 8)
-        lay.setSpacing(6)
-
-        def _sec(txt):
-            l = QLabel(f"â-¸ {txt}")
-            l.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
-            l.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
-            return l
-
-        lay.addWidget(_sec("ACTIVITY LOG"))
-        self._log = LogWidget()
-        lay.addWidget(self._log, stretch=1)
-
-        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
-        lay.addWidget(sep)
-
-        lay.addWidget(_sec("FILE UPLOAD"))
-        self._drop_zone = FileDropZone()
-        self._drop_zone.file_selected.connect(self._on_file_selected)
-        lay.addWidget(self._drop_zone)
-
-        self._file_hint = QLabel("No file loaded â€” drop or click above to upload")
-        self._file_hint.setFont(QFont("Courier New", 7))
-        self._file_hint.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
-        self._file_hint.setWordWrap(True)
-        lay.addWidget(self._file_hint)
-
-        sep2 = QFrame(); sep2.setFrameShape(QFrame.Shape.HLine)
-        sep2.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
-        lay.addWidget(sep2)
-
-        lay.addWidget(_sec("COMMAND INPUT"))
-        lay.addLayout(self._build_input_row())
-
-        self._mute_btn = QPushButton("ðŸŽ™  MICROPHONE ACTIVE")
-        self._mute_btn.setFixedHeight(30)
-        self._mute_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
-        self._mute_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._mute_btn.clicked.connect(self._toggle_mute)
-        self._style_mute_btn()
-        lay.addWidget(self._mute_btn)
-
-        fs_btn = QPushButton("â›¶  FULLSCREEN  [F11]")
-        fs_btn.setFixedHeight(26)
-        fs_btn.setFont(QFont("Courier New", 7))
-        fs_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        fs_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: transparent; color: {C.TEXT_MED};
-                border: 1px solid {C.BORDER}; border-radius: 3px;
-            }}
-            QPushButton:hover {{
-                color: {C.PRI}; border: 1px solid {C.BORDER_B};
-            }}
-        """)
-        fs_btn.clicked.connect(self._toggle_fullscreen)
-        lay.addWidget(fs_btn)
-
-        return w
-
-    def _build_input_row(self) -> QHBoxLayout:
-        row = QHBoxLayout(); row.setSpacing(5)
-        self._input = QLineEdit()
-        self._input.setPlaceholderText("Type a command or questionâ€¦")
-        self._input.setFont(QFont("Courier New", 9))
-        self._input.setFixedHeight(30)
-        self._input.setStyleSheet(f"""
-            QLineEdit {{
-                background: #000d14; color: {C.WHITE};
-                border: 1px solid {C.BORDER}; border-radius: 3px; padding: 3px 7px;
-            }}
-            QLineEdit:focus {{ border: 1px solid {C.PRI}; }}
-        """)
-        self._input.returnPressed.connect(self._send)
-        row.addWidget(self._input)
-
-        send = QPushButton("â-¸")
-        send.setFixedSize(30, 30)
-        send.setFont(QFont("Courier New", 11, QFont.Weight.Bold))
-        send.setCursor(Qt.CursorShape.PointingHandCursor)
-        send.setStyleSheet(f"""
-            QPushButton {{
-                background: {C.PANEL}; color: {C.PRI};
-                border: 1px solid {C.PRI_DIM}; border-radius: 3px;
-            }}
-            QPushButton:hover {{ background: {C.PRI_GHO}; border: 1px solid {C.PRI}; }}
-        """)
-        send.clicked.connect(self._send)
-        row.addWidget(send)
-        return row
-
-    def _build_footer(self) -> QWidget:
-        w = QWidget()
-        w.setFixedHeight(22)
-        w.setStyleSheet(f"background: {C.DARK}; border-top: 1px solid {C.BORDER};")
-        lay = QHBoxLayout(w); lay.setContentsMargins(14, 0, 14, 0)
-
-        def _fl(txt, color=C.TEXT_MED):
-            l = QLabel(txt); l.setFont(QFont("Courier New", 7))
-            l.setStyleSheet(f"color: {color}; background: transparent;")
-            return l
-
-        lay.addWidget(_fl("[F4] Mute  Â·  [F11] Fullscreen"))
-        lay.addStretch()
-        lay.addWidget(_fl("Suryaansh Tiwari  Â·  Brahma Echo  Â·  Open Source"))
-        lay.addStretch()
-        lay.addWidget(_fl("Â© STARK INDUSTRIES", C.PRI_DIM))
-        return w
-
-    def _on_file_selected(self, path: str):
-        self._current_file = path
-        p = Path(path)
-        cat = _file_category(p)
-        icon, _ = _FILE_ICONS.get(cat, _FILE_ICONS["unknown"])
-        size = _fmt_size(p.stat().st_size)
-        if hasattr(self, "_file_chip") and self._file_chip:
-            self._file_chip.setText(f"Attached: {icon} {p.name}  â€¢  {size}")
-        self._log.append_log(f"FILE: {p.name} ({size}) loaded")
-        if self.on_text_command:
-            msg = (
-                f"[FILE_UPLOADED] path={path} | name={p.name} | "
-                f"type={p.suffix.lstrip('.') } | size={size} | "
-                f"Briefly tell the user you can see the file '{p.name}' "
-                f"({size}) has been uploaded and ask what they'd like to do with it."
-            )
-            threading.Thread(target=self.on_text_command, args=(msg,), daemon=True).start()
-
     def _browse_attachment(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Attach a file to Brahma Echo", str(Path.home()),
+            self, "Anexar um arquivo ao ULTRON", str(Path.home()),
             "All Files (*.*);;"
             "Images (*.jpg *.jpeg *.png *.gif *.webp *.bmp *.svg);;"
             "Documents (*.pdf *.docx *.txt *.md *.pptx);;"
@@ -7796,10 +9060,10 @@ class MainWindow(QMainWindow):
         self._style_mute_btn()
         if self._muted:
             self._apply_state("MUTED")
-            self._log.append_log("SYS: Microphone muted.")
+            self._log.append_log("SYS: Microfone silenciado.")
         else:
             self._apply_state("LISTENING")
-            self._log.append_log("SYS: Microphone active.")
+            self._log.append_log("SYS: Microfone ativo.")
 
     def set_muted_state(self, muted: bool, *, wakeword: bool = False):
         muted = bool(muted)
@@ -7811,10 +9075,10 @@ class MainWindow(QMainWindow):
         self._style_mute_btn()
         if self._muted:
             self._apply_state("MUTED")
-            self._log.append_log("SYS: Microphone muted.")
+            self._log.append_log("SYS: Microfone silenciado.")
         else:
             self._apply_state("LISTENING")
-            self._log.append_log("SYS: Microphone active.")
+            self._log.append_log("SYS: Microfone ativo.")
 
     def _style_mute_btn(self):
         if not hasattr(self, "_mute_btn") or self._mute_btn is None:
@@ -7855,7 +9119,7 @@ class MainWindow(QMainWindow):
             self._command_card.set_body(preview)
             self._command_card.hide()
         if hasattr(self, "_result_card"):
-            self._result_card.set_body("Waiting for reply...")
+            self._result_card.set_body("Aguardando resposta...")
             self._result_card.hide()
         self._restart_card_hide_timer()
         self._log_sig.emit(f"You: {txt}")
@@ -7874,7 +9138,7 @@ class MainWindow(QMainWindow):
                     self.on_chat_event({"role": "user", "text": user_msg, "source": source})
                 except Exception:
                     pass
-        if hasattr(self, "_result_card") and low.startswith("brahma echo:"):
+        if hasattr(self, "_result_card") and low.startswith(("ultron:", "brahma echo:")):
             reply = raw.split(":", 1)[1].strip()
             self._result_card.set_body(reply[:80] + ("…" if len(reply) > 80 else ""))
             self._result_card.hide()
@@ -7909,60 +9173,208 @@ class MainWindow(QMainWindow):
             self._command_card.hide()
         if hasattr(self, "_result_card"):
             self._result_card.hide()
+        if hasattr(self, "_hud_result_wing"):
+            self._hud_result_wing.dismiss()
+        if hasattr(self, "_hud_telemetry_wing"):
+            self._hud_telemetry_wing.dismiss()
+
+    def _apply_hud_operation(self, data: dict):
+        if hasattr(self, "_hud_telemetry_wing"):
+            self._hud_telemetry_wing.show_operation(
+                title=data.get("title") or "OPERATION IN PROGRESS",
+                step=data.get("step") or "Processing...",
+                sources=data.get("sources") or [],
+                tool=data.get("tool") or ""
+            )
+
+    def _apply_hud_deliverable(self, data: dict):
+        if hasattr(self, "_hud_result_wing"):
+            self._hud_result_wing.show_deliverable(
+                title=data.get("title") or "MISSION DELIVERABLE",
+                summary=data.get("summary") or "",
+                bullets=data.get("bullets") or [],
+                file_path=data.get("file_path"),
+                kind=data.get("kind") or "result",
+                actions=data.get("actions") or [],
+                data=data.get("data") or {}
+            )
 
     def _apply_daily_briefing(self, payload):
-        action, text = payload if isinstance(payload, tuple) else ("hide", "")
-        if action == "show" and hasattr(self, "_briefing_card"):
-            clean_text = " ".join(str(text or "").split())
-            self._briefing_text_lbl.setText(clean_text[:360] + ("..." if len(clean_text) > 360 else ""))
-            self._briefing_card.show()
-            self._briefing_card.raise_()
-            if hasattr(self, "_smart_devices_section"):
-                self._smart_devices_section.hide()
-        elif hasattr(self, "_briefing_card"):
-            self._briefing_card.hide()
-            if hasattr(self, "_smart_devices_section"):
-                self._smart_devices_section.show()
+        action, data = payload if isinstance(payload, tuple) else ("show", payload)
+        if action == "hide":
+            if getattr(self, "_briefing_overlay", None):
                 try:
-                    self._smart_devices_section.refresh(force=True)
+                    self._briefing_overlay.hide()
+                    self._briefing_overlay.deleteLater()
                 except Exception:
                     pass
+                self._briefing_overlay = None
+            if hasattr(self, "_briefing_card"):
+                self._briefing_card.hide()
+            if hasattr(self, "_smart_devices_section"):
+                self._smart_devices_section.show()
+            return
+
+        # Legacy label support if present
+        if hasattr(self, "_briefing_text_lbl"):
+            summary_txt = data if isinstance(data, str) else (data.get("spoken_narrative", "") if isinstance(data, dict) else str(data))
+            clean_text = " ".join(str(summary_txt or "").split())
+            self._briefing_text_lbl.setText(clean_text[:360] + ("..." if len(clean_text) > 360 else ""))
+
+        # Holographic HUD card overlay
+        if getattr(self, "_briefing_overlay", None):
+            try:
+                self._briefing_overlay.deleteLater()
+            except Exception:
+                pass
+            self._briefing_overlay = None
+
+        overlay = DailyBriefingOverlay(data, parent=self)
+        overlay.closed.connect(lambda: setattr(self, "_briefing_overlay", None))
+        self._briefing_overlay = overlay
+        self._position_briefing_overlay()
+        overlay.show()
+        overlay.raise_()
+
+        try:
+            from sound_manager import sound_mgr
+            sound_mgr.play_sfx("telemetry_chirp")
+        except Exception:
+            pass
+
+    def _position_briefing_overlay(self):
+        if not getattr(self, "_briefing_overlay", None):
+            return
+        geo = self.geometry()
+        x = max(16, (geo.width() - self._briefing_overlay.width()) // 2)
+        y = max(16, (geo.height() - self._briefing_overlay.height()) // 2)
+        self._briefing_overlay.move(x, y)
 
     def _hide_daily_briefing_card(self):
-        if hasattr(self, "_briefing_card"):
-            self._briefing_card.hide()
-        if hasattr(self, "_smart_devices_section"):
-            self._smart_devices_section.show()
+        self._apply_daily_briefing(("hide", None))
+
+    def _schedule_daily_briefing_hide(self):
+        if getattr(self, "_briefing_overlay", None):
+            self._briefing_overlay._remaining_secs = min(getattr(self._briefing_overlay, "_remaining_secs", 30), 10)
+
+    def show_daily_briefing(self, text):
+        self._briefing_sig.emit(("show", text))
+
+    def hide_daily_briefing(self):
+        self._briefing_sig.emit(("hide", None))
+
+    def schedule_daily_briefing_hide(self):
+        self._schedule_daily_briefing_hide()
+
+    def show_confirm(self, title: str, detail: str = ""):
+        self._confirm_sig.emit("show", title, detail)
+
+    def hide_confirm(self):
+        self._confirm_sig.emit("hide", "", "")
+
+    def _apply_confirm_overlay(self, action: str, title: str = "", detail: str = ""):
+        if action == "hide":
+            if getattr(self, "_confirm_overlay", None):
+                try:
+                    self._confirm_overlay.deleteLater()
+                except Exception:
+                    pass
+                self._confirm_overlay = None
+            return
+
+        if action == "show":
+            if getattr(self, "_confirm_overlay", None):
+                try:
+                    self._confirm_overlay.deleteLater()
+                except Exception:
+                    pass
+                self._confirm_overlay = None
+
+            overlay = ConfirmationOverlay(title, detail, parent=self)
+            overlay.answered.connect(self._on_confirm_answered)
+            overlay.closed.connect(lambda: setattr(self, "_confirm_overlay", None))
+            self._confirm_overlay = overlay
+            self._position_confirm_overlay()
+            overlay.show()
+            overlay.raise_()
+
             try:
-                self._smart_devices_section.refresh(force=True)
+                from sound_manager import sound_mgr
+                sound_mgr.play_sfx("telemetry_chirp")
             except Exception:
                 pass
 
-    def _schedule_daily_briefing_hide(self):
-        if hasattr(self, "_briefing_hide_tmr"):
-            self._briefing_hide_tmr.start(10000)
+    def _on_confirm_answered(self, accepted: bool):
+        try:
+            from core import confirm as confirm_gate
+            confirm_gate.resolve(accepted)
+        except Exception:
+            pass
+        self._apply_confirm_overlay("hide", "", "")
 
-    def show_daily_briefing(self, text: str):
-        pass
+    def _position_confirm_overlay(self):
+        if not getattr(self, "_confirm_overlay", None):
+            return
+        geo = self.geometry()
+        x = max(16, (geo.width() - self._confirm_overlay.width()) // 2)
+        y = max(16, (geo.height() - self._confirm_overlay.height()) // 2)
+        self._confirm_overlay.move(x, y)
 
-    def hide_daily_briefing(self):
-        pass
+    def show_memory_inspector(self):
+        self._memory_overlay_sig.emit("show")
 
-    def schedule_daily_briefing_hide(self):
-        pass
+    def hide_memory_inspector(self):
+        self._memory_overlay_sig.emit("hide")
+
+    def _apply_memory_overlay(self, action: str):
+        if action == "hide":
+            if getattr(self, "_memory_overlay", None):
+                try:
+                    self._memory_overlay.deleteLater()
+                except Exception:
+                    pass
+                self._memory_overlay = None
+            return
+
+        if action == "show":
+            if getattr(self, "_memory_overlay", None):
+                try:
+                    self._memory_overlay.deleteLater()
+                except Exception:
+                    pass
+                self._memory_overlay = None
+
+            overlay = MemoryInspectorOverlay(parent=self)
+            overlay.closed.connect(lambda: setattr(self, "_memory_overlay", None))
+            self._memory_overlay = overlay
+            self._position_memory_overlay()
+            overlay.show()
+            overlay.raise_()
+
+    def _position_memory_overlay(self):
+        if not getattr(self, "_memory_overlay", None):
+            return
+        geo = self.geometry()
+        x = max(16, (geo.width() - self._memory_overlay.width()) // 2)
+        y = max(16, (geo.height() - self._memory_overlay.height()) // 2)
+        self._memory_overlay.move(x, y)
 
     def show_app(self):
+        try:
+            self.setWindowState((self.windowState() & ~Qt.WindowState.WindowMinimized) | Qt.WindowState.WindowActive)
+        except Exception:
+            pass
         self.showNormal()
         self.raise_()
         self.activateWindow()
 
     def _show_remote_connect(self):
         if not self.on_remote_clicked:
-            self._log_sig.emit("ERR: Mobile remote is not ready yet.")
+            self._log_sig.emit("ERR: O controle remoto móvel ainda não está pronto.")
             return
         result = self.on_remote_clicked()
         if not result:
-            self._log_sig.emit("ERR: Mobile remote could not start. Install dashboard dependencies and try again.")
+            self._log_sig.emit("ERR: O controle remoto móvel não pôde iniciar. Instale as dependências do painel e tente novamente.")
             return
         url = result[0]
         key = result[1]
@@ -7983,7 +9395,7 @@ class MainWindow(QMainWindow):
         self._position_remote_overlay()
         overlay.show()
         overlay.raise_()
-        self._log_sig.emit(f"SYS: Mobile Connect ready at {manual}. Scan the QR code or enter key {key}.")
+        self._log_sig.emit(f"SYS: Conexão Móvel pronta em {manual}. Escaneie o código QR ou insira a chave {key}.")
 
     def _position_remote_overlay(self):
         if not self._remote_overlay:
@@ -7996,24 +9408,84 @@ class MainWindow(QMainWindow):
     def notify_phone_connected(self):
         if self._remote_overlay is not None:
             self._remote_overlay.mark_connected()
-        self._log_sig.emit("SYS: Phone connected to Brahma Echo remote.")
+        self._log_sig.emit("SYS: Celular conectado ao controle remoto do ULTRON.")
 
     def changeEvent(self, event):
         super().changeEvent(event)
-        if event.type() == QEvent.Type.WindowStateChange and self.isMinimized():
-            self.minimized.emit()
+        if event.type() == QEvent.Type.WindowStateChange:
+            if self.isMinimized():
+                self.minimized.emit()
+            else:
+                self.restored.emit()
+
+    def _on_audio_level_sig(self, level: float):
+        if hasattr(self, "_bg_widget") and hasattr(self._bg_widget, "set_audio_level"):
+            self._bg_widget.set_audio_level(level)
+
+    def set_audio_level(self, level: float):
+        try:
+            self._audio_level_sig.emit(float(level))
+        except Exception:
+            pass
 
     def _apply_state(self, state: str):
         self._state = state
-        self.hud.state = state
-        self.hud.speaking = (state == "SPEAKING")
-        if hasattr(self, "central") and hasattr(self.central, "set_ai_state"):
-            self.central.set_ai_state(state)
+        if hasattr(self, "_bg_widget") and hasattr(self._bg_widget, "set_ai_state"):
+            self._bg_widget.set_ai_state(state)
+        elif hasattr(self, "centralWidget") and hasattr(self.centralWidget(), "set_ai_state"):
+            self.centralWidget().set_ai_state(state)
+
+        # Update top taskbar status badge
+        if hasattr(self, "_status_badge"):
+            badge_map = {
+                "LISTENING":  ("◉ OUVINDO",   "#00e5ff", "rgba(0, 229, 255, 0.4)",  "rgba(0, 229, 255, 0.08)"),
+                "SPEAKING":   ("◈ FALANDO",   "#ffb300", "rgba(255, 179, 0, 0.5)",  "rgba(255, 179, 0, 0.12)"),
+                "THINKING":   ("◒ PENSANDO",  "#ff9100", "rgba(255, 145, 0, 0.45)", "rgba(255, 145, 0, 0.08)"),
+                "PROCESSING": ("◒ PROCESSANDO", "#ff9100", "rgba(255, 145, 0, 0.45)", "rgba(255, 145, 0, 0.08)"),
+                "EXECUTING":  ("⚡ EXECUTANDO", "#7c4dff", "rgba(124, 77, 255, 0.45)","rgba(124, 77, 255, 0.08)"),
+                "WORKING":    ("⚡ TRABALHANDO", "#7c4dff", "rgba(124, 77, 255, 0.45)","rgba(124, 77, 255, 0.08)"),
+                "MUTED":      ("⊗ SILENCIADO", "#ff3b30", "rgba(255, 59, 48, 0.45)", "rgba(255, 59, 48, 0.08)"),
+                "SCANNING":   ("◓ ESCANEANDO", "#37ff5f", "rgba(55, 255, 95, 0.45)", "rgba(55, 255, 95, 0.08)"),
+            }
+            lbl_txt, col, border, bg = badge_map.get(state, ("● ONLINE", "#ffb300", "rgba(255, 179, 0, 0.25)", "rgba(12,14,18,220)"))
+            self._status_badge.setText(lbl_txt)
+            self._status_badge.setStyleSheet(
+                f"color: {col}; background: {bg}; border: 1px solid {border}; border-radius: 8px; padding: 5px 12px;"
+            )
+
+        # Update command row input placeholder
+        if hasattr(self, "_input"):
+            ph_map = {
+                "LISTENING": "Ouvindo... (ou digite seu comando)",
+                "SPEAKING": "ULTRON está respondendo...",
+                "THINKING": "Brahma está pensando...",
+                "PROCESSING": "Processando solicitação...",
+                "EXECUTING": "Executando ação...",
+                "WORKING": "Trabalhando nisso...",
+                "MUTED": "Microfone silenciado — digite o comando aqui...",
+                "SCANNING": "Escaneando a tela...",
+            }
+            self._input.setPlaceholderText(ph_map.get(state, "Pergunte qualquer coisa ao ULTRON..."))
+
+        # Update chat workspace footer status
+        if hasattr(self, "_inline_workspace") and hasattr(self._inline_workspace, "_footer_status"):
+            foot_map = {
+                "LISTENING": "● Aguardando comando de voz...",
+                "SPEAKING": "● Brahma está falando...",
+                "THINKING": "● Pensando...",
+                "PROCESSING": "● Processando...",
+                "EXECUTING": "● Executando comando do sistema...",
+                "WORKING": "● Trabalhando na tarefa...",
+                "MUTED": "● Entrada de voz silenciada",
+                "SCANNING": "● Sistema de visão ativo",
+            }
+            self._inline_workspace._footer_status.setText(foot_map.get(state, "ULTRON está online"))
+
         if hasattr(self, "_status_chip"):
             chip_text = {
-                "THINKING": "● WORKING",
-                "SPEAKING": "● SPEAKING",
-                "MUTED":    "● MUTED",
+                "THINKING": "● TRABALHANDO",
+                "SPEAKING": "● FALANDO",
+                "MUTED":    "● SILENCIADO",
             }.get(state, "● ONLINE")
             self._status_chip.setText(chip_text)
             color = C.PRI if state == "MUTED" else C.GREEN if state in ("LISTENING", "SPEAKING") else C.WHITE
@@ -8023,32 +9495,32 @@ class MainWindow(QMainWindow):
             )
         if hasattr(self, "_time_status_lbl"):
             status_text = {
-                "THINKING": "Working",
-                "SPEAKING": "Speaking",
-                "MUTED": "Muted",
+                "THINKING": "Trabalhando",
+                "SPEAKING": "Falando",
+                "MUTED": "Silenciado",
             }.get(state, "Online")
             self._time_status_lbl.setText(status_text)
             self._time_status_lbl.setStyleSheet(
                 f"color: {C.GREEN if state in ('LISTENING', 'SPEAKING') else C.RED if state == 'MUTED' else C.WHITE}; background: transparent;"
             )
         if hasattr(self, "_task_card"):
-            if state == "THINKING":
-                self._task_card.set_task("Working on it...", "Brahma Echo is processing your request.", 72)
+            if state in ("THINKING", "PROCESSING", "EXECUTING", "WORKING"):
+                self._task_card.set_task("Trabalhando nisso...", "ULTRON está processando sua solicitação.", 72)
             elif state == "SPEAKING":
-                self._task_card.set_task("Responding...", "Brahma Echo is speaking now.", 100)
+                self._task_card.set_task("Respondendo...", "ULTRON está falando agora.", 100)
             elif state == "MUTED":
-                self._task_card.set_task("Microphone muted", "Voice input is paused.", 0)
+                self._task_card.set_task("Microfone silenciado", "A entrada de voz está pausada.", 0)
             else:
-                self._task_card.set_task("Ready", "Brahma Echo is idle and ready.", 0)
+                self._task_card.set_task("Pronto", "ULTRON está ocioso e pronto.", 0)
         if hasattr(self, "_result_card"):
-            if state == "THINKING":
+            if state in ("THINKING", "PROCESSING", "EXECUTING", "WORKING"):
                 self._result_card.set_body("Action pending")
             elif state == "SPEAKING":
                 self._result_card.set_body("Speaking now")
             elif state == "MUTED":
                 self._result_card.set_body("Voice muted")
             else:
-                self._result_card.set_body("Action completed")
+                self._result_card.set_body("Ação concluída")
 
     def _check_config(self) -> bool:
         if not API_FILE.exists(): return False
@@ -8157,7 +9629,7 @@ class MainWindow(QMainWindow):
         elif action == "finish":
             target.finish_workspace(
                 data.get("result") or data.get("output") or "Done.",
-                status=data.get("status") or "Task completed.",
+                status=data.get("status") or "Tarefa concluída.",
                 percent=int(data.get("percent") or 100),
             )
         elif action == "clear":
@@ -8248,10 +9720,10 @@ class MainWindow(QMainWindow):
                 self._overlay.hide()
                 self._overlay.deleteLater()
                 self._overlay = None
-            
+
             # Maximize the main window for the cinematic experience
             self.showMaximized()
-            
+
             ov = SetupOverlay(self.centralWidget(), defaults=defaults or self._load_api_defaults())
             cw = self.centralWidget()
             ov.setGeometry(0, 0, cw.width(), cw.height())
@@ -8289,243 +9761,12 @@ class MainWindow(QMainWindow):
                 self._overlay = None
             if hasattr(self, '_floating_gesture_card'):
                 self._floating_gesture_card.show()
+            self.showNormal()
             self._apply_state("LISTENING")
-            self._log.append_log(f"SYS: Initialised. OS={os_name.upper()}. Brahma Echo online.")
+            self._log.append_log(f"SYS: Inicializado. SO={os_name.upper()}. ULTRON online.")
         except Exception as e:
             self._log.append_log(f"ERR: setup failed: {e}")
             traceback.print_exc()
-
-    def _build_left_panel_modern(self) -> QWidget:
-        w = QFrame()
-        w.setObjectName("LeftPanelFrame")
-        w.setFixedWidth(_LEFT_W)
-        w.setStyleSheet(f"""
-            QFrame#LeftPanelFrame {{
-                background: transparent;
-                border: none;
-                border-radius: 18px;
-            }}
-        """)
-        root_lay = QVBoxLayout(w)
-        root_lay.setContentsMargins(14, 14, 14, 14)
-        root_lay.setSpacing(12)
-
-        toggle_row = QHBoxLayout()
-        self._left_toggle_btn = QPushButton("<")
-        self._left_toggle_btn.setFixedSize(34, 34)
-        self._left_toggle_btn.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
-        self._left_toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._left_toggle_btn.setStyleSheet(
-            f"QPushButton {{ background: rgba(12,14,18,245); color: {C.WHITE}; border: 1px solid {C.BORDER_B}; border-radius: 8px; }}"
-            f"QPushButton:hover {{ color: {C.PRI}; border: 1px solid {C.PRI}; }}"
-        )
-        self._left_toggle_btn.clicked.connect(self._toggle_left_sidebar)
-        toggle_row.addWidget(self._left_toggle_btn)
-        toggle_row.addStretch()
-        root_lay.addLayout(toggle_row)
-
-        self._left_content = QWidget()
-        self._left_content.setStyleSheet("background: transparent;")
-        lay = QVBoxLayout(self._left_content)
-        lay.setContentsMargins(2, 8, 2, 4)
-        lay.setSpacing(12)
-        root_lay.addWidget(self._left_content, stretch=1)
-
-        def section(title: str):
-            lbl = QLabel(title.upper())
-            lbl.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
-            lbl.setStyleSheet(f"color: #8a909a; background: transparent; letter-spacing: 1px;")
-            return lbl
-
-        class NavItem(QFrame):
-            clicked = pyqtSignal()
-
-            def __init__(self, text: str, active: bool = False, letter: str | None = None, compact: bool = False):
-                super().__init__()
-                self._compact = compact
-                self._letter = (letter or text[:1]).upper()
-                self._text = text
-                self._active = bool(active)
-                self.setObjectName("LeftNavItem")
-                self.setFixedHeight(42 if compact else 44)
-                self.setCursor(Qt.CursorShape.PointingHandCursor)
-                r = QHBoxLayout(self)
-                r.setContentsMargins(12, 0, 12, 0)
-                r.setSpacing(10)
-                self._icon = QLabel(self._letter)
-                self._icon.setFixedSize(22, 22)
-                self._icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                self._icon.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
-                self._glow = QWidget(self)
-                self._glow.setObjectName("NavGlow")
-                self._glow.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-                self._glow.setStyleSheet("background: transparent; border: none;")
-                self._glow.setGeometry(2, 2, self.width() - 4, self.height() - 4)
-                self._glow_effect = QGraphicsOpacityEffect(self._glow)
-                self._glow_effect.setOpacity(0.0)
-                self._glow.setGraphicsEffect(self._glow_effect)
-                self._hover_anim = QPropertyAnimation(self._glow_effect, b"opacity", self)
-                self._hover_anim.setDuration(180)
-                self._hover_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-                self._lbl = QLabel(text)
-                self._lbl.setFont(QFont("Segoe UI", 10 if compact else 11, QFont.Weight.Bold if active else QFont.Weight.Normal))
-                self._arrow = QLabel(">")
-                self._arrow.setFont(QFont("Segoe UI", 10))
-                self._arrow.setStyleSheet("background: transparent;")
-                r.addWidget(self._icon)
-                r.addWidget(self._lbl)
-                r.addStretch()
-                r.addWidget(self._arrow)
-                self.set_active(active)
-
-            def set_active(self, active: bool):
-                self._active = bool(active)
-                bg_style = "rgba(255, 255, 255, 0.05)" if self._active else "transparent"
-                border_left = "2px solid #ffb300" if self._active else "2px solid transparent"
-                self.setStyleSheet(
-                    f"""
-                    QFrame#LeftNavItem {{
-                        background: {bg_style};
-                        border: 1px solid rgba(255, 179, 0, { '0.15' if self._active else '0.0' });
-                        border-left: {border_left};
-                        border-radius: 12px;
-                        margin: 2px 8px;
-                    }}
-                    """
-                )
-                if self._active:
-                    self._icon.setStyleSheet("background: rgba(255, 179, 0, 0.25); color: #ffb300; border-radius: 8px; border: 1px solid #ffb300;")
-                    self._lbl.setStyleSheet("color: #ffffff; background: transparent; font-weight: bold;")
-                    self._arrow.setStyleSheet("color: #ffb300; background: transparent; font-weight: bold;")
-                else:
-                    self._icon.setStyleSheet("background: rgba(255, 255, 255, 0.03); color: rgba(255, 255, 255, 0.6); border-radius: 8px; border: 1px solid transparent;")
-                    self._lbl.setStyleSheet("color: rgba(255, 255, 255, 0.65); background: transparent;")
-                    self._arrow.setStyleSheet("color: rgba(255, 255, 255, 0.15); background: transparent;")
-
-            def resizeEvent(self, event):
-                super().resizeEvent(event)
-                self._glow.setGeometry(2, 2, self.width() - 4, self.height() - 4)
-
-            def enterEvent(self, event):
-                super().enterEvent(event)
-                if not self._active:
-                    self._icon.setStyleSheet("background: rgba(255, 179, 0, 0.15); color: #ffb300; border-radius: 8px; border: 1px solid rgba(255, 179, 0, 0.4);")
-                    self._lbl.setStyleSheet("color: #ffffff; background: transparent;")
-                    self._hover_anim.stop()
-                    self._hover_anim.setStartValue(self._glow_effect.opacity())
-                    self._hover_anim.setEndValue(0.35)
-                    self._hover_anim.start()
-
-            def leaveEvent(self, event):
-                super().leaveEvent(event)
-                if not self._active:
-                    self._icon.setStyleSheet("background: rgba(255, 255, 255, 0.03); color: rgba(255, 255, 255, 0.6); border-radius: 8px; border: 1px solid transparent;")
-                    self._lbl.setStyleSheet("color: rgba(255, 255, 255, 0.65); background: transparent;")
-                    self._hover_anim.stop()
-                    self._hover_anim.setStartValue(self._glow_effect.opacity())
-                    self._hover_anim.setEndValue(0.0)
-                    self._hover_anim.start()
-
-            def mousePressEvent(self, event):
-                super().mousePressEvent(event)
-                if event.button() == Qt.MouseButton.LeftButton:
-                    self.clicked.emit()
-
-        self._nav_items: dict[str, NavItem] = {}
-        def activate(page: str):
-            for name, item in self._nav_items.items():
-                item.set_active(name == page)
-            self._set_page(page)
-
-        brand = QWidget()
-        brand_lay = QHBoxLayout(brand)
-        brand_lay.setContentsMargins(0, 0, 0, 0)
-        brand_lay.setSpacing(14)
-        brand_lay.addWidget(_framed_logo(62, 44, bg="rgba(9,10,14,245)", border=C.BORDER_B, radius=10, inset=8))
-        brand_text = QVBoxLayout()
-        brand_text.setSpacing(2)
-        title = QLabel("<span style='color:#ffb300;'>BRAHMA ECHO</span><br><span style='color:#ffffff;'>LITE</span>")
-        title.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
-        title.setStyleSheet("background: transparent;")
-        sub = QLabel("Your AI Assistant")
-        sub.setFont(QFont("Segoe UI", 9))
-        sub.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent; padding-top: 2px;")
-        brand_text.addWidget(title)
-        brand_text.addWidget(sub)
-        brand_lay.addLayout(brand_text)
-        lay.addWidget(brand)
-
-        lay.addWidget(section("Workspace"))
-        self._nav_items["dashboard"] = NavItem("Dashboard", active=True, letter="[]")
-        self._nav_items["home"] = NavItem("Brahma Echo Home", active=False, letter="H")
-        self._nav_items["devices"] = NavItem("Devices", active=False, letter="D")
-        self._nav_items["settings"] = NavItem("System & Connect", letter="S")
-        self._nav_items["dashboard"].clicked.connect(lambda: activate("dashboard"))
-        self._nav_items["home"].clicked.connect(lambda: activate("home"))
-        self._nav_items["devices"].clicked.connect(lambda: activate("devices"))
-        self._nav_items["settings"].clicked.connect(lambda: activate("settings"))
-        lay.addWidget(self._nav_items["dashboard"])
-        lay.addWidget(self._nav_items["home"])
-        lay.addWidget(self._nav_items["devices"])
-        lay.addWidget(self._nav_items["settings"])
-
-        self._gesture_preview = GestureCameraPreview()
-        self._gesture_preview.setFixedHeight(230)
-        lay.addWidget(self._gesture_preview)
-
-        lay.addStretch(1)
-
-        status_card = QFrame()
-        status_card.setFixedHeight(78)
-        status_card.setObjectName("LeftStatusCard")
-        status_card.setStyleSheet(f"""
-            QFrame#LeftStatusCard {{
-                background: rgba(255, 179, 0, 0.03);
-                border: 1px solid rgba(255, 179, 0, 0.6);
-                border-radius: 16px;
-            }}
-            QLabel {{
-                background: transparent;
-                border: none;
-            }}
-        """)
-        try:
-            shadow = QGraphicsDropShadowEffect(status_card)
-            shadow.setBlurRadius(20)
-            shadow.setColor(QColor(255, 179, 0, 80))
-            shadow.setOffset(0, 0)
-            status_card.setGraphicsEffect(shadow)
-        except: pass
-        status_lay = QVBoxLayout(status_card)
-        status_lay.setContentsMargins(14, 12, 14, 12)
-        status_lay.setSpacing(6)
-        
-        top_row = QHBoxLayout()
-        top_row.setContentsMargins(0, 0, 0, 0)
-        online = QLabel("<span style='color:#ffb300;'>ΓùÅ</span> <span style='color:#ffffff; font-weight:700;'>System Online</span>")
-        online.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
-        top_row.addWidget(online)
-        top_row.addStretch()
-        uptime_lbl = QLabel("Up: 0h 0m")
-        uptime_lbl.setFont(QFont("Segoe UI", 8))
-        uptime_lbl.setStyleSheet("color: rgba(255, 255, 255, 0.4);")
-        top_row.addWidget(uptime_lbl)
-        self._uptime_lbl = uptime_lbl
-        
-        status_lay.addLayout(top_row)
-
-        metrics_row = QHBoxLayout()
-        metrics_row.setSpacing(8)
-        self._bar_cpu = MetricBar("CPU", C.PRI)
-        self._bar_mem = MetricBar("RAM", C.PRI)
-        metrics_row.addWidget(self._bar_cpu)
-        metrics_row.addWidget(self._bar_mem)
-        
-        status_lay.addLayout(metrics_row)
-        lay.addWidget(status_card)
-
-        self._apply_sidebar_state()
-        return w
 
     def _build_center_panel_modern(self, face_path: str) -> QWidget:
         w = QWidget()
@@ -8544,49 +9785,58 @@ class MainWindow(QMainWindow):
         lay.addWidget(stage_frame, stretch=1)
 
         # Internal labels kept as hidden placeholders for safety
-        self._core_lbl = QLabel()
-        self._core_sub_lbl = QLabel()
-        self._core_status_lbl = QLabel()
-        self._clock_lbl = QLabel()
-        self._date_lbl = QLabel()
-        self._time_status_lbl = QLabel()
-        self._cpu_lbl = QLabel()
-        self._ram_lbl = QLabel()
-        self._status_chip = QLabel()
-        self._smart_devices_section = SmartDevicesSection(self)
+        self._hidden_legacy_container = QWidget(self)
+        self._hidden_legacy_container.setObjectName("HiddenLegacyContainer")
+        self._hidden_legacy_container.hide()
+
+        self._core_lbl = QLabel(self._hidden_legacy_container)
+        self._core_sub_lbl = QLabel(self._hidden_legacy_container)
+        self._core_status_lbl = QLabel(self._hidden_legacy_container)
+        self._clock_lbl = QLabel(self._hidden_legacy_container)
+        self._date_lbl = QLabel(self._hidden_legacy_container)
+        self._time_status_lbl = QLabel(self._hidden_legacy_container)
+        self._cpu_lbl = QLabel(self._hidden_legacy_container)
+        self._ram_lbl = QLabel(self._hidden_legacy_container)
+        self._status_chip = QLabel(self._hidden_legacy_container)
+        self._smart_devices_section = SmartDevicesSection(self._hidden_legacy_container)
         self._smart_devices_section.hide()
-        self._briefing_card = QFrame()
+        self._briefing_card = QFrame(self._hidden_legacy_container)
         self._briefing_card.hide()
-        self._briefing_text_lbl = QLabel()
-        self._developer_card = QFrame()
+        self._briefing_text_lbl = QLabel(self._hidden_legacy_container)
+        self._developer_card = QFrame(self._hidden_legacy_container)
         self._developer_card.hide()
-        self._developer_status_lbl = QLabel()
+        self._developer_status_lbl = QLabel(self._hidden_legacy_container)
 
-        self._command_card = SmallPanelCard("COMMAND", "hey", accent=C.WHITE)
-        self._command_card.setFixedWidth(185)
-        self._result_card = SmallPanelCard("ACTION RESULT", "Action completed", accent=C.WHITE)
-        self._result_card.setFixedWidth(185)
-        self._command_card.hide()
-        self._result_card.hide()
+        self._hud_result_wing = BrahmaResultWing(self)
+        self._hud_telemetry_wing = BrahmaTelemetryWing(self)
+        self._command_card = self._hud_result_wing
+        self._result_card = self._hud_telemetry_wing
 
-        self.hud = HudCanvas(face_path)
-        self.hud.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.hud.setMinimumSize(240, 240)
-        self.hud.setMaximumSize(280, 280)
-        self.hud.hide()
-        hud_wrap = QFrame()
-        hud_wrap.setStyleSheet("background: transparent;")
-        hud_lay = QVBoxLayout(hud_wrap)
-        hud_lay.setContentsMargins(0, 0, 0, 0)
-        hud_lay.setSpacing(0)
-        hud_lay.addWidget(self.hud, alignment=Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
-        hud_wrap.hide()
+        class _HudShim:
+            def __init__(self):
+                self.state = "ONLINE"
+                self.speaking = False
+                self.listening = False
+                self.muted = False
+            def set_state(self, s): self.state = s
+            def set_audio_level(self, lvl): pass
+            def feed_level(self, lvl): pass
+            def update(self): pass
+            def repaint(self): pass
+            def show(self): pass
+            def hide(self): pass
+            def isVisible(self): return False
+            def setVisible(self, v): pass
+            def __getattr__(self, name):
+                return lambda *args, **kwargs: None
+        self.hud = _HudShim()
 
         command_row = QHBoxLayout()
-        command_row.setSpacing(14)
-        command_row.addWidget(self._command_card, alignment=Qt.AlignmentFlag.AlignVCenter)
-        command_row.addWidget(hud_wrap, stretch=1)
-        command_row.addWidget(self._result_card, alignment=Qt.AlignmentFlag.AlignVCenter)
+        command_row.setContentsMargins(6, 0, 6, 0)
+        command_row.setSpacing(12)
+        command_row.addWidget(self._hud_result_wing, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        command_row.addStretch(1)
+        command_row.addWidget(self._hud_telemetry_wing, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         stage.addLayout(command_row, stretch=1)
 
         self._command_panel = QWidget()
@@ -8606,18 +9856,7 @@ class MainWindow(QMainWindow):
         self._center_stack.addWidget(self._devices_page)
         self._settings_page = SystemConnectivityPage()
         self._center_stack.addWidget(self._settings_page)
-        
-        chat_page = QWidget()
-        chat_page_lay = QVBoxLayout(chat_page)
-        chat_page_lay.setContentsMargins(10, 10, 10, 10)
-        self._inline_workspace = InlineChatWorkspace()
-        self._inline_workspace.attach_requested.connect(self._browse_attachment)
-        self._inline_workspace.mic_requested.connect(self._toggle_mute)
-        self._inline_workspace.command_submitted.connect(self._send)
-        self._log = self._inline_workspace
-        chat_page_lay.addWidget(self._inline_workspace)
-        self._center_stack.addWidget(chat_page)
-        
+
         self._settings_hub_page = SettingsHubPage(lambda idx: self._center_stack.setCurrentIndex(idx))
         self._center_stack.addWidget(self._settings_hub_page)
 
@@ -8626,25 +9865,60 @@ class MainWindow(QMainWindow):
 
     def _build_right_panel_modern(self) -> QWidget:
         w = QWidget()
+        self._right_panel = w
+        w.setObjectName("ModularRightSidebar")
         w.setFixedWidth(_RIGHT_W)
-        w.setStyleSheet("QWidget { background: transparent; border-left: none; }")
+        w.setStyleSheet(
+            f"QWidget#ModularRightSidebar {{ "
+            f"  background: rgba(8, 10, 15, 0.22); "
+            f"  border-left: 1px solid rgba(255, 179, 0, 0.25); "
+            f"}}"
+        )
         root_lay = QVBoxLayout(w)
-        root_lay.setContentsMargins(14, 14, 14, 14)
-        root_lay.setSpacing(12)
+        root_lay.setContentsMargins(14, 12, 14, 12)
+        root_lay.setSpacing(10)
 
-        toggle_row = QHBoxLayout()
-        toggle_row.addStretch()
-        self._right_toggle_btn = QPushButton(">")
-        self._right_toggle_btn.setFixedSize(34, 34)
-        self._right_toggle_btn.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
+        # Modular Header
+        header_bar = QHBoxLayout()
+        header_bar.setContentsMargins(2, 2, 2, 2)
+        header_bar.setSpacing(8)
+
+        pulse_dot = QLabel("●")
+        pulse_dot.setFont(QFont("Segoe UI", 10))
+        pulse_dot.setStyleSheet("color: #37ff5f; background: transparent;")
+        header_bar.addWidget(pulse_dot)
+
+        header_title = QLabel("CHAT ULTRON")
+        header_title.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+        header_title.setStyleSheet(f"color: {C.WHITE}; background: transparent; letter-spacing: 1px;")
+        header_bar.addWidget(header_title)
+
+        header_bar.addStretch(1)
+
+        self._new_chat_btn = QPushButton("+ Novo")
+        self._new_chat_btn.setFixedSize(54, 28)
+        self._new_chat_btn.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        self._new_chat_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._new_chat_btn.setToolTip("Iniciar uma nova sessão de chat")
+        self._new_chat_btn.setStyleSheet(
+            f"QPushButton {{ background: rgba(255, 179, 0, 0.10); color: {C.PRI}; border: 1px solid rgba(255, 179, 0, 0.30); border-radius: 6px; padding: 2px 6px; }}"
+            f"QPushButton:hover {{ background: rgba(255, 179, 0, 0.22); color: #FFFFFF; border-color: {C.PRI}; }}"
+        )
+        self._new_chat_btn.clicked.connect(lambda: self._inline_workspace.new_conversation() if hasattr(self, "_inline_workspace") else None)
+        header_bar.addWidget(self._new_chat_btn)
+
+        self._right_toggle_btn = QPushButton("❯")
+        self._right_toggle_btn.setFixedSize(28, 28)
+        self._right_toggle_btn.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
         self._right_toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._right_toggle_btn.setToolTip("Recolher Barra Lateral do Chat")
         self._right_toggle_btn.setStyleSheet(
-            f"QPushButton {{ background: rgba(12,14,18,245); color: {C.WHITE}; border: 1px solid {C.BORDER_B}; border-radius: 8px; }}"
-            f"QPushButton:hover {{ color: {C.PRI}; border: 1px solid {C.PRI}; }}"
+            f"QPushButton {{ background: rgba(255,255,255,0.06); color: {C.WHITE}; border: 1px solid rgba(255,255,255,0.12); border-radius: 6px; }}"
+            f"QPushButton:hover {{ color: {C.PRI}; border-color: {C.PRI}; background: rgba(255,179,0,0.12); }}"
         )
         self._right_toggle_btn.clicked.connect(self._toggle_right_sidebar)
-        toggle_row.addWidget(self._right_toggle_btn)
-        root_lay.addLayout(toggle_row)
+        header_bar.addWidget(self._right_toggle_btn)
+        root_lay.addLayout(header_bar)
 
         self._right_stack = QStackedWidget()
         self._right_stack.setStyleSheet("background: transparent; border: none;")
@@ -8704,7 +9978,7 @@ class MainWindow(QMainWindow):
         row.setSpacing(12)
 
         self._input = QLineEdit()
-        self._input.setPlaceholderText("Ask Brahma Echo anything...")
+        self._input.setPlaceholderText("Pergunte qualquer coisa ao ULTRON...")
         self._input.setFont(QFont("Segoe UI", 10))
         self._input.setFixedHeight(50)
         self._input.setStyleSheet(f"""
@@ -8738,7 +10012,7 @@ class MainWindow(QMainWindow):
         attach = QPushButton()
         attach.setFixedSize(44, 44)
         attach.setCursor(Qt.CursorShape.PointingHandCursor)
-        attach.setToolTip("Attach file")
+        attach.setToolTip("Anexar arquivo")
         attach.setIcon(QIcon(_icon_pixmap("attach", 20)))
         attach.setIconSize(QSize(20, 20))
         attach.setStyleSheet(icon_button_style)
@@ -8748,7 +10022,7 @@ class MainWindow(QMainWindow):
         mic = QPushButton()
         mic.setFixedSize(44, 44)
         mic.setCursor(Qt.CursorShape.PointingHandCursor)
-        mic.setToolTip("Microphone")
+        mic.setToolTip("Microfone")
         mic.setIcon(QIcon(_icon_pixmap("mic", 20)))
         mic.setIconSize(QSize(20, 20))
         mic.setStyleSheet(f"""
@@ -8822,7 +10096,7 @@ class SystemConnectivitySidebar(QFrame):
         lay.setContentsMargins(18, 18, 18, 18)
         lay.setSpacing(14)
 
-        title = QLabel("SYSTEM STATUS")
+        title = QLabel("STATUS DO SISTEMA")
         title.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
         title.setStyleSheet(f"color: {C.WHITE}; letter-spacing: 1px;")
         lay.addWidget(title)
@@ -8832,23 +10106,28 @@ class SystemConnectivitySidebar(QFrame):
         s_lay = QVBoxLayout(self._status_card)
         s_lay.setContentsMargins(16, 14, 16, 14)
         s_lay.setSpacing(10)
-        self._online_lbl = QLabel("ΓùÅ System Online")
+        self._online_lbl = QLabel("ΓùÅ Sistema Online")
         self._online_lbl.setStyleSheet("color: #35ff75; font-weight: 700;")
-        self._desc_lbl = QLabel("All systems are operational.")
+        self._desc_lbl = QLabel("Todos os sistemas estão operacionais.")
         self._desc_lbl.setStyleSheet(f"color: {C.TEXT_MED};")
         s_lay.addWidget(self._online_lbl)
         s_lay.addWidget(self._desc_lbl)
         lay.addWidget(self._status_card)
 
         self._info_rows: dict[str, QLabel] = {}
-        for label in ("Version", "Platform", "Current AI Provider", "Last Updated"):
+        for label, label_text in (
+            ("Version", "Versão"),
+            ("Platform", "Plataforma"),
+            ("Current AI Provider", "Provedor de IA Atual"),
+            ("Last Updated", "Última Atualização"),
+        ):
             row = QHBoxLayout()
             row.setContentsMargins(0, 4, 0, 4)
             row.setSpacing(10)
             icon = QLabel("Γùî")
             icon.setFixedWidth(18)
             icon.setStyleSheet(f"color: {C.WHITE};")
-            key_lbl = QLabel(label)
+            key_lbl = QLabel(label_text)
             key_lbl.setStyleSheet(f"color: {C.WHITE};")
             val_lbl = QLabel("")
             val_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -8860,7 +10139,7 @@ class SystemConnectivitySidebar(QFrame):
             lay.addLayout(row)
             self._info_rows[label] = val_lbl
 
-        quick_title = QLabel("QUICK ACTIONS")
+        quick_title = QLabel("AÇÕES RÁPIDAS")
         quick_title.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
         quick_title.setStyleSheet(f"color: {C.WHITE}; letter-spacing: 1px;")
         lay.addWidget(quick_title)
@@ -8868,20 +10147,20 @@ class SystemConnectivitySidebar(QFrame):
         self._quick_actions = QVBoxLayout()
         self._quick_actions.setSpacing(10)
         lay.addLayout(self._quick_actions)
-        self._mk_quick_action("Γå╗ Restart Brahma Echo", QStyle.StandardPixmap.SP_BrowserReload, self._restart)
-        self._mk_quick_action("Γƒ│ Reload Configuration", QStyle.StandardPixmap.SP_BrowserReload, self._reload)
-        self._mk_quick_action("≡ƒôü Open Data Folder", QStyle.StandardPixmap.SP_DirOpenIcon, self._open_data_folder)
-        self._mk_quick_action("≡ƒôä View Logs", QStyle.StandardPixmap.SP_FileDialogDetailedView, self._view_logs)
-        self._mk_quick_action("Γ¼ç Check for Updates", QStyle.StandardPixmap.SP_ArrowDown, self._check_updates)
+        self._mk_quick_action("Γå╗ Reiniciar ULTRON", QStyle.StandardPixmap.SP_BrowserReload, self._restart)
+        self._mk_quick_action("Γƒ│ Recarregar Configuração", QStyle.StandardPixmap.SP_BrowserReload, self._reload)
+        self._mk_quick_action("≡ƒôü Abrir Pasta de Dados", QStyle.StandardPixmap.SP_DirOpenIcon, self._open_data_folder)
+        self._mk_quick_action("≡ƒôä Ver Logs", QStyle.StandardPixmap.SP_FileDialogDetailedView, self._view_logs)
+        self._mk_quick_action("Γ¼ç Verificar Atualizações", QStyle.StandardPixmap.SP_ArrowDown, self._check_updates)
 
         tip = QFrame()
         tip.setStyleSheet("QFrame { background: rgba(24, 18, 8, 0.85); border: 1px solid rgba(255, 191, 0, 0.22); border-radius: 14px; }")
         tip_lay = QVBoxLayout(tip)
         tip_lay.setContentsMargins(16, 14, 16, 14)
         tip_lay.setSpacing(8)
-        tip_title = QLabel("Security Tip")
+        tip_title = QLabel("Dica de Segurança")
         tip_title.setStyleSheet("color: #ffbf00; font-weight: 700;")
-        tip_body = QLabel('"Never share your API keys with anyone."')
+        tip_body = QLabel('"Nunca compartilhe suas chaves de API com ninguém."')
         tip_body.setWordWrap(True)
         tip_body.setStyleSheet(f"color: {C.TEXT_MED};")
         tip_lay.addWidget(tip_title)
@@ -8915,7 +10194,7 @@ class SystemConnectivitySidebar(QFrame):
             try:
                 self._bridge()._win._load_api_defaults()
                 self._bridge()._win._load_discord_settings()
-                self._bridge()._log_sig.emit("SYS: Configuration reloaded.")
+                self._bridge()._log_sig.emit("SYS: Configuração recarregada.")
             except Exception:
                 pass
 
@@ -8933,7 +10212,7 @@ class SystemConnectivitySidebar(QFrame):
 
     def _check_updates(self):
         if self._bridge() and hasattr(self._bridge(), "write_log"):
-            self._bridge().write_log("SYS: Update check is not connected to a remote service yet.")
+            self._bridge().write_log("SYS: A verificação de atualizações ainda não está conectada a um serviço remoto.")
 
     def refresh(self):
         if self._bridge() and hasattr(self._bridge(), "_win"):
@@ -8961,13 +10240,13 @@ class SettingsHubPage(QWidget):
         lay.setContentsMargins(40, 60, 40, 60)
         lay.setSpacing(25)
 
-        title = QLabel("Settings Hub")
+        title = QLabel("Central de Configurações")
         title.setFont(QFont("Segoe UI", 32, QFont.Weight.Black))
         title.setStyleSheet(f"color: {C.WHITE}; letter-spacing: 1px;")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lay.addWidget(title)
 
-        subtitle = QLabel("Select a section below to configure your Brahma Echo environment.")
+        subtitle = QLabel("Selecione uma seção abaixo para configurar seu ambiente ULTRON.")
         subtitle.setFont(QFont("Segoe UI", 12))
         subtitle.setStyleSheet(f"color: {C.TEXT_DIM};")
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -8978,9 +10257,9 @@ class SettingsHubPage(QWidget):
         cards_lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         cards_data = [
-            ("Brahma Echo Home", "Configure smart home integrations", "🏠", 1),
-            ("Devices", "Manage and control connected hardware", "🔌", 2),
-            ("System & Connect", "Configure providers and api preferences", "⚙️", 3)
+            ("ULTRON Home", "Configure integrações de casa inteligente", "🏠", 1),
+            ("Dispositivos", "Gerencie e controle o hardware conectado", "🔌", 2),
+            ("Sistema e Conexão", "Configure provedores e preferências de API", "⚙️", 3)
         ]
 
         for title_text, desc_text, icon_emoji, target_idx in cards_data:
@@ -9095,10 +10374,10 @@ class SystemConnectivityPage(QWidget):
         h_lay = QVBoxLayout(header)
         h_lay.setContentsMargins(0, 0, 0, 0)
         h_lay.setSpacing(6)
-        title = QLabel("SYSTEM & CONNECTIVITY")
+        title = QLabel("SISTEMA E CONECTIVIDADE")
         title.setFont(QFont("Segoe UI", 22, QFont.Weight.Black))
         title.setStyleSheet(f"color: {C.WHITE}; letter-spacing: 1px;")
-        sub = QLabel("Manage your AI providers, connections and application preferences.")
+        sub = QLabel("Gerencie seus provedores de IA, conexões e preferências do aplicativo.")
         sub.setFont(QFont("Segoe UI", 10))
         sub.setStyleSheet(f"color: {C.TEXT_DIM};")
         h_lay.addWidget(title)
@@ -9168,7 +10447,7 @@ class SystemConnectivityPage(QWidget):
     def _provider_key_preview(self, key: str) -> str:
         key = (key or "").strip()
         if not key:
-            return "Not set"
+            return "Não definido"
         if len(key) <= 8:
             return "ΓÇóΓÇóΓÇóΓÇóΓÇóΓÇóΓÇóΓÇó"
         return f"{key[:4]}ΓÇóΓÇóΓÇóΓÇóΓÇóΓÇóΓÇóΓÇó{key[-4:]}"
@@ -9196,12 +10475,12 @@ class SystemConnectivityPage(QWidget):
         title.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
         title.setStyleSheet(f"color: {C.WHITE}; border: none;")
         if key:
-            status = QLabel("\u2713  Already Added")
+            status = QLabel("\u2713  Já Adicionado")
             status.setStyleSheet(f"color: {C.GREEN}; border: none; font-weight: bold;")
         else:
-            status = QLabel("Not configured")
+            status = QLabel("Não configurado")
             status.setStyleSheet(f"color: {C.TEXT_DIM}; border: none;")
-        model_lbl = QLabel(f"Current model: {model}")
+        model_lbl = QLabel(f"Modelo atual: {model}")
         model_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; border: none;")
         api_lbl = QLabel(self._provider_key_preview(key))
         api_lbl.setStyleSheet(f"color: {C.TEXT_MED}; border: none;")
@@ -9213,9 +10492,9 @@ class SystemConnectivityPage(QWidget):
         btn_lay = QVBoxLayout()
         btn_lay.setSpacing(8)
         if key:
-            edit = QPushButton("Edit API Key")
+            edit = QPushButton("Editar Chave de API")
         else:
-            edit = QPushButton("Add API Key")
+            edit = QPushButton("Adicionar Chave de API")
             edit.setStyleSheet("""
                 QPushButton {
                     background: rgba(255, 179, 0, 0.1);
@@ -9231,7 +10510,7 @@ class SystemConnectivityPage(QWidget):
                 }
             """)
         edit.clicked.connect(lambda: self._open_api_keys())
-        test = QPushButton("Test Connection")
+        test = QPushButton("Testar Conexão")
         test.clicked.connect(lambda: self._test_provider(setting_key))
         btn_lay.addWidget(edit)
         btn_lay.addWidget(test)
@@ -9245,42 +10524,67 @@ class SystemConnectivityPage(QWidget):
         lay.setSpacing(14)
 
 
-        
+
 
 
         # Instagram Connect
-        ig_card = self._card("Instagram Connect", "Connect your personal Instagram account to allow Brahma Echo to manage your DMs.")
+        ig_card = self._card("Conexão Instagram", "Conecte sua conta pessoal do Instagram para permitir que o ULTRON gerencie suas DMs.")
         ig_lay = ig_card.layout()
 
+        self._ig_status_lbl = QLabel("Status: Verificando...")
+        self._ig_status_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; font-size: 11px; font-weight: bold; margin-bottom: 4px;")
+        ig_lay.addWidget(self._ig_status_lbl)
+
+        self._ig_browser_btn = QPushButton("🌐 Conectar via Navegador (Recomendado)")
+        self._ig_browser_btn.setStyleSheet(f"background: {C.PRI}; color: {C.DARK}; font-weight: bold; padding: 7px; border-radius: 4px;")
+        self._ig_browser_btn.setToolTip("Abre o Instagram em uma janela de navegador real. Faça login uma vez, resolva o 2FA facilmente e nunca seja bloqueado pela Meta.")
+        self._ig_browser_btn.clicked.connect(self._handle_ig_browser_connect)
+        ig_lay.addWidget(self._ig_browser_btn)
+
+        or_sep = QLabel("─── ou conecte com credenciais de celular ───")
+        or_sep.setAlignment(__import__('PyQt6').QtCore.Qt.AlignmentFlag.AlignCenter)
+        or_sep.setStyleSheet(f"color: {C.TEXT_DIM}; font-size: 10px; margin: 4px 0;")
+        ig_lay.addWidget(or_sep)
+
         ig_user_row = QHBoxLayout()
-        ig_user_row.addWidget(QLabel("Username"))
+        ig_user_row.addWidget(QLabel("Usuário"))
         self._ig_username = QLineEdit()
-        self._ig_username.setPlaceholderText("Instagram Username")
+        self._ig_username.setPlaceholderText("Usuário do Instagram")
         ig_user_row.addWidget(self._ig_username)
         ig_lay.addLayout(ig_user_row)
 
         ig_pass_row = QHBoxLayout()
-        ig_pass_row.addWidget(QLabel("Password"))
+        ig_pass_row.addWidget(QLabel("Senha"))
         self._ig_password = QLineEdit()
         self._ig_password.setEchoMode(QLineEdit.EchoMode.Password)
-        self._ig_password.setPlaceholderText("Instagram Password")
-        ig_pass_row.addWidget(self._ig_password)
+        self._ig_password.setPlaceholderText("Senha do Instagram (ou sessionid do navegador)")
+        ig_pass_row.addWidget(self._ig_password, 1)
+
+        self._ig_reveal_btn = QPushButton("Mostrar")
+        self._ig_reveal_btn.setCheckable(True)
+        self._ig_reveal_btn.clicked.connect(self._toggle_ig_password_reveal)
+        ig_pass_row.addWidget(self._ig_reveal_btn)
         ig_lay.addLayout(ig_pass_row)
-        
+
+        ig_hint = QLabel("Dica: Use 'Conectar via Navegador' acima para evitar os bloqueios automatizados de celular da Meta e os limites de taxa 429.")
+        ig_hint.setStyleSheet(f"color: {C.TEXT_DIM}; font-size: 11px;")
+        ig_hint.setWordWrap(True)
+        ig_lay.addWidget(ig_hint)
+
         ig_btns_row = QHBoxLayout()
-        
-        self._ig_connect_btn = QPushButton("Connect")
+
+        self._ig_connect_btn = QPushButton("Conectar (Senha)")
         self._ig_connect_btn.clicked.connect(self._handle_ig_connect)
         ig_btns_row.addWidget(self._ig_connect_btn)
-        
-        self._ig_disconnect_btn = QPushButton("Disconnect")
+
+        self._ig_disconnect_btn = QPushButton("Desconectar")
         self._ig_disconnect_btn.clicked.connect(self._handle_ig_disconnect)
         ig_btns_row.addWidget(self._ig_disconnect_btn)
 
         ig_lay.addLayout(ig_btns_row)
-        
+
         lay.addWidget(ig_card)
-        
+
         # Pre-fill from API keys if they exist
         try:
             with open(Path("config/api_keys.json"), "r", encoding="utf-8") as f:
@@ -9292,36 +10596,96 @@ class SystemConnectivityPage(QWidget):
         except Exception:
             pass
 
+        self._update_ig_status()
+
+        # Google Workspace (Gmail / Calendar / Drive)
+        gw_card = self._card("Google Workspace (Gmail / Calendar / Drive)", "Configure sua integração com Gmail, Google Calendar e Drive.")
+        gw_lay = gw_card.layout()
+
+        gw_email_row = QHBoxLayout()
+        gw_email_row.addWidget(QLabel("Endereço do Gmail"))
+        self._gw_email = QLineEdit()
+        self._gw_email.setPlaceholderText("seu-email@gmail.com")
+        gw_email_row.addWidget(self._gw_email)
+        gw_lay.addLayout(gw_email_row)
+
+        gw_pass_row = QHBoxLayout()
+        gw_pass_row.addWidget(QLabel("Senha de App"))
+        self._gw_password = QLineEdit()
+        self._gw_password.setEchoMode(QLineEdit.EchoMode.Password)
+        self._gw_password.setPlaceholderText("Senha de App do Google de 16 caracteres")
+        gw_pass_row.addWidget(self._gw_password)
+
+        self._gw_reveal_btn = QPushButton("Mostrar")
+        self._gw_reveal_btn.setCheckable(True)
+        self._gw_reveal_btn.clicked.connect(self._toggle_gw_password_reveal)
+        gw_pass_row.addWidget(self._gw_reveal_btn)
+        gw_lay.addLayout(gw_pass_row)
+
+        gw_btns_row = QHBoxLayout()
+        self._gw_save_btn = QPushButton("Salvar Credenciais")
+        self._gw_save_btn.clicked.connect(self._handle_gw_save)
+        gw_btns_row.addWidget(self._gw_save_btn)
+
+        self._gw_test_btn = QPushButton("Testar Conexão")
+        self._gw_test_btn.clicked.connect(self._handle_gw_test)
+        gw_btns_row.addWidget(self._gw_test_btn)
+
+        self._gw_oauth_btn = QPushButton("Carregar JSON do OAuth")
+        self._gw_oauth_btn.clicked.connect(self._handle_gw_oauth)
+        gw_btns_row.addWidget(self._gw_oauth_btn)
+        gw_lay.addLayout(gw_btns_row)
+
+        self._gw_status_lbl = QLabel("Status: Pronto")
+        self._gw_status_lbl.setStyleSheet(f"color: {C.TEXT_DIM};")
+        gw_lay.addWidget(self._gw_status_lbl)
+
+        gw_help = QLabel("Dica: Gere uma Senha de App de 16 caracteres em myaccount.google.com/apppasswords")
+        gw_help.setStyleSheet(f"color: {C.TEXT_MED}; font-size: 11px;")
+        gw_lay.addWidget(gw_help)
+
+        lay.addWidget(gw_card)
+
+        # Pre-fill stored Google Workspace credentials
+        try:
+            from actions.google_workspace_mcp import get_stored_gmail_credentials
+            _em, _pw = get_stored_gmail_credentials()
+            if _em:
+                self._gw_email.setText(_em)
+            if _pw:
+                self._gw_password.setText(_pw)
+        except Exception:
+            pass
 
         # Identity & Profile
-        identity_card = self._card("Identity & Profile", "Configure assistant identity, user profile, and behavior.")
+        identity_card = self._card("Identidade e Perfil", "Configure a identidade do assistente, o perfil do usuário e o comportamento.")
         ilay = identity_card.layout()
-        
+
         # Assistant Settings
         ast_row = QHBoxLayout()
-        ast_row.addWidget(QLabel("Assistant Name"))
+        ast_row.addWidget(QLabel("Nome do Assistente"))
         self._set_ast_name = QLineEdit(identity.get_assistant_name())
         self._set_ast_name.textChanged.connect(lambda t: identity.set_assistant_name(t.strip() or "Brahma"))
         ast_row.addWidget(self._set_ast_name)
         ilay.addLayout(ast_row)
-        
+
         app_row = QHBoxLayout()
-        app_row.addWidget(QLabel("Application Name"))
+        app_row.addWidget(QLabel("Nome do Aplicativo"))
         self._set_app_name = QLineEdit(identity.get_application_name())
-        self._set_app_name.textChanged.connect(lambda t: identity.set_application_name(t.strip() or "Brahma Echo"))
+        self._set_app_name.textChanged.connect(lambda t: identity.set_application_name(t.strip() or "ULTRON"))
         app_row.addWidget(self._set_app_name)
         ilay.addLayout(app_row)
 
         # Owner Profile
         own_row = QHBoxLayout()
-        own_row.addWidget(QLabel("Your Name"))
+        own_row.addWidget(QLabel("Seu Nome"))
         self._set_own_name = QLineEdit(identity.get_owner_name())
         self._set_own_name.textChanged.connect(lambda t: identity.set_owner_name(t.strip()))
         own_row.addWidget(self._set_own_name)
         ilay.addLayout(own_row)
 
         role_row = QHBoxLayout()
-        role_row.addWidget(QLabel("Your Role"))
+        role_row.addWidget(QLabel("Seu Papel"))
         self._set_own_role = QLineEdit(identity.get_owner_role())
         self._set_own_role.textChanged.connect(lambda t: identity.set_owner_role(t.strip()))
         role_row.addWidget(self._set_own_role)
@@ -9329,7 +10693,7 @@ class SystemConnectivityPage(QWidget):
 
         # Behavior
         beh_row = QHBoxLayout()
-        beh_row.addWidget(QLabel("Behavior Mode"))
+        beh_row.addWidget(QLabel("Modo de Comportamento"))
         self._set_beh_mode = QComboBox()
         self._set_beh_mode.addItems(["professional", "casual", "technical", "minimal", "proactive"])
         self._set_beh_mode.setCurrentText(identity.get_behavior_mode())
@@ -9340,13 +10704,13 @@ class SystemConnectivityPage(QWidget):
         lay.addWidget(identity_card)
 
         # AI Providers
-        card = self._card("AI Providers", "Only the supported providers are shown here.")
+        card = self._card("Provedores de IA", "Apenas os provedores suportados são mostrados aqui.")
         lay1 = card.layout()
         self._api_defaults = self._load_api_defaults()
         self._gemini_row, self._gemini_status, self._gemini_key = self._provider_row(
             "Google Gemini",
             self._api_defaults.get("gemini_api_key", ""),
-            "gemini-2.5-flash",
+            "gemini-3.6-flash",
             "gemini",
         )
         self._or_row, self._or_status, self._or_key = self._provider_row(
@@ -9361,7 +10725,7 @@ class SystemConnectivityPage(QWidget):
         controls.setSpacing(12)
         self._default_provider = QComboBox()
         self._default_provider.addItems(["Google Gemini", "OpenRouter", "Local"])
-        
+
         current_provider = self._load_app_settings().get("default_ai_provider", "Gemini")
         if current_provider in {"Gemini", "Google Gemini"}:
             self._default_provider.setCurrentText("Google Gemini")
@@ -9369,55 +10733,55 @@ class SystemConnectivityPage(QWidget):
             self._default_provider.setCurrentText("Local")
         else:
             self._default_provider.setCurrentText("OpenRouter")
-            
+
         self._default_provider.currentTextChanged.connect(self._set_default_provider)
-        controls.addWidget(QLabel("Default AI Provider"))
+        controls.addWidget(QLabel("Provedor de IA Padrão"))
         controls.addWidget(self._default_provider, 1)
         lay1.addLayout(controls)
-        
+
         # Local AI Settings
         self._local_ai_widget = QWidget()
         local_lay = QVBoxLayout(self._local_ai_widget)
         local_lay.setContentsMargins(0, 0, 0, 0)
-        
+
         url_row = QHBoxLayout()
-        url_row.addWidget(QLabel("Local Server URL"))
+        url_row.addWidget(QLabel("URL do Servidor Local"))
         self._local_url_input = QLineEdit(self._load_app_settings().get("local_ai_url", "http://localhost:11434/v1"))
         self._local_url_input.textChanged.connect(lambda t: self._set_setting("local_ai_url", t))
         url_row.addWidget(self._local_url_input, 1)
         local_lay.addLayout(url_row)
-        
+
         model_row = QHBoxLayout()
-        model_row.addWidget(QLabel("Local Model Name"))
+        model_row.addWidget(QLabel("Nome do Modelo Local"))
         self._local_model_input = QLineEdit(self._load_app_settings().get("local_ai_model", "llama3.2"))
         self._local_model_input.textChanged.connect(lambda t: self._set_setting("local_ai_model", t))
         model_row.addWidget(self._local_model_input, 1)
         local_lay.addLayout(model_row)
-        
+
         self._local_ai_widget.setVisible(current_provider == "Local")
         self._default_provider.currentTextChanged.connect(lambda t: self._local_ai_widget.setVisible(t == "Local"))
-        
+
         lay1.addWidget(self._local_ai_widget)
-        
-        self._auto_switch_btn = self._mk_toggle("Automatically switch if a provider fails", bool(self._load_app_settings().get("auto_provider_switch", True)), self._toggle_auto_provider_switch)
+
+        self._auto_switch_btn = self._mk_toggle("Alternar automaticamente se um provedor falhar", bool(self._load_app_settings().get("auto_provider_switch", True)), self._toggle_auto_provider_switch)
         lay1.addWidget(self._auto_switch_btn)
         lay.addWidget(card)
 
         # Mobile connect
-        mobile = self._card("Mobile Connect", "Connect your phone and control Brahma Echo remotely.")
+        mobile = self._card("Conexão Móvel", "Conecte seu celular e controle o ULTRON remotamente.")
         ml = mobile.layout()
-        self._mobile_status = QLabel("Connection Status: Ready")
-        self._mobile_phone = QLabel("Phone Name: Not connected")
-        self._mobile_last = QLabel("Last Connected: Never")
+        self._mobile_status = QLabel("Status da Conexão: Pronto")
+        self._mobile_phone = QLabel("Nome do Celular: Não conectado")
+        self._mobile_last = QLabel("Última Conexão: Nunca")
         for lbl in (self._mobile_status, self._mobile_phone, self._mobile_last):
             lbl.setStyleSheet(f"color: {C.TEXT_MED};")
             ml.addWidget(lbl)
         row = QHBoxLayout()
-        self._mobile_connect_btn = QPushButton("Connect Device")
+        self._mobile_connect_btn = QPushButton("Conectar Dispositivo")
         self._mobile_connect_btn.clicked.connect(self._connect_mobile)
-        self._mobile_disconnect_btn = QPushButton("Disconnect")
+        self._mobile_disconnect_btn = QPushButton("Desconectar")
         self._mobile_disconnect_btn.clicked.connect(self._disconnect_mobile)
-        self._mobile_qr_btn = QPushButton("Generate QR Code")
+        self._mobile_qr_btn = QPushButton("Gerar Código QR")
         self._mobile_qr_btn.clicked.connect(self._show_qr_code)
         row.addWidget(self._mobile_connect_btn)
         row.addWidget(self._mobile_disconnect_btn)
@@ -9426,15 +10790,15 @@ class SystemConnectivityPage(QWidget):
         lay.addWidget(mobile)
 
         # Attention prompts
-        attention = self._card("Attention Prompts", "Control incoming message and call alerts.")
+        attention = self._card("Alertas de Atenção", "Controle os avisos de mensagens e chamadas recebidas.")
         al = attention.layout()
         self._attention_message_btn = self._mk_toggle(
-            "Show incoming message prompts",
+            "Mostrar avisos de mensagens recebidas",
             bool(self._load_app_settings().get("attention_message_prompts", True)),
             self._toggle_attention_message_prompts,
         )
         self._attention_call_btn = self._mk_toggle(
-            "Show incoming call prompts",
+            "Mostrar avisos de chamadas recebidas",
             bool(self._load_app_settings().get("attention_call_prompts", True)),
             self._toggle_attention_call_prompts,
         )
@@ -9443,42 +10807,42 @@ class SystemConnectivityPage(QWidget):
         lay.addWidget(attention)
 
         # Startup
-        startup = self._card("Startup", "Use Brahma Echo with Windows startup preferences.")
+        startup = self._card("Inicialização", "Use o ULTRON com as preferências de inicialização do Windows.")
         sl = startup.layout()
-        self._startup_launch_btn = self._mk_toggle("Launch Brahma Echo when Windows starts", bool(self._load_app_settings().get("show_workspace_on_startup", False)), self._toggle_startup_from_page)
-        self._startup_minimized_btn = self._mk_toggle("Launch Minimized", bool(self._load_app_settings().get("launch_minimized", False)), self._toggle_launch_minimized)
-        self._startup_updates_btn = self._mk_toggle("Check for updates on startup", bool(self._load_app_settings().get("check_updates_on_startup", True)), self._toggle_update_check)
+        self._startup_launch_btn = self._mk_toggle("Iniciar o ULTRON quando o Windows iniciar", bool(self._load_app_settings().get("show_workspace_on_startup", False)), self._toggle_startup_from_page)
+        self._startup_minimized_btn = self._mk_toggle("Iniciar Minimizado", bool(self._load_app_settings().get("launch_minimized", False)), self._toggle_launch_minimized)
+        self._startup_updates_btn = self._mk_toggle("Verificar atualizações ao iniciar", bool(self._load_app_settings().get("check_updates_on_startup", True)), self._toggle_update_check)
         sl.addWidget(self._startup_launch_btn)
         sl.addWidget(self._startup_minimized_btn)
         sl.addWidget(self._startup_updates_btn)
         lay.addWidget(startup)
 
         # Shortcuts & Pinning
-        shortcuts = self._card("Shortcuts & Pinning", "Create shortcuts and pin Brahma Echo to your Windows system.")
+        shortcuts = self._card("Atalhos e Fixação", "Crie atalhos e fixe o ULTRON no seu sistema Windows.")
         shl = shortcuts.layout()
-        
+
         btn_row = QHBoxLayout()
         btn_row.setSpacing(12)
-        
-        self._desktop_shortcut_btn = QPushButton("Create Desktop Shortcut")
+
+        self._desktop_shortcut_btn = QPushButton("Criar Atalho na Área de Trabalho")
         self._desktop_shortcut_btn.clicked.connect(self._handle_create_desktop_shortcut)
-        self._taskbar_pin_btn = QPushButton("Pin to Taskbar")
+        self._taskbar_pin_btn = QPushButton("Fixar na Barra de Tarefas")
         self._taskbar_pin_btn.clicked.connect(self._handle_pin_to_taskbar)
-        
+
         btn_row.addWidget(self._desktop_shortcut_btn, 1)
         btn_row.addWidget(self._taskbar_pin_btn, 1)
         shl.addLayout(btn_row)
         lay.addWidget(shortcuts)
 
         # App Theme
-        theme_card = self._card("App Theme", "Select the primary color theme for Brahma Echo.")
+        theme_card = self._card("Tema do App", "Selecione o tema de cor principal do ULTRON.")
         tl = theme_card.layout()
         theme_row = QHBoxLayout()
-        theme_row.addWidget(QLabel("Primary Color:"))
-        
-        self._pick_theme_btn = QPushButton("Pick Color Palette")
+        theme_row.addWidget(QLabel("Cor Primária:"))
+
+        self._pick_theme_btn = QPushButton("Escolher Paleta de Cores")
         self._pick_theme_btn.clicked.connect(self._pick_theme_color)
-        
+
         current_theme = "Gold"
         try:
             if APP_SETTINGS_FILE.exists():
@@ -9487,27 +10851,27 @@ class SystemConnectivityPage(QWidget):
                     current_theme = _d.get("app_theme", "Gold")
         except:
             pass
-            
+
         if current_theme.startswith("#"):
             self._pick_theme_btn.setStyleSheet(f"background: {current_theme}; color: #ffffff;")
-        
+
         theme_row.addWidget(self._pick_theme_btn, 1)
         tl.addLayout(theme_row)
         lay.addWidget(theme_card)
 
         # Startup animation
-        anim = self._card("Startup Animation", "Control how the boot sequence behaves.")
+        anim = self._card("Animação de Inicialização", "Controle como a sequência de inicialização se comporta.")
         al = anim.layout()
-        self._startup_anim_enable_btn = self._mk_toggle("Enable Startup Animation", bool(self._startup_animation_enabled()), self._toggle_startup_animation_from_page)
+        self._startup_anim_enable_btn = self._mk_toggle("Ativar Animação de Inicialização", bool(self._startup_animation_enabled()), self._toggle_startup_animation_from_page)
         al.addWidget(self._startup_anim_enable_btn)
         speed_row = QHBoxLayout()
-        speed_row.addWidget(QLabel("Animation Speed"))
+        speed_row.addWidget(QLabel("Velocidade da Animação"))
         self._anim_speed = QComboBox()
         self._anim_speed.addItems(["Fast", "Normal", "Slow"])
         self._anim_speed.setCurrentText(self._load_app_settings().get("startup_anim_speed", "Normal"))
         speed_row.addWidget(self._anim_speed, 1)
         al.addLayout(speed_row)
-        self._anim_preview_btn = QPushButton("Preview Animation")
+        self._anim_preview_btn = QPushButton("Pré-visualizar Animação")
         self._anim_preview_btn.clicked.connect(self._preview_animation)
         al.addWidget(self._anim_preview_btn)
         self._preview_progress = QProgressBar()
@@ -9518,31 +10882,30 @@ class SystemConnectivityPage(QWidget):
         self._preview_progress.setStyleSheet("QProgressBar { background: rgba(255,255,255,0.05); border: none; border-radius: 4px; } QProgressBar::chunk { background: #ffb300; border-radius: 4px; }")
         al.addWidget(self._preview_progress)
         lay.addWidget(anim)
-
         # Discord bot
-        discord = self._card("Discord Bot", "Mirror Brahma Echo between the app and your server.")
+        discord = self._card("Bot do Discord", "Espelhe o ULTRON entre o app e o seu servidor.")
         dl = discord.layout()
         self._discord_defaults = self._load_discord_settings()
-        self._discord_status = QLabel("Bot Status: Offline")
+        self._discord_status = QLabel("Status do Bot: Offline")
         dl.addWidget(self._discord_status)
         self._discord_token = QLineEdit()
         self._discord_token.setEchoMode(QLineEdit.EchoMode.Password)
-        self._discord_token.setPlaceholderText("Bot Token")
+        self._discord_token.setPlaceholderText("Token do Bot")
         self._discord_token.setText((self._discord_defaults.get("bot_token") or "").strip())
         self._discord_token.setCursorPosition(0)
         dl.addWidget(self._discord_token)
-        self._discord_reveal = QPushButton("Reveal")
+        self._discord_reveal = QPushButton("Mostrar")
         self._discord_reveal.setCheckable(True)
         self._discord_reveal.clicked.connect(self._toggle_discord_reveal)
         dl.addWidget(self._discord_reveal)
         self._discord_channel = QLineEdit()
-        self._discord_channel.setPlaceholderText("Optional Channel ID")
+        self._discord_channel.setPlaceholderText("ID do Canal (Opcional)")
         self._discord_channel.setText((self._discord_defaults.get("channel_id") or "").strip())
         dl.addWidget(self._discord_channel)
         db = QHBoxLayout()
-        self._discord_save = QPushButton("Save")
-        self._discord_test = QPushButton("Test Connection")
-        self._discord_restart = QPushButton("Restart Bot")
+        self._discord_save = QPushButton("Salvar")
+        self._discord_test = QPushButton("Testar Conexão")
+        self._discord_restart = QPushButton("Reiniciar Bot")
         self._discord_save.clicked.connect(self._save_discord_from_page)
         self._discord_test.clicked.connect(self._test_discord_from_page)
         self._discord_restart.clicked.connect(self._restart_discord_from_page)
@@ -9555,19 +10918,19 @@ class SystemConnectivityPage(QWidget):
         dl.addWidget(self._discord_msg)
         lay.addWidget(discord)
 
-        about = self._card("About Brahma Echo", "Brahma Echo information only.")
+        about = self._card("Sobre o ULTRON", "Apenas informações do ULTRON.")
         ab = about.layout()
         about_grid = QGridLayout()
         about_grid.setHorizontalSpacing(22)
         about_grid.setVerticalSpacing(8)
         entries = [
-            ("Version", "v1.0.0"),
-            ("Build Number", "2026.06.29"),
-            ("Release Date", "29 Jun 2026"),
+            ("Version", "Versão", "v1.0.0"),
+            ("Build Number", "Número da Build", "2026.06.29"),
+            ("Release Date", "Data de Lançamento", "29 Jun 2026"),
         ]
         self._about_values: dict[str, QLabel] = {}
-        for idx, (label, value) in enumerate(entries):
-            key = QLabel(label)
+        for idx, (label, label_text, value) in enumerate(entries):
+            key = QLabel(label_text)
             key.setStyleSheet(f"color: {C.TEXT_DIM};")
             val = QLabel(value)
             val.setStyleSheet(f"color: {C.WHITE}; font-weight: 700;")
@@ -9577,68 +10940,467 @@ class SystemConnectivityPage(QWidget):
         ab.addLayout(about_grid)
         lay.addWidget(about)
 
+        # Autonomous Self-Healing & Continuous Self-Improvement Card
+        auto_heal_card = self._card("Auto-Correção e Auto-Aprimoramento Contínuo", "Reparo autônomo de bugs, sentinela de recuperação de falhas, correção verificada por AST e diretrizes comportamentais persistentes.")
+        ah_lay = auto_heal_card.layout()
+
+        self._ah_status_lbl = QLabel("Sentinela: Ativa | Sandbox: Habilitado | Regras: 0 ativas")
+        self._ah_status_lbl.setStyleSheet(f"color: {C.WHITE}; font-size: 12px; font-weight: bold; padding: 4px 0;")
+        ah_lay.addWidget(self._ah_status_lbl)
+
+        ah_btn_row = QHBoxLayout()
+        self._ah_history_btn = QPushButton("Histórico de Correções")
+        self._ah_history_btn.clicked.connect(self._handle_ah_history)
+        ah_btn_row.addWidget(self._ah_history_btn)
+
+        self._ah_rollback_btn = QPushButton("Reverter Última Correção")
+        self._ah_rollback_btn.clicked.connect(self._handle_ah_rollback)
+        ah_btn_row.addWidget(self._ah_rollback_btn)
+
+        self._ah_rules_btn = QPushButton("Regras Aprendidas")
+        self._ah_rules_btn.clicked.connect(self._handle_ah_rules)
+        ah_btn_row.addWidget(self._ah_rules_btn)
+        ah_lay.addLayout(ah_btn_row)
+
+        test_row = QHBoxLayout()
+        self._ah_trigger_bug_btn = QPushButton("⚡ Acionar Bug de Teste")
+        self._ah_trigger_bug_btn.clicked.connect(self._handle_ah_trigger_test_bug)
+        test_row.addWidget(self._ah_trigger_bug_btn)
+
+        self._ah_fix_bug_btn = QPushButton("🛠️ Corrigir Bug Capturado")
+        self._ah_fix_bug_btn.clicked.connect(self._handle_ah_fix_captured_bug)
+        test_row.addWidget(self._ah_fix_bug_btn)
+        ah_lay.addLayout(test_row)
+
+        rule_input_row = QHBoxLayout()
+        self._ah_rule_input = QLineEdit()
+        self._ah_rule_input.setPlaceholderText("Ensine uma regra ao Brahma (ex.: Sempre resumir em tópicos)")
+        rule_input_row.addWidget(self._ah_rule_input)
+        self._ah_learn_btn = QPushButton("Ensinar Regra")
+        self._ah_learn_btn.clicked.connect(self._handle_ah_learn_rule)
+        rule_input_row.addWidget(self._ah_learn_btn)
+        ah_lay.addLayout(rule_input_row)
+
+        self._ah_output_lbl = QLabel("A sentinela de auto-correção está ativa. Proteção contra travamento e reversão automática ativadas.")
+        self._ah_output_lbl.setStyleSheet(f"color: {C.TEXT_MED}; font-size: 11px;")
+        self._ah_output_lbl.setWordWrap(True)
+        ah_lay.addWidget(self._ah_output_lbl)
+
+        lay.addWidget(auto_heal_card)
+        try:
+            self._refresh_auto_heal_status()
+        except Exception:
+            pass
+
+        # Brahma Audio Routing & Hardware Controls
+        audio_card = self._card("Roteamento de Áudio e Controles de Hardware", "Selecione interfaces de áudio, ative o Push-to-Talk ou inspecione a memória de longo prazo.")
+        alay = audio_card.layout()
+
+        # Mic selection row
+        mic_row = QHBoxLayout()
+        mic_lbl = QLabel("Microfone de Entrada")
+        mic_lbl.setStyleSheet(f"color: {C.WHITE}; min-width: 130px;")
+        mic_row.addWidget(mic_lbl)
+
+        self._mic_combo = QComboBox()
+        self._mic_combo.addItem("Microfone Padrão do Sistema")
+        try:
+            from core import audio_devices
+            from memory import config_manager
+            audio_devices.prefetch()
+            input_devs = audio_devices.list_devices("input")
+            for dev in input_devs:
+                self._mic_combo.addItem(dev)
+            saved_in = config_manager.get_input_device()
+            if saved_in and saved_in in input_devs:
+                self._mic_combo.setCurrentText(saved_in)
+        except Exception:
+            pass
+        # Connect only after the saved value is applied (see speaker combo note).
+        self._mic_combo.currentTextChanged.connect(self._on_input_device_changed)
+        mic_row.addWidget(self._mic_combo, 1)
+        alay.addLayout(mic_row)
+
+        # Speaker selection row
+        spk_row = QHBoxLayout()
+        spk_lbl = QLabel("Alto-falante de Saída")
+        spk_lbl.setStyleSheet(f"color: {C.WHITE}; min-width: 130px;")
+        spk_row.addWidget(spk_lbl)
+
+        self._spk_combo = QComboBox()
+        self._spk_combo.addItem("Alto-falante Padrão do Sistema")
+        try:
+            from core import audio_devices
+            from memory import config_manager
+            output_devs = audio_devices.list_devices("output")
+            for dev in output_devs:
+                self._spk_combo.addItem(dev)
+            saved_out = config_manager.get_output_device()
+            if saved_out and saved_out in output_devs:
+                self._spk_combo.setCurrentText(saved_out)
+        except Exception:
+            pass
+        # Connect only AFTER the saved value is selected. Otherwise populating the
+        # combo fired currentTextChanged and overwrote the user's saved device with
+        # the first entry ("system default") — which silently routed audio to the
+        # speakers and caused echo to be transcribed as the user.
+        self._spk_combo.currentTextChanged.connect(self._on_output_device_changed)
+        spk_row.addWidget(self._spk_combo, 1)
+        alay.addLayout(spk_row)
+
+        # Push-to-Talk and Memory Inspector Action buttons
+        tools_row = QHBoxLayout()
+        try:
+            from memory import config_manager
+            ptt_enabled = config_manager.get_push_to_talk_enabled()
+        except Exception:
+            ptt_enabled = False
+
+        self._ptt_toggle = self._mk_toggle(
+            "Push-to-Talk (Segure Ctrl+Space)",
+            ptt_enabled,
+            self._on_ptt_toggled
+        )
+        tools_row.addWidget(self._ptt_toggle)
+
+        mem_btn = QPushButton("🧠 Inspecionar Memória")
+        mem_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        mem_btn.clicked.connect(self._open_memory_inspector)
+        tools_row.addWidget(mem_btn)
+
+        undo_btn = QPushButton("↺ Reverter (Desfazer)")
+        undo_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        undo_btn.clicked.connect(self._handle_undo_click)
+        tools_row.addWidget(undo_btn)
+        alay.addLayout(tools_row)
+
+        self._audio_status_lbl = QLabel("Deduplicação de áudio de hardware, proteção de eco e pilha de desfazer ativas.")
+        self._audio_status_lbl.setStyleSheet(f"color: {C.TEXT_MED}; font-size: 11px;")
+        alay.addWidget(self._audio_status_lbl)
+
+        lay.addWidget(audio_card)
+
         lay.addStretch(1)
         return col
 
 
+    def _on_input_device_changed(self, name: str):
+        try:
+            from memory import config_manager
+            val = "" if name == "Microfone Padrão do Sistema" else name
+            config_manager.set_input_device(val)
+            self._audio_status_lbl.setText(f"✅ Dispositivo de entrada definido para: {name}")
+        except Exception as e:
+            self._audio_status_lbl.setText(f"Erro ao definir entrada: {e}")
+
+    def _on_output_device_changed(self, name: str):
+        try:
+            from memory import config_manager
+            val = "" if name == "Alto-falante Padrão do Sistema" else name
+            config_manager.set_output_device(val)
+            self._audio_status_lbl.setText(f"✅ Dispositivo de saída definido para: {name}")
+        except Exception as e:
+            self._audio_status_lbl.setText(f"Erro ao definir saída: {e}")
+
+    def _on_ptt_toggled(self, checked: bool):
+        try:
+            from memory import config_manager
+            config_manager.set_push_to_talk_enabled(checked)
+            self._audio_status_lbl.setText(f"✅ Push-to-Talk {'ativado (Segure Ctrl+Space)' if checked else 'desativado'}")
+        except Exception as e:
+            self._audio_status_lbl.setText(f"Erro ao alternar PTT: {e}")
+
+    def _open_memory_inspector(self):
+        try:
+            win = self.window()
+            if hasattr(win, "show_memory_inspector"):
+                win.show_memory_inspector()
+            elif hasattr(win, "_memory_overlay_sig"):
+                win._memory_overlay_sig.emit("show")
+        except Exception as e:
+            self._audio_status_lbl.setText(f"Erro ao abrir o inspetor de memória: {e}")
+
+    def _handle_undo_click(self):
+        try:
+            from core import undo
+            if not undo.can_undo():
+                self._audio_status_lbl.setText("ℹ Ainda não há nada para desfazer.")
+                return
+            res = undo.undo_last()
+            self._audio_status_lbl.setText(f"↺ {res}")
+        except Exception as e:
+            self._audio_status_lbl.setText(f"Erro ao executar o desfazer: {e}")
+
+    def _update_ig_status(self):
+        try:
+            if not hasattr(self, "_ig_status_lbl"):
+                return
+            from pathlib import Path
+            import json
+            api_keys = Path("config/api_keys.json")
+            username = ""
+            d = {}
+            if api_keys.exists():
+                with open(api_keys, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                    username = d.get("instagram_username", "")
+
+            is_browser_auth = bool(d.get("instagram_browser_authenticated") and d.get("instagram_sessionid"))
+            if is_browser_auth:
+                name_str = f" (@{username})" if username else ""
+                self._ig_status_lbl.setText(f"Status: 🟢 Conectado via Navegador{name_str}")
+                self._ig_status_lbl.setStyleSheet("color: #00ffcc; font-size: 11px; font-weight: bold; margin-bottom: 4px;")
+                return
+
+            if username and Path("config/ig_session.json").exists():
+                self._ig_status_lbl.setText(f"Status: 🟢 Conectado (@{username})")
+                self._ig_status_lbl.setStyleSheet("color: #00ffcc; font-size: 11px; font-weight: bold; margin-bottom: 4px;")
+                return
+
+            self._ig_status_lbl.setText("Status: ⚪ Não Conectado — Clique em 'Conectar via Navegador' abaixo")
+            self._ig_status_lbl.setStyleSheet(f"color: {C.PRI}; font-size: 11px; font-weight: bold; margin-bottom: 4px;")
+        except Exception:
+            pass
+
     def _handle_ig_disconnect(self):
         try:
             import json
+            import shutil
             from pathlib import Path
             with open("config/api_keys.json", "r", encoding="utf-8") as f:
                 d = json.load(f)
             d["instagram_username"] = ""
             d["instagram_password"] = ""
+            d["instagram_sessionid"] = ""
+            d["instagram_user_id"] = ""
+            d["instagram_browser_authenticated"] = False
             with open("config/api_keys.json", "w", encoding="utf-8") as f:
                 json.dump(d, f, indent=4)
-                
+
             session_path = Path("config/ig_session.json")
             if session_path.exists():
                 session_path.unlink()
-                
-            from actions.instagram_chat import stop_daemon
+
+            profile_dir = Path("config/ig_browser_profile")
+            if profile_dir.exists():
+                try:
+                    shutil.rmtree(profile_dir)
+                except Exception:
+                    pass
+
+            from actions.instagram_mcp import stop_daemon, kill_browser_processes
             stop_daemon()
-            
+            kill_browser_processes()
+
+            self._update_ig_status()
             from PyQt6.QtWidgets import QMessageBox
-            QMessageBox.information(self, "Disconnected", "Instagram account disconnected.")
+            QMessageBox.information(self, "Desconectado", "Conta do Instagram desconectada.")
         except Exception as e:
             from PyQt6.QtWidgets import QMessageBox
-            QMessageBox.critical(self, "Error", f"Error disconnecting Instagram: {e}")
+            QMessageBox.critical(self, "Erro", f"Erro ao desconectar o Instagram: {e}")
+
+    class IGBrowserLoginWorker(__import__('PyQt6').QtCore.QThread):
+        finished_success = __import__('PyQt6').QtCore.pyqtSignal(str)
+        finished_error = __import__('PyQt6').QtCore.pyqtSignal(str)
+        status_update = __import__('PyQt6').QtCore.pyqtSignal(str)
+
+        def __init__(self, username=""):
+            super().__init__()
+            self.username = username
+
+        def run(self):
+            try:
+                from playwright.sync_api import sync_playwright
+                from pathlib import Path
+                import json
+                import time
+
+                profile_dir = Path("config/ig_browser_profile").resolve()
+                profile_dir.mkdir(parents=True, exist_ok=True)
+
+                self.status_update.emit("Launching browser for Instagram...")
+                with sync_playwright() as p:
+                    context = p.chromium.launch_persistent_context(
+                        str(profile_dir),
+                        headless=False,
+                        args=["--disable-blink-features=AutomationControlled"],
+                        viewport={"width": 1080, "height": 800},
+                    )
+                    page = context.pages[0] if context.pages else context.new_page()
+                    page.goto("https://www.instagram.com/accounts/login/", timeout=60000)
+
+                    # Try to prefill username
+                    if self.username:
+                        try:
+                            user_input = page.wait_for_selector('input[name="username"], input[name="email"]', timeout=5000)
+                            if user_input and not user_input.input_value():
+                                user_input.fill(self.username)
+                        except Exception:
+                            pass
+
+                    self.status_update.emit("Please log in in the opened browser window...")
+
+                    logged_in = False
+                    detected_username = self.username
+                    # Poll cookies for up to 5 minutes
+                    for _ in range(300):
+                        if self.isInterruptionRequested():
+                            break
+                        try:
+                            cookies = context.cookies("https://www.instagram.com")
+                            cookie_map = {c["name"]: c["value"] for c in cookies}
+                            if "sessionid" in cookie_map and "ds_user_id" in cookie_map:
+                                logged_in = True
+                                sid = cookie_map["sessionid"]
+                                uid = cookie_map["ds_user_id"]
+
+                                time.sleep(2)
+                                try:
+                                    u = page.evaluate("() => window._sharedData?.config?.viewer?.username || ''")
+                                    if u:
+                                        detected_username = u
+                                    else:
+                                        parts = [x for x in page.url.replace("https://www.instagram.com/", "").split("/") if x]
+                                        if parts and parts[0] not in ["accounts", "direct", "explore", "reels"]:
+                                            detected_username = parts[0]
+                                except Exception:
+                                    pass
+
+                                try:
+                                    cfg_path = Path("config/api_keys.json")
+                                    data = {}
+                                    if cfg_path.exists():
+                                        with open(cfg_path, "r", encoding="utf-8") as f:
+                                            data = json.load(f)
+                                    if detected_username:
+                                        data["instagram_username"] = detected_username
+                                    data["instagram_sessionid"] = sid
+                                    data["instagram_user_id"] = uid
+                                    data["instagram_browser_authenticated"] = True
+                                    with open(cfg_path, "w", encoding="utf-8") as f:
+                                        json.dump(data, f, indent=4)
+                                except Exception:
+                                    pass
+
+                                break
+                        except Exception:
+                            pass
+                        time.sleep(1)
+
+                    context.close()
+
+                    if logged_in:
+                        from actions.instagram_mcp import stop_daemon, start_daemon
+                        stop_daemon()
+                        start_daemon()
+                        self.finished_success.emit(detected_username or "")
+                    else:
+                        self.finished_error.emit("Login timed out or the browser window was closed before login was completed.")
+            except Exception as e:
+                self.finished_error.emit(str(e))
+
+    def _handle_ig_browser_connect(self):
+        self._ig_browser_btn.setEnabled(False)
+        self._ig_browser_btn.setText("Conectando via Navegador...")
+        from actions.instagram_mcp import stop_daemon, kill_browser_processes
+        stop_daemon()
+        kill_browser_processes()
+        username = self._ig_username.text().strip()
+        self._ig_browser_worker = self.IGBrowserLoginWorker(username)
+        self._ig_browser_worker.finished_success.connect(self._ig_browser_success)
+        self._ig_browser_worker.finished_error.connect(self._ig_browser_error)
+        self._ig_browser_worker.start()
+
+    def _ig_browser_success(self, detected_username):
+        self._ig_browser_btn.setEnabled(True)
+        self._ig_browser_btn.setText("🌐 Conectar via Navegador (Recomendado)")
+        if detected_username:
+            self._ig_username.setText(detected_username)
+        self._update_ig_status()
+        from PyQt6.QtWidgets import QMessageBox
+        name_str = f" as @{detected_username}" if detected_username else ""
+        QMessageBox.information(self, "Instagram Conectado", f"Instagram conectado com sucesso via Navegador{name_str}!\n\nO Brahma agora está ativo para notificações de voz de DMs e respostas diretas instantâneas.")
+
+    def _ig_browser_error(self, err_msg):
+        self._ig_browser_btn.setEnabled(True)
+        self._ig_browser_btn.setText("🌐 Conectar via Navegador (Recomendado)")
+        self._update_ig_status()
+        from PyQt6.QtWidgets import QMessageBox
+        QMessageBox.warning(self, "Login pelo Navegador", f"A conexão pelo navegador não foi concluída: {err_msg}")
 
     class IGLoginWorker(__import__('PyQt6').QtCore.QThread):
         finished_success = __import__('PyQt6').QtCore.pyqtSignal()
         finished_error = __import__('PyQt6').QtCore.pyqtSignal(str)
         request_2fa = __import__('PyQt6').QtCore.pyqtSignal()
         request_challenge = __import__('PyQt6').QtCore.pyqtSignal()
-        
+
         def __init__(self, username, password):
             super().__init__()
             self.username = username
             self.password = password
             self.code_event = __import__('threading').Event()
             self.code = None
-            
+
         def run(self):
             try:
                 from instagrapi import Client
                 from instagrapi.exceptions import TwoFactorRequired, ChallengeRequired
+                import json
+                from pathlib import Path
                 cl = Client()
-                try:
-                    cl.login(self.username, self.password)
-                except TwoFactorRequired:
-                    self.request_2fa.emit()
-                    self.code_event.wait()
-                    if not self.code:
-                        raise Exception("2FA code not provided.")
-                    cl.two_factor_login(self.code)
-                except ChallengeRequired:
-                    self.request_challenge.emit()
-                    self.code_event.wait()
-                    if not self.code:
-                        raise Exception("Challenge code not provided.")
-                    cl.challenge_resolve(self.code)
+
+                pwd = (self.password or "").strip()
+                if pwd.startswith("sessionid:") or (len(pwd) > 40 and "%3A" in pwd):
+                    sid = pwd.replace("sessionid:", "").strip()
+                    cl.login_by_sessionid(sid)
+                else:
+                    cl.username = self.username
+                    outcome = cl.bloks_caa_login(self.username, pwd)
+                    raw_str = json.dumps(outcome, default=str)
+
+                    if outcome.get("logged_in"):
+                        cl.login_flow()
+                    elif "login_wrong_password" in raw_str or "Incorrect password" in raw_str or "password you entered is incorrect" in raw_str:
+                        raise Exception("The password you entered is incorrect. Please check your Instagram password, or paste your web browser 'sessionid' cookie.")
+                    elif "checkpoint_required" in raw_str or "challenge_required" in raw_str:
+                        try:
+                            cl.login(self.username, pwd)
+                        except TwoFactorRequired:
+                            self.request_2fa.emit()
+                            self.code_event.wait()
+                            if not self.code:
+                                raise Exception("2FA code not provided.")
+                            cl.two_factor_login(self.code)
+                        except ChallengeRequired:
+                            self.request_challenge.emit()
+                            self.code_event.wait()
+                            if not self.code:
+                                raise Exception("Challenge code not provided.")
+                            cl.challenge_resolve(self.code)
+                    else:
+                        try:
+                            cl.login(self.username, pwd)
+                        except TwoFactorRequired:
+                            self.request_2fa.emit()
+                            self.code_event.wait()
+                            if not self.code:
+                                raise Exception("2FA code not provided.")
+                            cl.two_factor_login(self.code)
+                        except ChallengeRequired:
+                            self.request_challenge.emit()
+                            self.code_event.wait()
+                            if not self.code:
+                                raise Exception("Challenge code not provided.")
+                            cl.challenge_resolve(self.code)
+                        except Exception as e:
+                            err_str = str(e)
+                            if "out of date" in err_str.lower() or "CAA login" in err_str:
+                                raise Exception("Instagram rejected credentials or security check. Please check your username/password or paste your web browser 'sessionid' cookie.")
+                            raise
+
+                Path("config").mkdir(parents=True, exist_ok=True)
                 cl.dump_settings("config/ig_session.json")
-                from actions.instagram_chat import stop_daemon, start_daemon
+                from actions.instagram_mcp import stop_daemon, start_daemon
                 stop_daemon()
                 start_daemon()
                 self.finished_success.emit()
@@ -9648,30 +11410,30 @@ class SystemConnectivityPage(QWidget):
     def _handle_ig_connect(self):
         username = self._ig_username.text().strip()
         password = self._ig_password.text().strip()
-        
+
         from PyQt6.QtWidgets import QMessageBox
         import json
-        
+
         if not username or not password:
-            QMessageBox.warning(self, "Error", "Please enter both username and password.")
+            QMessageBox.warning(self, "Erro", "Por favor, informe o usuário e a senha.")
             return
-            
+
         self._ig_connect_btn.setEnabled(False)
-        self._ig_connect_btn.setText("Connecting...")
-        
+        self._ig_connect_btn.setText("Conectando...")
+
         # Save credentials temporarily
         try:
             with open("config/api_keys.json", "r", encoding="utf-8") as f:
                 d = json.load(f)
         except Exception:
             d = {}
-            
+
         d["instagram_username"] = username
         d["instagram_password"] = password
-        
+
         with open("config/api_keys.json", "w", encoding="utf-8") as f:
             json.dump(d, f, indent=4)
-            
+
         self._ig_worker = self.IGLoginWorker(username, password)
         self._ig_worker.finished_success.connect(self._ig_login_success)
         self._ig_worker.finished_error.connect(self._ig_login_error)
@@ -9681,19 +11443,30 @@ class SystemConnectivityPage(QWidget):
 
     def _ig_login_success(self):
         self._ig_connect_btn.setEnabled(True)
-        self._ig_connect_btn.setText("Connect")
+        self._ig_connect_btn.setText("Conectar (Senha)")
+        self._update_ig_status()
         from PyQt6.QtWidgets import QMessageBox
-        QMessageBox.information(self, "Success", "Instagram login successful and daemon started!")
+        QMessageBox.information(self, "Sucesso", "Login do Instagram bem-sucedido e serviço iniciado!")
 
     def _ig_login_error(self, err_msg):
         self._ig_connect_btn.setEnabled(True)
-        self._ig_connect_btn.setText("Connect")
+        self._ig_connect_btn.setText("Conectar (Senha)")
+        self._update_ig_status()
         from PyQt6.QtWidgets import QMessageBox
-        QMessageBox.critical(self, "Error", f"Instagram login failed: {err_msg}")
+        reply = QMessageBox.question(
+            self,
+            "Login Móvel do Instagram Bloqueado",
+            f"O login direto por senha do Instagram falhou:\n{err_msg}\n\n"
+            "A Meta frequentemente bloqueia logins automatizados por senha de celular.\n"
+            "Deseja conectar com segurança via Navegador em vez disso?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._handle_ig_browser_connect()
 
     def _ig_login_2fa(self):
         from PyQt6.QtWidgets import QInputDialog
-        code, ok = QInputDialog.getText(self, "2-Factor Authentication", "Enter the 6-digit code sent to your device:")
+        code, ok = QInputDialog.getText(self, "Autenticação de 2 Fatores", "Digite o código de 6 dígitos enviado ao seu dispositivo:")
         if ok and code:
             self._ig_worker.code = code
         else:
@@ -9702,15 +11475,240 @@ class SystemConnectivityPage(QWidget):
 
     def _ig_login_challenge(self):
         from PyQt6.QtWidgets import QInputDialog
-        code, ok = QInputDialog.getText(self, "Challenge Required", "Enter the verification code sent to your email/phone:")
+        code, ok = QInputDialog.getText(self, "Desafio Necessário", "Digite o código de verificação enviado ao seu e-mail/celular:")
         if ok and code:
             self._ig_worker.code = code
         else:
             self._ig_worker.code = None
         self._ig_worker.code_event.set()
 
+    def _toggle_ig_password_reveal(self):
+        from PyQt6.QtWidgets import QLineEdit
+        if getattr(self, "_ig_reveal_btn", None) and self._ig_reveal_btn.isChecked():
+            self._ig_password.setEchoMode(QLineEdit.EchoMode.Normal)
+            self._ig_reveal_btn.setText("Ocultar")
+        else:
+            self._ig_password.setEchoMode(QLineEdit.EchoMode.Password)
+            self._ig_reveal_btn.setText("Mostrar")
+
+    def _toggle_gw_password_reveal(self):
+        from PyQt6.QtWidgets import QLineEdit
+        if getattr(self, "_gw_reveal_btn", None) and self._gw_reveal_btn.isChecked():
+            self._gw_password.setEchoMode(QLineEdit.EchoMode.Normal)
+            self._gw_reveal_btn.setText("Ocultar")
+        else:
+            self._gw_password.setEchoMode(QLineEdit.EchoMode.Password)
+            self._gw_reveal_btn.setText("Mostrar")
+
+    def _handle_gw_save(self):
+        email_val = self._gw_email.text().strip()
+        pw_val = self._gw_password.text().strip()
+        from PyQt6.QtWidgets import QMessageBox
+        if not email_val:
+            QMessageBox.warning(self, "E-mail Ausente", "Por favor, informe seu endereço do Gmail.")
+            return
+        try:
+            from actions.google_workspace_mcp import save_stored_gmail_credentials
+            ok = save_stored_gmail_credentials(email_val, pw_val)
+            if ok:
+                try:
+                    from actions.google_workspace_mcp import stop_email_daemon, start_email_daemon
+                    stop_email_daemon()
+                    start_email_daemon()
+                except Exception:
+                    pass
+                self._gw_status_lbl.setText("Status: Credenciais salvas com segurança.")
+                self._gw_status_lbl.setStyleSheet("color: #4caf50;")
+                QMessageBox.information(self, "Salvo", "Credenciais do Google Workspace salvas com sucesso!")
+            else:
+                QMessageBox.critical(self, "Erro", "Falha ao criptografar e salvar as credenciais.")
+        except Exception as e:
+            QMessageBox.critical(self, "Erro", f"Erro ao salvar as credenciais: {e}")
+
+    def _handle_gw_test(self):
+        self._gw_status_lbl.setText("Status: Testando conexão...")
+        self._gw_status_lbl.setStyleSheet(f"color: {C.TEXT_DIM};")
+        email_val = self._gw_email.text().strip()
+        pw_val = self._gw_password.text().strip()
+        if email_val and pw_val:
+            try:
+                from actions.google_workspace_mcp import save_stored_gmail_credentials
+                save_stored_gmail_credentials(email_val, pw_val)
+            except Exception:
+                pass
+
+        from actions.google_workspace_mcp import GmailEngine
+        res = GmailEngine.test_connection()
+        from PyQt6.QtWidgets import QMessageBox
+        if res.get("success"):
+            self._gw_status_lbl.setText(f"Status: {res.get('message')}")
+            self._gw_status_lbl.setStyleSheet("color: #4caf50;")
+            QMessageBox.information(self, "Conexão Bem-sucedida", res.get("message"))
+        else:
+            self._gw_status_lbl.setText(f"Status: {res.get('message')}")
+            self._gw_status_lbl.setStyleSheet("color: #f44336;")
+            QMessageBox.warning(self, "Conexão Falhou", res.get("message"))
+
+    def _handle_gw_oauth(self):
+        from PyQt6.QtWidgets import QFileDialog, QMessageBox
+        path, _ = QFileDialog.getOpenFileName(self, "Select Google Cloud credentials.json", str(Path.home()), "JSON Files (*.json)")
+        if path:
+            try:
+                import shutil
+                shutil.copy2(path, Path("config/google_workspace_credentials.json"))
+                self._gw_status_lbl.setText("Status: credentials.json do OAuth carregado.")
+                self._gw_status_lbl.setStyleSheet("color: #4caf50;")
+                QMessageBox.information(self, "Sucesso", "Credenciais OAuth do Google Cloud carregadas com sucesso!")
+            except Exception as e:
+                QMessageBox.critical(self, "Erro", f"Falha ao carregar as credenciais: {e}")
+
+    def _refresh_hw_vitals(self):
+        try:
+            from actions.system_diagnostics_mcp import get_full_diagnostics
+            d = get_full_diagnostics()
+            cpu_pct = d["cpu"]["usage_percent"]
+            ram_pct = d["ram"]["usage_percent"]
+            bat_pct = d["battery"].get("percent", "--")
+            disp = d["display"].get("brightness_levels", [80])
+            b_val = disp[0] if disp else 80
+            self._hw_vitals_lbl.setText(f"CPU: {cpu_pct}% | RAM: {ram_pct}% | Bateria: {bat_pct}% | Tela: {b_val}%")
+            self._hw_brightness_slider.blockSignals(True)
+            self._hw_brightness_slider.setValue(int(b_val))
+            self._hw_brightness_val_lbl.setText(f"{b_val}%")
+            self._hw_brightness_slider.blockSignals(False)
+            self._hw_output_lbl.setText(f"Sinais vitais atualizados. Tempo ativo: {d['uptime']} ({d['running_processes_count']} processos).")
+        except Exception as e:
+            self._hw_output_lbl.setText(f"Erro ao buscar sinais vitais: {e}")
+
+    def _handle_hw_brightness_slider(self, val):
+        self._hw_brightness_val_lbl.setText(f"{val}%")
+        try:
+            from actions.system_diagnostics_mcp import set_brightness
+            set_brightness(val)
+        except Exception:
+            pass
+
+    def _handle_hw_ram_hogs(self):
+        try:
+            from actions.system_diagnostics_mcp import system_diagnostics
+            res = system_diagnostics({"action": "ram_hogs", "limit": 4})
+            self._hw_output_lbl.setText(res)
+        except Exception as e:
+            self._hw_output_lbl.setText(f"Erro ao escanear consumidores de RAM: {e}")
+
+    def _handle_hw_battery(self):
+        try:
+            from actions.system_diagnostics_mcp import system_diagnostics
+            res = system_diagnostics({"action": "battery"})
+            self._hw_output_lbl.setText(res)
+        except Exception as e:
+            self._hw_output_lbl.setText(f"Erro ao verificar a bateria: {e}")
+
+    def _handle_hw_kill(self):
+        target = self._hw_kill_target.text().strip()
+        if not target:
+            self._hw_output_lbl.setText("Por favor, informe o nome de um aplicativo ou PID para encerrar.")
+            return
+        try:
+            from actions.system_diagnostics_mcp import kill_process
+            res = kill_process(target)
+            msg = res.get("message", "Done.")
+            self._hw_output_lbl.setText(msg)
+            from PyQt6.QtWidgets import QMessageBox
+            if res.get("success"):
+                QMessageBox.information(self, "Processo Encerrado", msg)
+            else:
+                QMessageBox.warning(self, "Gerenciamento de Processos", msg)
+        except Exception as e:
+            self._hw_output_lbl.setText(f"Erro: {e}")
+
+    def _refresh_auto_heal_status(self):
+        try:
+            from core.learned_rules import LearnedRulesEngine
+            rules = LearnedRulesEngine.list_rules()
+            active_count = sum(1 for r in rules if r.get("active", True))
+            self._ah_status_lbl.setText(f"Sentinela: Ativa | Sandbox: Verificado | Regras: {active_count} ativas")
+        except Exception as e:
+            self._ah_status_lbl.setText(f"Status: Erro ao carregar ({e})")
+
+    def _handle_ah_history(self):
+        try:
+            from actions.auto_heal_engine import auto_heal
+            res = auto_heal({"action": "history"})
+            self._ah_output_lbl.setText(res)
+        except Exception as e:
+            self._ah_output_lbl.setText(f"Erro ao ler o histórico de correções: {e}")
+
+    def _handle_ah_rollback(self):
+        try:
+            from PyQt6.QtWidgets import QMessageBox
+            from actions.auto_heal_engine import auto_heal
+            reply = QMessageBox.question(
+                self,
+                "Confirm Rollback",
+                "Are you sure you want to rollback the most recent autonomous patch?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                res = auto_heal({"action": "rollback", "patch_id": "latest"})
+                self._ah_output_lbl.setText(res)
+                self._refresh_auto_heal_status()
+                QMessageBox.information(self, "Resultado da Reversão", res)
+        except Exception as e:
+            self._ah_output_lbl.setText(f"Erro ao executar a reversão: {e}")
+
+    def _handle_ah_rules(self):
+        try:
+            from actions.auto_heal_engine import auto_heal
+            res = auto_heal({"action": "list_rules"})
+            self._ah_output_lbl.setText(res)
+        except Exception as e:
+            self._ah_output_lbl.setText(f"Erro ao ler as regras aprendidas: {e}")
+
+    def _handle_ah_learn_rule(self):
+        txt = self._ah_rule_input.text().strip()
+        if not txt:
+            self._ah_output_lbl.setText("Por favor, informe uma regra ou hábito para ensinar.")
+            return
+        try:
+            from core.learned_rules import LearnedRulesEngine
+            res = LearnedRulesEngine.add_rule(txt, origin="ui_settings")
+            msg = res.get("message", "Rule saved.")
+            self._ah_output_lbl.setText(f"✅ {msg}")
+            self._ah_rule_input.clear()
+            self._refresh_auto_heal_status()
+        except Exception as e:
+            self._ah_output_lbl.setText(f"Erro ao salvar a regra: {e}")
+
+    def _handle_ah_trigger_test_bug(self):
+        try:
+            from actions.test_action import test_action
+            res = test_action({})
+            self._ah_output_lbl.setText(f"✅ A ação de teste foi executada sem erros: {res}\nO código já está saudável!")
+        except Exception as e:
+            import traceback
+            from actions.auto_heal_engine import AutoHealEngine
+            tb = traceback.format_exc()
+            AutoHealEngine.record_last_error(tb)
+            self._ah_output_lbl.setText(
+                f"❌ Simulated bug triggered in test_action.py: {type(e).__name__}: {e}\n"
+                f"Traceback captured in AutoHealEngine! Click 'Fix Captured Bug' or say 'Brahma, fix that bug'."
+            )
+
+    def _handle_ah_fix_captured_bug(self):
+        self._ah_output_lbl.setText("⏳ O Gemini está sintetizando a correção no sandbox de segurança...")
+        from PyQt6.QtWidgets import QApplication
+        QApplication.processEvents()
+        try:
+            from actions.auto_heal_engine import auto_heal
+            res = auto_heal({"action": "heal"})
+            self._ah_output_lbl.setText(f"🛠️ Resultado:\n{res}")
+            self._refresh_auto_heal_status()
+        except Exception as e:
+            self._ah_output_lbl.setText(f"Erro ao reparar o bug: {e}")
+
     def _pick_theme_color(self):
-        color = QColorDialog.getColor(QColor(C.PRI), self, "Select App Theme Color")
+        color = QColorDialog.getColor(QColor(C.PRI), self, "Selecione a Cor do Tema do App")
         if color.isValid():
             self._change_theme(color.name())
 
@@ -9733,7 +11731,7 @@ class SystemConnectivityPage(QWidget):
             print(f"Error saving theme: {e}")
         import subprocess
         import sys
-        QMessageBox.information(self, "Restart Required", "The application will now restart to apply the new theme.")
+        QMessageBox.information(self, "Reinicialização Necessária", "O aplicativo será reiniciado agora para aplicar o novo tema.")
         subprocess.Popen([sys.executable, "main.py"])
         QApplication.quit()
 
@@ -9747,11 +11745,11 @@ class SystemConnectivityPage(QWidget):
         return card
 
     def _build_status_box(self):
-        box = self._card("System Status", "")
+        box = self._card("Status do Sistema", "")
         lay = box.layout()
-        self._sys_online = QLabel("≡ƒƒó System Online")
+        self._sys_online = QLabel("≡ƒƒó Sistema Online")
         self._sys_online.setStyleSheet("color: #35ff75; font-weight: 700;")
-        self._sys_note = QLabel("All systems are operational.")
+        self._sys_note = QLabel("Todos os sistemas estão operacionais.")
         self._sys_note.setStyleSheet(f"color: {C.TEXT_MED};")
         lay.addWidget(self._sys_online)
         lay.addWidget(self._sys_note)
@@ -9771,7 +11769,7 @@ class SystemConnectivityPage(QWidget):
         box = self._card("Quick Actions", "")
         lay = box.layout()
         actions = [
-            ("Restart Brahma Echo", QStyle.StandardPixmap.SP_BrowserReload, self._restart_app),
+            ("Restart ULTRON", QStyle.StandardPixmap.SP_BrowserReload, self._restart_app),
             ("Reload Configuration", QStyle.StandardPixmap.SP_BrowserReload, self._reload_config),
             ("Open Data Folder", QStyle.StandardPixmap.SP_DirOpenIcon, self._open_data_folder),
             ("View Logs", QStyle.StandardPixmap.SP_FileDialogDetailedView, self._view_logs),
@@ -9791,9 +11789,9 @@ class SystemConnectivityPage(QWidget):
         lay = QVBoxLayout(box)
         lay.setContentsMargins(16, 14, 16, 14)
         lay.setSpacing(8)
-        title = QLabel("Security Tip")
+        title = QLabel("Dica de Segurança")
         title.setStyleSheet("color: #ffbf00; font-weight: 700;")
-        body = QLabel('"Never share your API keys with anyone."')
+        body = QLabel('"Nunca compartilhe suas chaves de API com ninguém."')
         body.setWordWrap(True)
         body.setStyleSheet(f"color: {C.TEXT_MED};")
         lay.addWidget(title)
@@ -9824,11 +11822,34 @@ class SystemConnectivityPage(QWidget):
             return self._ctrl()._win._startup_animation_enabled()
         return True
 
+    def _toggle_sound_effects(self, enabled: bool):
+        sound_mgr.enabled = enabled
+        self._set_setting("sound_effects_enabled", enabled)
+        if enabled:
+            sound_mgr.play_listening_start()
+
+    def _on_sfx_volume_changed(self, val: int):
+        sound_mgr.set_volume_percent(val)
+        if hasattr(self, "_sfx_val_lbl"):
+            self._sfx_val_lbl.setText(f"{val}%")
+        self._set_setting("sound_effects_volume", val)
+
     def _set_setting(self, key: str, value):
         if self._ctrl() and hasattr(self._ctrl(), "_win"):
             settings = self._ctrl()._win._load_app_settings()
             settings[key] = value
             self._ctrl()._win._save_app_settings(settings)
+        else:
+            try:
+                data = {}
+                if APP_SETTINGS_FILE.exists():
+                    with open(APP_SETTINGS_FILE, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                data[key] = value
+                with open(APP_SETTINGS_FILE, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=4)
+            except Exception:
+                pass
 
     def _open_api_keys(self):
         if self._ctrl() and hasattr(self._ctrl(), "_win"):
@@ -9853,16 +11874,16 @@ class SystemConnectivityPage(QWidget):
         elif hasattr(ctrl, "_win") and hasattr(ctrl._win, "_show_remote_connect"):
             target = ctrl._win
         if target is not None:
-            self._mobile_connect_btn.setText("Connecting...")
+            self._mobile_connect_btn.setText("Conectando...")
             target._show_remote_connect()
-            QTimer.singleShot(1100, lambda: self._mobile_connect_btn.setText("Connect Device"))
+            QTimer.singleShot(1100, lambda: self._mobile_connect_btn.setText("Conectar Dispositivo"))
 
     def _disconnect_mobile(self):
         if self._ctrl() and hasattr(self._ctrl(), "write_log"):
-            self._ctrl().write_log("SYS: Mobile Connect session closed.")
-        self._mobile_status.setText("Connection Status: Disconnected")
-        self._mobile_phone.setText("Phone Name: Not connected")
-        self._mobile_last.setText("Last Connected: Never")
+            self._ctrl().write_log("SYS: Sessão de Conexão Móvel encerrada.")
+        self._mobile_status.setText("Status da Conexão: Desconectado")
+        self._mobile_phone.setText("Nome do Celular: Não conectado")
+        self._mobile_last.setText("Última Conexão: Nunca")
 
     def _show_qr_code(self):
         ctrl = self._ctrl()
@@ -9901,22 +11922,22 @@ class SystemConnectivityPage(QWidget):
             provider = "OpenRouter"
         self._set_setting("default_ai_provider", provider)
         if self._ctrl() and hasattr(self._ctrl(), "write_log"):
-            self._ctrl().write_log(f"SYS: Default AI provider set to {provider}.")
+            self._ctrl().write_log(f"SYS: Provedor de IA padrão definido para {provider}.")
 
     def _toggle_auto_provider_switch(self, checked: bool):
         self._set_setting("auto_provider_switch", bool(checked))
         if self._ctrl() and hasattr(self._ctrl(), "write_log"):
-            self._ctrl().write_log(f"SYS: Auto provider switch {'enabled' if checked else 'disabled'}.")
+            self._ctrl().write_log(f"SYS: Troca automática de provedor {'ativada' if checked else 'desativada'}.")
 
     def _toggle_attention_message_prompts(self, checked: bool):
         self._set_setting("attention_message_prompts", bool(checked))
         if self._ctrl() and hasattr(self._ctrl(), "write_log"):
-            self._ctrl().write_log(f"SYS: Incoming message prompts {'enabled' if checked else 'disabled'}.")
+            self._ctrl().write_log(f"SYS: Avisos de mensagens recebidas {'ativados' if checked else 'desativados'}.")
 
     def _toggle_attention_call_prompts(self, checked: bool):
         self._set_setting("attention_call_prompts", bool(checked))
         if self._ctrl() and hasattr(self._ctrl(), "write_log"):
-            self._ctrl().write_log(f"SYS: Incoming call prompts {'enabled' if checked else 'disabled'}.")
+            self._ctrl().write_log(f"SYS: Avisos de chamadas recebidas {'ativados' if checked else 'desativados'}.")
 
     def _preview_animation(self):
         self._preview_progress.setValue(0)
@@ -9945,7 +11966,7 @@ class SystemConnectivityPage(QWidget):
             self._ctrl()._win._discord_token_input = self._discord_token
             self._ctrl()._win._discord_channel_input = self._discord_channel
             self._ctrl()._win._save_discord_token()
-            self._discord_status.setText("Bot Status: Saved")
+            self._discord_status.setText("Status do Bot: Salvo")
             self.refresh()
 
     def _test_discord_from_page(self):
@@ -9953,14 +11974,14 @@ class SystemConnectivityPage(QWidget):
         if self._ctrl() and hasattr(self._ctrl(), "_win"):
             self._ctrl()._win._start_discord_bot()
             self._ctrl()._win._stop_discord_bot()
-            self._discord_status.setText("Bot Status: Test sent")
-            self._discord_msg.setText("Connected as Brahma Echo#9649" if self._discord_token.text().strip() else "Bot Offline")
+            self._discord_status.setText("Status do Bot: Teste enviado")
+            self._discord_msg.setText("Conectado como ULTRON#9649" if self._discord_token.text().strip() else "Bot Offline")
 
     def _restart_discord_from_page(self):
         if self._ctrl() and hasattr(self._ctrl(), "_win"):
             self._ctrl()._win._stop_discord_bot()
             self._ctrl()._win._start_discord_bot()
-            self._discord_status.setText("Bot Status: Restarted")
+            self._discord_status.setText("Status do Bot: Reiniciado")
 
     def _restart_app(self):
         if self._ctrl() and hasattr(self._ctrl(), "_restart_app"):
@@ -10010,8 +12031,8 @@ class SystemConnectivityPage(QWidget):
             if widget is not None:
                 widget.blockSignals(True)
         try:
-            self._gemini_status.setText("Connected" if api.get("gemini_api_key") else "Not connected")
-            self._or_status.setText("Connected" if api.get("openrouter_api_key") else "Not connected")
+            self._gemini_status.setText("Conectado" if api.get("gemini_api_key") else "Não conectado")
+            self._or_status.setText("Conectado" if api.get("openrouter_api_key") else "Não conectado")
             self._gemini_key.setText(self._provider_key_preview(api.get("gemini_api_key", "")))
             self._or_key.setText(self._provider_key_preview(api.get("openrouter_api_key", "")))
             self._default_provider.setCurrentText("Google Gemini" if app.get("default_ai_provider", "Gemini") == "Gemini" else "OpenRouter")
@@ -10043,14 +12064,14 @@ class SystemConnectivityPage(QWidget):
         enabled = bool(discord.get("enabled", False))
         token = (discord.get("bot_token") or "").strip()
         if enabled and token:
-            self._discord_status.setText("Bot Status: Online")
-            self._discord_msg.setText("Connected as Brahma Echo#9649")
+            self._discord_status.setText("Status do Bot: Online")
+            self._discord_msg.setText("Conectado como ULTRON#9649")
         elif token:
-            self._discord_status.setText("Bot Status: Offline")
+            self._discord_status.setText("Status do Bot: Offline")
             self._discord_msg.setText("Bot Offline")
         else:
-            self._discord_status.setText("Bot Status: Offline")
-            self._discord_msg.setText("Token required")
+            self._discord_status.setText("Status do Bot: Offline")
+            self._discord_msg.setText("Token necessário")
         if self._ctrl() and hasattr(self._ctrl(), "_win"):
             self._sys_provider.setText("Gemini" if app.get("default_ai_provider", "Gemini") == "Gemini" else "OpenRouter")
 
@@ -10058,14 +12079,14 @@ class SystemConnectivityPage(QWidget):
         success, path_or_err = self._create_desktop_shortcut_logic()
         if success:
             QMessageBox.information(
-                self, 
-                "Success", 
+                self,
+                "Success",
                 f"Desktop shortcut created successfully at:\n{path_or_err}"
             )
         else:
             QMessageBox.warning(
-                self, 
-                "Error", 
+                self,
+                "Error",
                 f"Failed to create desktop shortcut:\n{path_or_err}"
             )
 
@@ -10075,8 +12096,8 @@ class SystemConnectivityPage(QWidget):
             QMessageBox.information(self, "Success", msg)
         else:
             QMessageBox.warning(
-                self, 
-                "Taskbar Pinning", 
+                self,
+                "Taskbar Pinning",
                 msg
             )
 
@@ -10088,7 +12109,7 @@ class SystemConnectivityPage(QWidget):
             import subprocess
             from pathlib import Path
             import winreg
-            
+
             # Find the correct Desktop folder path using registry (OneDrive safe!)
             try:
                 key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders")
@@ -10097,30 +12118,30 @@ class SystemConnectivityPage(QWidget):
                 desktop_dir = Path(os.path.expandvars(desktop_raw))
             except Exception:
                 desktop_dir = Path(os.path.expanduser("~")) / "Desktop"
-                
+
             desktop_dir.mkdir(parents=True, exist_ok=True)
-            shortcut_path = desktop_dir / "Brahma Echo - Premium.lnk"
-            
+            shortcut_path = desktop_dir / "ULTRON - Premium.lnk"
+
             # Base variables
             base_dir = Path(os.path.abspath("."))
             script_path = base_dir / "main.py"
             icon_path = base_dir / "assets" / "Brahma_Lite_Logo.ico"
-            
+
             python_exe = sys.executable
             if not python_exe:
                 python_exe = shutil.which("pythonw") or shutil.which("python") or "pythonw"
-                
+
             shortcut_target = python_exe
             shortcut_args = f'"{script_path}"'
             if getattr(sys, "frozen", False):
                 shortcut_target = python_exe
                 shortcut_args = ""
-                
+
             powershell_exe = shutil.which("powershell.exe") or "powershell"
-            
+
             def _ps_escape(value: str) -> str:
                 return value.replace("'", "''")
-                
+
             icon_value = str(icon_path) if icon_path.exists() else ""
             ps1_script = "\n".join([
                 "$WshShell = New-Object -ComObject WScript.Shell",
@@ -10129,25 +12150,25 @@ class SystemConnectivityPage(QWidget):
                 f"$Shortcut.Arguments = '{_ps_escape(shortcut_args)}'",
                 f"$Shortcut.WorkingDirectory = '{_ps_escape(str(base_dir))}'",
                 "$Shortcut.WindowStyle = 7",
-                "$Shortcut.Description = 'Launch Brahma Echo - Premium'",
+                "$Shortcut.Description = 'Launch ULTRON - Premium'",
                 f"if ('{_ps_escape(icon_value)}') {{ $Shortcut.IconLocation = '{_ps_escape(icon_value)},0' }}",
                 "$Shortcut.Save()",
             ])
-            
+
             ps1_path = base_dir / "config" / "create_desktop_shortcut.ps1"
             ps1_path.write_text(ps1_script, encoding="utf-8")
-            
+
             subprocess.run(
                 [powershell_exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ps1_path)],
                 check=True,
                 capture_output=True,
                 text=True,
             )
-            
+
             # Write marker file
             marker_path = base_dir / "config" / ".desktop_shortcut_created"
             marker_path.write_text("created", encoding="utf-8")
-            
+
             return True, str(shortcut_path)
         except Exception as e:
             return False, str(e)
@@ -10159,22 +12180,22 @@ class SystemConnectivityPage(QWidget):
             import shutil
             import subprocess
             from pathlib import Path
-            
+
             # Ensure desktop shortcut exists first
             success, path_or_err = self._create_desktop_shortcut_logic()
             if not success:
                 return False, f"Failed to create desktop shortcut first: {path_or_err}"
-                
+
             shortcut_path = Path(path_or_err)
             if not shortcut_path.exists():
                 return False, "Shortcut file does not exist."
-                
+
             powershell_exe = shutil.which("powershell.exe") or "powershell"
-            
+
             # COM pin script
             def _ps_escape(value: str) -> str:
                 return value.replace("'", "''")
-                
+
             pin_script = "\n".join([
                 "$Shell = New-Object -ComObject Shell.Application",
                 f"$Folder = $Shell.NameSpace('{_ps_escape(str(shortcut_path.parent))}')",
@@ -10182,16 +12203,16 @@ class SystemConnectivityPage(QWidget):
                 "$Verb = $Item.Verbs() | Where-Object { $_.Name.Replace('&', '') -match 'Pin to taskbar' }",
                 "if ($Verb) { $Verb.DoIt(); exit 0 } else { exit 1 }"
             ])
-            
+
             res = subprocess.run(
                 [powershell_exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", pin_script],
                 capture_output=True
             )
-            
+
             if res.returncode == 0:
-                return True, "Brahma Echo has been pinned to your Taskbar!"
+                return True, "ULTRON has been pinned to your Taskbar!"
             else:
-                return False, "Windows restricts programmatic taskbar pinning. Please right-click the 'Brahma Echo - Premium.lnk' shortcut on your Desktop and select 'Pin to taskbar', or drag it directly onto your taskbar."
+                return False, "Windows restricts programmatic taskbar pinning. Please right-click the 'ULTRON - Premium.lnk' shortcut on your Desktop and select 'Pin to taskbar', or drag it directly onto your taskbar."
         except Exception as e:
             return False, f"Error pinning to taskbar: {e}"
 
@@ -10225,17 +12246,17 @@ class SmartDevicesSection(QFrame):
         header.setSpacing(8)
         title_box = QVBoxLayout()
         title_box.setSpacing(1)
-        self._title_lbl = QLabel("SMART DEVICES")
+        self._title_lbl = QLabel("DISPOSITIVOS INTELIGENTES")
         self._title_lbl.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
         self._title_lbl.setStyleSheet(f"color: {C.WHITE}; letter-spacing: 1px;")
-        self._subtitle_lbl = QLabel("Quick access to your connected home devices.")
+        self._subtitle_lbl = QLabel("Acesso rápido aos seus dispositivos de casa conectados.")
         self._subtitle_lbl.setFont(QFont("Segoe UI", 8))
         self._subtitle_lbl.setStyleSheet(f"color: {C.TEXT_DIM};")
         title_box.addWidget(self._title_lbl)
         title_box.addWidget(self._subtitle_lbl)
         header.addLayout(title_box, 1)
 
-        self._count_chip = QLabel("0 devices")
+        self._count_chip = QLabel("0 dispositivos")
         self._count_chip.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._count_chip.setStyleSheet(
             f"QLabel {{ background: rgba(255,255,255,0.03); color: {C.PRI}; border: 1px solid rgba(255,255,255,0.07); border-radius: 10px; padding: 4px 10px; }}"
@@ -10260,7 +12281,7 @@ class SmartDevicesSection(QFrame):
         self._refresh_btn.clicked.connect(lambda: self.refresh(force=True))
         header.addWidget(self._refresh_btn)
 
-        self._open_home_btn = QPushButton("Add Device")
+        self._open_home_btn = QPushButton("Adicionar Dispositivo")
         self._open_home_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._open_home_btn.setStyleSheet(f"""
             QPushButton {{
@@ -10284,16 +12305,16 @@ class SmartDevicesSection(QFrame):
         empty_lay = QVBoxLayout(self._empty_card)
         empty_lay.setContentsMargins(6, 4, 6, 4)
         empty_lay.setSpacing(6)
-        empty_title = QLabel("No Smart Devices Connected")
+        empty_title = QLabel("Nenhum Dispositivo Inteligente Conectado")
         empty_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         empty_title.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
         empty_title.setStyleSheet(f"color: {C.WHITE}; border: none;")
-        empty_desc = QLabel("Connect your first smart device to control it directly from your dashboard.")
+        empty_desc = QLabel("Conecte seu primeiro dispositivo inteligente para controlá-lo diretamente pelo seu painel.")
         empty_desc.setWordWrap(True)
         empty_desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
         empty_desc.setFont(QFont("Segoe UI", 8))
         empty_desc.setStyleSheet(f"color: {C.TEXT_DIM};")
-        empty_btn = QPushButton("Open Brahma Echo Home")
+        empty_btn = QPushButton("Abrir ULTRON Home")
         empty_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         empty_btn.setFixedWidth(160)
         empty_btn.setStyleSheet(f"""
@@ -10377,7 +12398,7 @@ class SmartDevicesSection(QFrame):
 
         panel_top = QHBoxLayout()
         panel_top.setSpacing(6)
-        self._panel_name = QLabel("Device")
+        self._panel_name = QLabel("Dispositivo")
         self._panel_name.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
         self._panel_name.setStyleSheet(f"color: {C.WHITE};")
         panel_top.addWidget(self._panel_name, 1)
@@ -10445,7 +12466,7 @@ class SmartDevicesSection(QFrame):
         if not force and snapshot == self._snapshot:
             return
         self._snapshot = snapshot
-        self._count_chip.setText(f"{len(devices)} device(s)")
+        self._count_chip.setText(f"{len(devices)} dispositivo(s)")
         self._empty_card.setVisible(not devices)
         self._scroll.setVisible(bool(devices))
         self._rebuild_device_cards(devices)
@@ -10592,18 +12613,18 @@ class SmartDevicesSection(QFrame):
             self._panel_meta.setText(
                 f"Room: {room or 'Unassigned'}\nType: {device_type.title()}\nManufacturer: {device.get('manufacturer', '')}\nConnection: Connected"
             )
-            self._panel_status.setText("ON" if is_on else "OFF")
-            self._panel_hint.setText("Click outside the panel to close.")
+            self._panel_status.setText("LIGADO" if is_on else "DESLIGADO")
+            self._panel_hint.setText("Clique fora do painel para fechar.")
 
-            power_btn = QPushButton("Power")
+            power_btn = QPushButton("Ligar/Desligar")
             power_btn.clicked.connect(lambda: self._apply_tile_action(str(device.get("id", "")), "power", {"is_on": not is_on}))
             self._panel_actions.addWidget(power_btn)
 
-            forget_btn = QPushButton("Forget")
+            forget_btn = QPushButton("Esquecer")
             forget_btn.clicked.connect(lambda: self._forget_device(str(device.get("id", ""))))
             self._panel_actions.addWidget(forget_btn)
 
-            rename_btn = QPushButton("Rename")
+            rename_btn = QPushButton("Renomear")
             rename_btn.clicked.connect(lambda: self._rename_device(str(device.get("id", "")), name))
             self._panel_actions.addWidget(rename_btn)
 
@@ -10619,7 +12640,7 @@ class SmartDevicesSection(QFrame):
                 self._panel_controls.addWidget(slider)
             elif device_type == "light":
                 brightness = int(traits.get("brightness", 75) or 75)
-                lbl = QLabel(f"Brightness {brightness}%")
+                lbl = QLabel(f"Brilho {brightness}%")
                 lbl.setStyleSheet(f"color: {C.TEXT_MED};")
                 self._panel_controls.addWidget(lbl)
                 slider = QSlider(Qt.Orientation.Horizontal)
@@ -10627,7 +12648,7 @@ class SmartDevicesSection(QFrame):
                 slider.setValue(brightness)
                 slider.valueChanged.connect(lambda value: self._apply_tile_action(str(device.get("id", "")), "brightness", {"brightness": value}))
                 self._panel_controls.addWidget(slider)
-                color_btn = QPushButton("Color")
+                color_btn = QPushButton("Cor")
                 color_btn.clicked.connect(lambda: self._pick_color(device))
                 self._panel_controls.addWidget(color_btn)
             elif device_type == "ac":
@@ -10656,7 +12677,7 @@ class SmartDevicesSection(QFrame):
                 lbl.setStyleSheet(f"color: {C.TEXT_MED};")
                 self._panel_controls.addWidget(lbl)
             else:
-                lbl = QLabel("Primary controls are available from the card below.")
+                lbl = QLabel("Os controles principais estão disponíveis no cartão abaixo.")
                 lbl.setWordWrap(True)
                 lbl.setStyleSheet(f"color: {C.TEXT_MED};")
                 self._panel_controls.addWidget(lbl)
@@ -10669,7 +12690,7 @@ class SmartDevicesSection(QFrame):
             self._apply_tile_action(str(device.get("id", "")), "color", {"color": color.name()})
 
     def _rename_device(self, device_id: str, current_name: str):
-        new_name, ok = QInputDialog.getText(self, "Rename Device", "New name:", text=current_name)
+        new_name, ok = QInputDialog.getText(self, "Renomear Dispositivo", "Novo nome:", text=current_name)
         if ok and new_name.strip():
             try:
                 self._service.rename_device(device_id, new_name.strip())
@@ -10700,716 +12721,6 @@ class SmartDevicesSection(QFrame):
         x = max(12, self.width() - panel_w - 12)
         y = 12
         self._panel.setGeometry(x, y, panel_w, panel_h)
-
-class _RootShim:
-    def __init__(self, app: QApplication):
-        self._app = app
-    def mainloop(self):
-        self._app.exec()
-    def protocol(self, *_):
-        pass
-
-
-class BrahmaUI:
-    def __init__(self, face_path: str, size=None, *, show_immediately: bool = True):
-        self._app = QApplication.instance() or QApplication(sys.argv)
-        self._app.setStyle("Fusion")
-        self._app.setQuitOnLastWindowClosed(False)
-        self._app.setApplicationDisplayName("Brahma Echo")
-        self._app.setWindowIcon(self._make_app_icon())
-        try:
-            current_store = workspace_store()
-            current_store.rollover_active_conversation_on_startup()
-        except Exception:
-            pass
-        self._win = MainWindow(face_path)
-        try:
-            self._win._startup_enabled()
-        except Exception:
-            pass
-        self._win.set_settings_bridge(self)
-        self._discord_service = DiscordBotService(
-            status_callback=self._win.discord_status_changed.emit,
-            log_callback=self._win._log_sig.emit,
-        )
-        self._discord_service.bind_app_submitter(self._win.submit_command)
-        self._win.discord_config_changed.connect(self._on_discord_config_changed)
-        self._win.on_chat_event = self._on_chat_event
-        self._app.aboutToQuit.connect(self._discord_service.stop)
-        self._launcher = FloatingLauncher()
-        self._command_bar = CommandBar()
-        self._workspace_sidebar = WorkspaceSidebar()
-        self._control_panel: LauncherControlPanel | None = None
-        self._boot_overlay: BootSequenceOverlay | None = None
-        self._app_settings_cache: dict | None = None
-        self._launcher.single_clicked.connect(self._toggle_command_bar)
-        self._launcher.double_clicked.connect(self._show_control_panel)
-        self._launcher.action_requested.connect(self._handle_launcher_action)
-        self._launcher.position_changed.connect(self._save_launcher_position)
-        self._command_bar.submitted.connect(self._submit_command)
-        self._command_bar.attach_clicked.connect(self._browse_attachment)
-        self._command_bar.mic_clicked.connect(self._toggle_mute)
-        self._command_bar.developer_clicked.connect(self._open_developer_mode_dialog)
-        self._workspace_sidebar.command_submitted.connect(self._submit_command)
-        self._workspace_sidebar.attach_requested.connect(self._browse_attachment)
-        self._workspace_sidebar.mic_requested.connect(self._toggle_mute)
-        self._workspace_sidebar.close_requested.connect(self._close_workspace_sidebar)
-        self._win.minimized.connect(self._on_minimized)
-        self._win._state_sig.connect(self._sync_launcher_state)
-        self._tray = QSystemTrayIcon(self._make_app_icon(), self._app)
-        self._tray.setToolTip("Brahma Echo")
-        self._tray.activated.connect(self._on_tray_activated)
-        self._tray.setContextMenu(self._build_tray_menu())
-        self._tray.show()
-        self._win._log_sig.connect(self._workspace_sidebar.append_log)
-        self._win._task_workspace_sig.connect(self._workspace_sidebar.apply_task_workspace)
-        # Some window layouts intentionally omit the inline chat workspace.  It is
-        # optional, so do not let its absence prevent the application from starting.
-        inline_workspace = getattr(self._win, "_inline_workspace", None)
-        if inline_workspace is not None:
-            self._win._task_workspace_sig.connect(inline_workspace.apply_task_workspace)
-        self._on_discord_config_changed(self._win._load_discord_settings())
-        launcher_pos = self._load_app_settings().get("launcher_pos")
-        if isinstance(launcher_pos, (list, tuple)) and len(launcher_pos) == 2:
-            try:
-                self._launcher.show_at(int(launcher_pos[0]), int(launcher_pos[1]))
-            except Exception:
-                self._launcher.show_at()
-        else:
-            self._launcher.show_at()
-        if bool(self._load_app_settings().get("show_workspace_on_startup", False)):
-            self._workspace_sidebar.show_workspace(animate=False)
-        else:
-            self._workspace_sidebar.hide_workspace(animate=False)
-        self.set_dashboard_page(getattr(self._win, "_current_page", "dashboard") == "dashboard")
-        self._apply_developer_mode_ui()
-        if show_immediately:
-            self.show_main()
-        self.root = _RootShim(self._app)
-
-    def _make_app_icon(self) -> QIcon:
-        return _logo_icon()
-
-    def set_brahma_connect_service(self, service):
-        self._win.set_brahma_connect_service(service)
-
-
-    
-
-    def show_main(self):
-        try:
-            self._win.showNormal()
-        except Exception:
-            self._win.show()
-        self._win.raise_()
-        self._win.activateWindow()
-        if self._launcher.isVisible():
-            try:
-                self._launcher.raise_()
-                self._launcher.activateWindow()
-            except Exception:
-                pass
-
-    def set_dashboard_page(self, enabled: bool):
-        try:
-            if enabled:
-                if not self._launcher.isVisible():
-                    self._show_floating_icon()
-            else:
-                self._command_bar.hide()
-                self._workspace_sidebar.hide_workspace(animate=False)
-                self._launcher.hide()
-        except Exception:
-            pass
-
-    def hide_main(self):
-        self._command_bar.hide()
-        self._launcher.hide()
-        self._win.hide()
-
-    def _load_app_settings(self) -> dict:
-        if self._app_settings_cache is not None:
-            return dict(self._app_settings_cache)
-        settings = _default_app_settings()
-        if APP_SETTINGS_FILE.exists():
-            try:
-                data = json.loads(APP_SETTINGS_FILE.read_text(encoding="utf-8"))
-                if isinstance(data, dict):
-                    settings.update(data)
-            except Exception:
-                pass
-        self._app_settings_cache = dict(settings)
-        return dict(settings)
-
-    def _save_app_settings(self, settings: dict):
-        os.makedirs(CONFIG_DIR, exist_ok=True)
-        APP_SETTINGS_FILE.write_text(json.dumps(settings, indent=4), encoding="utf-8")
-        self._app_settings_cache = dict(settings)
-
-    def _save_launcher_position(self, x: int, y: int):
-        try:
-            settings = self._load_app_settings()
-            settings["launcher_pos"] = [int(x), int(y)]
-            self._save_app_settings(settings)
-        except Exception:
-            pass
-
-    def _open_developer_mode_dialog(self):
-        try:
-            dialog = DeveloperModeDialog(self._win, settings=self._load_app_settings())
-            if dialog.exec() == QDialog.DialogCode.Accepted:
-                settings = dialog.get_settings()
-                self._save_app_settings(settings)
-                self._apply_developer_mode_ui()
-        except Exception:
-            pass
-
-    def _apply_developer_mode_ui(self):
-        try:
-            settings = self._load_app_settings()
-            enabled = bool(settings.get("developer_mode_enabled", False))
-            workspace = str(settings.get("developer_mode_workspace", "")).strip()
-            if hasattr(self._win, "_developer_card") and hasattr(self._win, "_developer_status_lbl"):
-                if enabled:
-                    workspace_text = workspace or "No folder selected"
-                    self._win._developer_status_lbl.setText(
-                        f"Developer mode is on ΓÇó {workspace_text}"
-                    )
-                    self._win._developer_card.show()
-                    self._win._developer_card.raise_()
-                else:
-                    self._win._developer_card.hide()
-        except Exception:
-            pass
-
-    def _sync_launcher_state(self, state: str):
-        state = (state or "idle").strip().lower()
-        detail = {
-            "listening": "Ready",
-            "thinking": "Thinking...",
-            "processing": "Executing task...",
-            "speaking": "Speaking",
-            "muted": "Muted",
-        }.get(state, "Ready")
-        try:
-            self._launcher.set_state(state, detail)
-        except Exception:
-            pass
-
-    def _load_discord_settings(self) -> dict:
-        settings = _default_discord_settings()
-        if DISCORD_SETTINGS_FILE.exists():
-            try:
-                data = json.loads(DISCORD_SETTINGS_FILE.read_text(encoding="utf-8"))
-                if isinstance(data, dict):
-                    settings.update(data)
-            except Exception:
-                pass
-        if (settings.get("bot_token") or "").strip():
-            settings["enabled"] = True
-        return dict(settings)
-
-    def _save_discord_settings(self, settings: dict):
-        os.makedirs(CONFIG_DIR, exist_ok=True)
-        DISCORD_SETTINGS_FILE.write_text(json.dumps(settings, indent=4), encoding="utf-8")
-
-    def _emit_discord_settings(self):
-        if not hasattr(self, "_discord_token_input"):
-            return
-        settings = {
-            "bot_token": self._discord_token_input.text().strip(),
-            "enabled": bool(getattr(self, "_discord_enabled", False)),
-            "channel_id": self._discord_channel_input.text().strip() if hasattr(self, "_discord_channel_input") else "",
-        }
-        self._save_discord_settings(settings)
-        self.discord_config_changed.emit(dict(settings))
-        self._refresh_discord_card()
-
-    def _refresh_discord_card(self, note: str = ""):
-        if not hasattr(self, "_discord_status_lbl"):
-            return
-        token = self._discord_token_input.text().strip() if hasattr(self, "_discord_token_input") else ""
-        enabled = bool(getattr(self, "_discord_enabled", False))
-        if note:
-            status = note
-            color = C.PRI if "error" in note.lower() or "missing" in note.lower() else C.TEXT_MED
-        elif not token:
-            status = "Token required"
-            color = C.PRI
-        elif enabled:
-            status = "Bot enabled"
-            color = C.GREEN
-        else:
-            status = "Bot disabled"
-            color = C.TEXT_MED
-        self._discord_status_lbl.setText(status)
-        self._discord_status_lbl.setStyleSheet(f"color: {color}; background: transparent;")
-        if hasattr(self, "_discord_start_btn"):
-            self._discord_start_btn.setEnabled(True)
-        if hasattr(self, "_discord_stop_btn"):
-            self._discord_stop_btn.setEnabled(True)
-        if hasattr(self, "_discord_save_btn"):
-            self._discord_save_btn.setText("Save Settings")
-
-    def _startup_animation_enabled(self) -> bool:
-        if platform.system() != "Windows":
-            return False
-        return bool(self._load_app_settings().get("startup_animation_enabled", True))
-
-    def _set_startup_animation_enabled(self, enabled: bool) -> bool:
-        try:
-            settings = self._load_app_settings()
-            settings["startup_animation_enabled"] = bool(enabled)
-            settings["last_boot_stamp"] = _current_boot_stamp()
-            self._save_app_settings(settings)
-            return True
-        except Exception as e:
-            self._log.append_log(f"ERR: startup animation setting failed: {e}")
-            return False
-
-    def _refresh_startup_animation_button(self):
-        if not hasattr(self, "_startup_anim_btn"):
-            return
-        if platform.system() != "Windows":
-            self._startup_anim_btn.setText("Startup Animation (Windows only)")
-            self._startup_anim_btn.setEnabled(False)
-            return
-        if self._startup_animation_enabled():
-            self._startup_anim_btn.setText("Disable Startup Animation")
-        else:
-            self._startup_anim_btn.setText("Enable Startup Animation")
-
-    def _toggle_startup_animation(self):
-        if platform.system() != "Windows":
-            return
-        enabled = not self._startup_animation_enabled()
-        if self._set_startup_animation_enabled(enabled):
-            self._refresh_startup_animation_button()
-            state = "enabled" if enabled else "disabled"
-            self._log.append_log(f"SYS: Startup animation {state}.")
-
-    def _should_play_boot_sequence(self) -> bool:
-        return True
-
-    def _mark_boot_sequence_played(self):
-        try:
-            settings = self._load_app_settings()
-            settings["last_boot_stamp"] = _current_boot_stamp()
-            settings["boot_sequence_played"] = True
-            self._save_app_settings(settings)
-        except Exception:
-            pass
-
-    def play_boot_sequence(self, finished_callback=None):
-        if self._boot_overlay is not None:
-            try:
-                self._boot_overlay.deleteLater()
-            except Exception:
-                pass
-            self._boot_overlay = None
-        self.hide_main()
-        overlay = BootSequenceOverlay()
-        self._boot_overlay = overlay
-
-        device_name = platform.node() or os.environ.get("COMPUTERNAME") or "DEVICE"
-
-        def _done():
-            self._mark_boot_sequence_played()
-            try:
-                self.show_main()
-            finally:
-                if self._boot_overlay is not None:
-                    try:
-                        self._boot_overlay.deleteLater()
-                    except Exception:
-                        pass
-                    self._boot_overlay = None
-                if finished_callback:
-                    finished_callback()
-
-        overlay.finished.connect(_done)
-        overlay.start(device_name=device_name, greeting_name="Suryaansh")
-
-    # Thread-safe helpers for driving the boot overlay from background threads
-    def boot_add_step(self, text: str):
-        try:
-            if not self._boot_overlay:
-                return None
-            QTimer.singleShot(0, lambda: self._boot_overlay.add_step(text))
-        except Exception:
-            pass
-
-    def boot_set_step_status(self, text: str, status: str):
-        try:
-            if not self._boot_overlay:
-                return
-            QTimer.singleShot(0, lambda: self._boot_overlay.set_step_status(text, status))
-        except Exception:
-            pass
-
-    def boot_set_progress(self, percent: int, tip: str | None = None):
-        try:
-            if not self._boot_overlay:
-                return
-            QTimer.singleShot(0, lambda: self._boot_overlay.set_progress(percent, tip))
-        except Exception:
-            pass
-
-    def _build_tray_menu(self) -> QMenu:
-        menu = QMenu()
-        menu.setStyleSheet(f"""
-            QMenu {{
-                background: rgba(8, 8, 8, 245);
-                color: {C.WHITE};
-                border: 1px solid {C.BORDER_B};
-                border-radius: 10px;
-                padding: 6px;
-            }}
-            QMenu::item {{
-                padding: 8px 18px;
-                border-radius: 6px;
-            }}
-            QMenu::item:selected {{
-                background: rgba(255,255,255,0.08);
-            }}
-        """)
-
-        open_app_action = menu.addAction("Open App")
-        open_action = menu.addAction("Open Workspace")
-        close_action = menu.addAction("Close Workspace")
-        startup_action = menu.addAction("Show Workspace On Startup")
-        startup_action.setCheckable(True)
-        startup_action.setChecked(bool(self._load_app_settings().get("show_workspace_on_startup", False)))
-        show_icon_action = menu.addAction("Show Floating Icon")
-        hide_icon_action = menu.addAction("Hide Floating Icon")
-        menu.addSeparator()
-        restart_action = menu.addAction("Restart")
-        quit_action = menu.addAction("Quit")
-
-        open_app_action.triggered.connect(self.show_main)
-        open_action.triggered.connect(self._show_workspace_sidebar)
-        close_action.triggered.connect(self._close_workspace_sidebar)
-        startup_action.triggered.connect(lambda: self._toggle_workspace_on_startup(startup_action.isChecked()))
-        show_icon_action.triggered.connect(self._show_floating_icon)
-        hide_icon_action.triggered.connect(self._hide_launcher_with_protection)
-        restart_action.triggered.connect(self._restart_app)
-        quit_action.triggered.connect(self._app.quit)
-        return menu
-
-    def _on_tray_activated(self, reason):
-        if reason == QSystemTrayIcon.ActivationReason.Trigger:
-            self._toggle_command_bar()
-        elif reason == QSystemTrayIcon.ActivationReason.DoubleClick:
-            self._show_control_panel()
-
-    def _on_minimized(self):
-        if self._launcher.isVisible():
-            self._launcher.raise_()
-        self._command_bar.hide()
-
-    def _toggle_command_bar(self):
-        if self._command_bar.isVisible():
-            self._command_bar.hide()
-        else:
-            self._command_bar.show_near(self._launcher)
-
-    def _toggle_workspace_sidebar(self):
-        if self._workspace_sidebar.isVisible():
-            self._close_workspace_sidebar()
-        else:
-            self._show_workspace_sidebar()
-
-    def _show_workspace_sidebar(self):
-        self._workspace_sidebar.show_workspace()
-        self._launcher.hide()
-
-    def _close_workspace_sidebar(self):
-        self._workspace_sidebar.hide_workspace()
-        self._show_floating_icon()
-
-    def _show_floating_icon(self):
-        launcher_pos = self._load_app_settings().get("launcher_pos")
-        if isinstance(launcher_pos, (list, tuple)) and len(launcher_pos) == 2:
-            try:
-                self._launcher.show_at(int(launcher_pos[0]), int(launcher_pos[1]))
-                return
-            except Exception:
-                pass
-        self._launcher.show_at()
-
-    def _restart_app(self):
-        try:
-            args = _hidden_launch_args("--startup" if _launched_from_windows_startup() else "")
-            args = [arg for arg in args if arg]
-            kwargs = {"cwd": str(BASE_DIR)}
-            if _OS == "Windows":
-                kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            subprocess.Popen(args, **kwargs)
-        except Exception as exc:
-            self._win.write_log(f"ERR: Restart failed: {exc}")
-        self._app.quit()
-
-    def _toggle_workspace_on_startup(self, enabled: bool):
-        try:
-            settings = self._load_app_settings()
-            settings["show_workspace_on_startup"] = bool(enabled)
-            self._save_app_settings(settings)
-        except Exception:
-            pass
-
-    def _hide_launcher_with_protection(self):
-        self._show_hide_launcher_confirm()
-
-    def _show_hide_launcher_confirm(self):
-        panel = LauncherControlPanel(
-            startup_workspace=bool(self._load_app_settings().get("show_workspace_on_startup", False)),
-            on_open=self._show_workspace_sidebar,
-            on_close=self._close_workspace_sidebar,
-            on_toggle_startup=self._toggle_workspace_on_startup,
-            on_hide_icon=self._launcher.hide,
-            on_restart=self._restart_app,
-            on_quit=self._app.quit,
-            on_open_app=self.show_main,
-            on_show_icon=self._show_floating_icon,
-            on_open_dev=self._open_developer_mode_dialog,
-        )
-        self._control_panel = panel
-        self._position_control_panel(panel)
-        panel.show()
-        panel.raise_()
-        panel.activateWindow()
-
-    def _position_control_panel(self, panel: LauncherControlPanel):
-        try:
-            geo = self._launcher.geometry()
-            panel.adjustSize()
-            panel.move(max(20, geo.left() - panel.width() - 16), max(20, geo.top() - 10))
-        except Exception:
-            screen = QApplication.primaryScreen().availableGeometry()
-            panel.move(screen.center().x() - panel.width() // 2, screen.center().y() - panel.height() // 2)
-
-    def _show_control_panel(self):
-        self._show_hide_launcher_confirm()
-
-    def _handle_launcher_action(self, action: str):
-        action = (action or "").strip().lower()
-        if action == "open_app":
-            self.show_main()
-        elif action == "open_workspace":
-            self._show_workspace_sidebar()
-        elif action == "close_workspace":
-            self._close_workspace_sidebar()
-        elif action == "show_icon":
-            self._show_floating_icon()
-        elif action == "hide_icon":
-            self._hide_launcher_with_protection()
-        elif action == "restart":
-            self._restart_app()
-        elif action == "quit":
-            self._app.quit()
-        elif action == "toggle_startup":
-            current = bool(self._load_app_settings().get("show_workspace_on_startup", False))
-            self._toggle_workspace_on_startup(not current)
-
-    def _submit_command(self, text: str):
-        self._win.submit_command(text)
-
-    def _browse_attachment(self):
-        self._win._browse_attachment()
-
-    def _toggle_mute(self):
-        self._win._toggle_mute()
-
-    def _on_chat_event(self, event: dict):
-        try:
-            self._discord_service.mirror_chat_event(event or {})
-        except Exception:
-            pass
-        try:
-            self._workspace_sidebar.record_chat_event(event or {})
-        except Exception:
-            pass
-        try:
-            self._win._inline_workspace.record_chat_event(event or {})
-        except Exception:
-            pass
-
-    def _on_discord_config_changed(self, settings: dict):
-        settings = settings or {}
-        enabled = bool(settings.get("enabled", False) or (settings.get("bot_token") or "").strip())
-        token = (settings.get("bot_token") or "").strip()
-        channel_id = (settings.get("channel_id") or "").strip()
-        self._discord_service.set_target_channel_id(channel_id)
-        if not enabled or not token:
-            self._discord_service.stop()
-            if not token:
-                self._win.discord_status_changed.emit("Token required")
-            else:
-                self._win.discord_status_changed.emit("Discord bot disabled")
-            return
-        try:
-            self._discord_service.start(token)
-        except Exception as exc:
-            msg = f"Discord error: {exc}"
-            self._win.discord_status_changed.emit(msg)
-            self._win._log_sig.emit(f"ERR: {msg}")
-
-    def _open_app(self):
-        self._command_bar.hide()
-        self._launcher.show_at()
-        self._win.show_app()
-
-    @property
-    def muted(self) -> bool:
-        return self._win._muted
-
-    @muted.setter
-    def muted(self, v: bool):
-        if v != self._win._muted:
-            self._win._toggle_mute()
-
-    def set_muted(self, muted: bool):
-        if bool(muted) != self._win._muted:
-            self._win.set_muted_state(bool(muted))
-
-    def set_muted_state(self, muted: bool, *, wakeword: bool = False):
-        self._win.set_muted_state(bool(muted), wakeword=wakeword)
-
-    @property
-    def current_file(self) -> str | None:
-        return self._win._current_file
-
-    @property
-    def on_text_command(self):
-        return self._win.on_text_command
-
-    @on_text_command.setter
-    def on_text_command(self, cb):
-        self._win.on_text_command = cb
-
-    @property
-    def on_remote_clicked(self):
-        return self._win.on_remote_clicked
-
-    @on_remote_clicked.setter
-    def on_remote_clicked(self, cb):
-        self._win.on_remote_clicked = cb
-
-    @property
-    def on_attention_action(self):
-        return self._win.on_attention_action
-
-    @on_attention_action.setter
-    def on_attention_action(self, cb):
-        self._win.on_attention_action = cb
-
-    @property
-    def on_chat_event(self):
-        return self._win.on_chat_event
-
-    @on_chat_event.setter
-    def on_chat_event(self, cb):
-        self._win.on_chat_event = cb
-
-    def set_state(self, state: str):
-        self._win._state_sig.emit(state)
-
-    def write_log(self, text: str):
-        self._win._log_sig.emit(text)
-
-    def show_daily_briefing(self, text: str):
-        self._win.show_daily_briefing(text)
-
-    def hide_daily_briefing(self):
-        self._win.hide_daily_briefing()
-
-    def schedule_daily_briefing_hide(self):
-        self._win.schedule_daily_briefing_hide()
-
-    def submit_external_command(self, text: str, source: str = "discord"):
-        self._win.submit_command(text, source=source)
-
-    def notify_phone_connected(self):
-        self._win.notify_phone_connected()
-
-    def set_scanning(self, enabled: bool, text: str = ""):
-        self._win.set_scanning(enabled, text)
-
-    def show_attention_alert(self, event: dict):
-        self._win._attention_sig.emit(event or {})
-
-    def set_meeting_mode(self, enabled: bool, title: str = "", summary: str = "", answer: str = "", speech: str = ""):
-        self._win.set_meeting_mode(enabled, title, summary, answer, speech)
-
-    def begin_task_workspace(self, command: str, plan: list[str] | str | None = None, source: str = "local"):
-        self._win._task_workspace_sig.emit({
-            "action": "start",
-            "command": command or "",
-            "plan": plan or [],
-            "source": source or "local",
-        })
-
-    def capture_screen_bytes(self) -> bytes:
-        import threading
-        from PyQt6.QtWidgets import QApplication
-        from PyQt6.QtCore import QBuffer, QIODevice, Qt
-
-        if threading.current_thread() == threading.main_thread():
-            screen = QApplication.primaryScreen()
-            if not screen: return b""
-            pixmap = screen.grabWindow(0)
-            pixmap = pixmap.scaled(640, 360, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-            buffer = QBuffer()
-            buffer.open(QIODevice.OpenModeFlag.WriteOnly)
-            pixmap.save(buffer, 'JPG', 55)
-            return buffer.data().data()
-        else:
-            return self._win.capture_screen_threadsafe()
-
-    def update_task_workspace(self, *, title: str | None = None, command: str | None = None, plan: list[str] | str | None = None,
-                              status: str | None = None, output: str | None = None, percent: int | None = None,
-                              footer: str | None = None, source: str | None = None):
-        payload = {"action": "update"}
-        if title is not None:
-            payload["title"] = title
-        if command is not None:
-            payload["command"] = command
-        if plan is not None:
-            payload["plan"] = plan
-        if status is not None:
-            payload["status"] = status
-        if output is not None:
-            payload["output"] = output
-        if percent is not None:
-            payload["percent"] = percent
-        if footer is not None:
-            payload["footer"] = footer
-        if source is not None:
-            payload["source"] = source or "local"
-        self._win._task_workspace_sig.emit(payload)
-
-    def finish_task_workspace(self, result: str, status: str = "Task completed.", percent: int = 100):
-        self._win._task_workspace_sig.emit({
-            "action": "finish",
-            "result": result or "Done.",
-            "status": status or "Task completed.",
-            "percent": percent,
-        })
-
-    def clear_task_workspace(self):
-        self._win._task_workspace_sig.emit({"action": "clear"})
-
-    def wait_for_api_key(self):
-        while not self._win._ready:
-            time.sleep(0.1)
-
-    def start_speaking(self):
-        self.set_state("SPEAKING")
-
-    def stop_speaking(self):
-        if not self.muted:
-            self.set_state("LISTENING")
-
 
 
 
@@ -11471,7 +12782,7 @@ class _ConnectDeviceCard(QFrame):
             info.append(str(device.get("device_type")))
         if device.get("ip"):
             info.append(str(device.get("ip")))
-        self._info_lbl = QLabel(" ┬╖ ".join(info) if info else "Connected device")
+        self._info_lbl = QLabel(" ┬╖ ".join(info) if info else "Dispositivo conectado")
         self._info_lbl.setFont(QFont("Segoe UI", 8))
         self._info_lbl.setStyleSheet("color: rgba(255,255,255,0.45);")
         self._info_lbl.setWordWrap(True)
@@ -11486,10 +12797,10 @@ class _ConnectDeviceCard(QFrame):
         actions_layout.setContentsMargins(8, 8, 8, 8)
         actions_layout.setSpacing(8)
 
-        self._rename_btn = QPushButton("Rename")
-        self._disconnect_btn = QPushButton("Disconnect")
-        self._forget_btn = QPushButton("Remove")
-        self._pin_btn = QPushButton("Set PIN")
+        self._rename_btn = QPushButton("Renomear")
+        self._disconnect_btn = QPushButton("Desconectar")
+        self._forget_btn = QPushButton("Remover")
+        self._pin_btn = QPushButton("Definir PIN")
 
         actions_layout.addWidget(self._pin_btn)
         actions_layout.addWidget(self._rename_btn)
@@ -11588,10 +12899,10 @@ class BrahmaConnectDevicesPage(QFrame):
         header.setSpacing(10)
         title_box = QVBoxLayout()
         title_box.setSpacing(2)
-        self._title = QLabel("DEVICES")
+        self._title = QLabel("DISPOSITIVOS")
         self._title.setFont(QFont("Segoe UI", 18, QFont.Weight.Black))
         self._title.setStyleSheet("color: #ffffff; letter-spacing: 2px;")
-        self._subtitle = QLabel("Everything connected to Brahma.")
+        self._subtitle = QLabel("Tudo o que está conectado ao Brahma.")
         self._subtitle.setFont(QFont("Segoe UI", 9))
         self._subtitle.setStyleSheet("color: rgba(255,255,255,0.62);")
         title_box.addWidget(self._title)
@@ -11607,7 +12918,7 @@ class BrahmaConnectDevicesPage(QFrame):
         self._gateway_pill.setStyleSheet("color: #35ff75; background: rgba(53,255,117,0.06); border: 1px solid rgba(53,255,117,0.16); border-radius: 12px; padding: 5px 10px;")
         top_row.addWidget(self._gateway_pill)
         top_row.addStretch(1)
-        self._add_btn = QPushButton("+ Add Device")
+        self._add_btn = QPushButton("+ Adicionar Dispositivo")
         self._add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._add_btn.setFixedHeight(34)
         self._add_btn.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
@@ -11627,7 +12938,7 @@ class BrahmaConnectDevicesPage(QFrame):
         self._add_btn.clicked.connect(self._trigger_add_device)
         top_row.addWidget(self._add_btn)
         status_wrap.addLayout(top_row)
-        self._gateway_meta = QLabel("Port: 8765  ┬╖  Devices: 0")
+        self._gateway_meta = QLabel("Porta: 8765  ┬╖  Dispositivos: 0")
         self._gateway_meta.setAlignment(Qt.AlignmentFlag.AlignRight)
         self._gateway_meta.setFont(QFont("Segoe UI", 8))
         self._gateway_meta.setStyleSheet("color: rgba(255,255,255,0.42);")
@@ -11637,7 +12948,7 @@ class BrahmaConnectDevicesPage(QFrame):
 
         self._main_stack = QStackedWidget()
         self._main_stack.setStyleSheet("background: transparent;")
-        
+
         # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
         # PAGE 0 ΓÇö OVERVIEW (GRID / EMPTY)
         # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
@@ -11645,14 +12956,14 @@ class BrahmaConnectDevicesPage(QFrame):
         ov_lay = QVBoxLayout(self._overview_page)
         ov_lay.setContentsMargins(0, 10, 0, 0)
         ov_lay.setSpacing(12)
-        
-        self._my_devices_lbl = QLabel("MY DEVICES")
+
+        self._my_devices_lbl = QLabel("MEUS DISPOSITIVOS")
         self._my_devices_lbl.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
         self._my_devices_lbl.setStyleSheet("color: #ffffff; letter-spacing: 1px;")
         ov_lay.addWidget(self._my_devices_lbl)
-        
+
         self._overview_stack = QStackedWidget()
-        
+
         # Grid View
         self._grid_page = QWidget()
         grid_lay = QVBoxLayout(self._grid_page)
@@ -11669,17 +12980,17 @@ class BrahmaConnectDevicesPage(QFrame):
         self._scroll.setWidget(self._grid_host)
         grid_lay.addWidget(self._scroll)
         self._overview_stack.addWidget(self._grid_page)
-        
+
         # Empty View
         self._empty_page = QWidget()
         empty_lay = QVBoxLayout(self._empty_page)
         empty_lay.addStretch(1)
-        empty_lbl = QLabel("No devices connected yet.")
+        empty_lbl = QLabel("Nenhum dispositivo conectado ainda.")
         empty_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         empty_lbl.setFont(QFont("Segoe UI", 12))
         empty_lbl.setStyleSheet("color: rgba(255,255,255,0.5);")
         empty_lay.addWidget(empty_lbl)
-        empty_btn = QPushButton("+ ADD DEVICE")
+        empty_btn = QPushButton("+ ADICIONAR DISPOSITIVO")
         empty_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         empty_btn.setFixedSize(160, 40)
         empty_btn.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
@@ -11699,10 +13010,10 @@ class BrahmaConnectDevicesPage(QFrame):
         empty_lay.addWidget(empty_btn, alignment=Qt.AlignmentFlag.AlignCenter)
         empty_lay.addStretch(1)
         self._overview_stack.addWidget(self._empty_page)
-        
+
         ov_lay.addWidget(self._overview_stack)
         self._main_stack.addWidget(self._overview_page)
-        
+
         # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
         # PAGE 1 ΓÇö DETAIL VIEW
         # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
@@ -11710,8 +13021,8 @@ class BrahmaConnectDevicesPage(QFrame):
         det_lay = QVBoxLayout(self._detail_page)
         det_lay.setContentsMargins(0, 10, 0, 0)
         det_lay.setSpacing(16)
-        
-        back_btn = QPushButton("ΓåÉ Back to Devices")
+
+        back_btn = QPushButton("ΓåÉ Voltar para Dispositivos")
         back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         back_btn.setFixedSize(140, 32)
         back_btn.setFont(QFont("Segoe UI", 9))
@@ -11721,7 +13032,7 @@ class BrahmaConnectDevicesPage(QFrame):
         """)
         back_btn.clicked.connect(self._close_detail)
         det_lay.addWidget(back_btn)
-        
+
         self._detail_header = QHBoxLayout()
         self._detail_icon = QLabel()
         self._detail_icon.setFixedSize(48, 48)
@@ -11729,20 +13040,20 @@ class BrahmaConnectDevicesPage(QFrame):
         self._detail_icon.setFont(QFont("Segoe UI", 20, QFont.Weight.Bold))
         self._detail_icon.setStyleSheet("background: rgba(255, 179, 0, 0.10); color: #ffb300; border: 1px solid rgba(255,179,0,0.22); border-radius: 12px;")
         self._detail_header.addWidget(self._detail_icon)
-        
+
         det_titles = QVBoxLayout()
         self._detail_title = QLabel()
         self._detail_title.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
         self._detail_title.setStyleSheet("color: #ffffff;")
         det_titles.addWidget(self._detail_title)
-        
+
         self._detail_status = QLabel()
         self._detail_status.setFont(QFont("Segoe UI", 10))
         self._detail_status.setStyleSheet("color: rgba(255,255,255,0.6);")
         det_titles.addWidget(self._detail_status)
         self._detail_header.addLayout(det_titles, 1)
         det_lay.addLayout(self._detail_header)
-        
+
         self._detail_scroll = QScrollArea()
         self._detail_scroll.setWidgetResizable(True)
         self._detail_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
@@ -11750,18 +13061,18 @@ class BrahmaConnectDevicesPage(QFrame):
         self._detail_content_lay = QVBoxLayout(self._detail_content)
         self._detail_content_lay.setContentsMargins(0, 10, 0, 10)
         self._detail_content_lay.setSpacing(16)
-        
+
         # Meta info
         self._detail_meta = QLabel()
         self._detail_meta.setStyleSheet("color: rgba(255,255,255,0.7);")
         self._detail_content_lay.addWidget(self._detail_meta)
-        
+
         # Controls
         self._action_box = QFrame()
         self._action_box.setStyleSheet("QFrame { background: rgba(10, 12, 18, 220); border: 1px solid rgba(255,255,255,0.06); border-radius: 16px; }")
         action_lay = QVBoxLayout(self._action_box)
         action_lay.setContentsMargins(16, 16, 16, 16)
-        action_title = QLabel("CONTROLS")
+        action_title = QLabel("CONTROLES")
         action_title.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
         action_title.setStyleSheet("color: #ffffff; letter-spacing: 1px;")
         action_lay.addWidget(action_title)
@@ -11769,23 +13080,23 @@ class BrahmaConnectDevicesPage(QFrame):
         self._action_buttons.setSpacing(8)
         action_lay.addLayout(self._action_buttons)
         self._detail_content_lay.addWidget(self._action_box)
-        
+
         # Manage
         manage_box = QFrame()
         manage_box.setStyleSheet("QFrame { background: rgba(10, 12, 18, 220); border: 1px solid rgba(255,255,255,0.06); border-radius: 16px; }")
         manage_lay = QVBoxLayout(manage_box)
         manage_lay.setContentsMargins(16, 16, 16, 16)
-        manage_title = QLabel("MANAGE")
+        manage_title = QLabel("GERENCIAR")
         manage_title.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
         manage_title.setStyleSheet("color: #ffffff; letter-spacing: 1px;")
         manage_lay.addWidget(manage_title)
-        
-        self._btn_rename = QPushButton("Rename Device")
-        self._btn_disconnect = QPushButton("Disconnect")
-        self._btn_reconnect = QPushButton("Reconnect")
-        self._btn_forget = QPushButton("Forget Device")
+
+        self._btn_rename = QPushButton("Renomear Dispositivo")
+        self._btn_disconnect = QPushButton("Desconectar")
+        self._btn_reconnect = QPushButton("Reconectar")
+        self._btn_forget = QPushButton("Esquecer Dispositivo")
         self._btn_forget.setStyleSheet("QPushButton { color: #ff5555; } QPushButton:hover { background: rgba(255, 85, 85, 0.1); border-color: #ff5555; }")
-        
+
         manage_grid = QGridLayout()
         manage_grid.setSpacing(8)
         for i, b in enumerate([self._btn_rename, self._btn_disconnect, self._btn_reconnect, self._btn_forget]):
@@ -11802,23 +13113,23 @@ class BrahmaConnectDevicesPage(QFrame):
                     QPushButton:hover { background: rgba(255,85,85,0.1); border: 1px solid rgba(255,85,85,0.3); }
                 """)
             manage_grid.addWidget(b, i // 2, i % 2)
-            
+
         manage_lay.addLayout(manage_grid)
         self._detail_content_lay.addWidget(manage_box)
         self._detail_content_lay.addStretch(1)
         self._detail_scroll.setWidget(self._detail_content)
         det_lay.addWidget(self._detail_scroll)
-        
+
         self._main_stack.addWidget(self._detail_page)
-        
+
         # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
         # PAGE 2 ΓÇö ADD DEVICE (QR WIZARD)
         # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
         self._add_device_page = QWidget()
         add_lay = QVBoxLayout(self._add_device_page)
         add_lay.setContentsMargins(0, 10, 0, 0)
-        
-        add_back_btn = QPushButton("ΓåÉ Cancel")
+
+        add_back_btn = QPushButton("ΓåÉ Cancelar")
         add_back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         add_back_btn.setFixedSize(140, 32)
         add_back_btn.setFont(QFont("Segoe UI", 9))
@@ -11828,21 +13139,21 @@ class BrahmaConnectDevicesPage(QFrame):
         """)
         add_back_btn.clicked.connect(self._close_detail)
         add_lay.addWidget(add_back_btn)
-        
+
         # Re-use the stacked widget logic for the wizard steps
         self._wizard_stack = QStackedWidget()
-        
+
         # Wizard State 0: Select Platform
         w0 = QWidget()
         w0_lay = QVBoxLayout(w0)
         w0_lay.addStretch(1)
-        w0_title = QLabel("SELECT DEVICE TYPE")
+        w0_title = QLabel("SELECIONE O TIPO DE DISPOSITIVO")
         w0_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         w0_title.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
         w0_title.setStyleSheet("color: #ffffff; letter-spacing: 2px;")
         w0_lay.addWidget(w0_title)
         w0_lay.addSpacing(20)
-        
+
         w0_row = QHBoxLayout()
         w0_row.addStretch(1)
         self._cs_android_btn = QPushButton("ANDROID")
@@ -11855,8 +13166,8 @@ class BrahmaConnectDevicesPage(QFrame):
         """)
         self._cs_android_btn.clicked.connect(self._cinema_select_android)
         w0_row.addWidget(self._cs_android_btn)
-        
-        self._cs_pc_btn = QPushButton("PC\n(Coming Soon)")
+
+        self._cs_pc_btn = QPushButton("PC\n(Em Breve)")
         self._cs_pc_btn.setFixedSize(140, 80)
         self._cs_pc_btn.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
         self._cs_pc_btn.setEnabled(False)
@@ -11866,18 +13177,18 @@ class BrahmaConnectDevicesPage(QFrame):
         w0_lay.addLayout(w0_row)
         w0_lay.addStretch(1)
         self._wizard_stack.addWidget(w0)
-        
+
         # Wizard State 1: QR Code
         w1 = QWidget()
         w1_lay = QVBoxLayout(w1)
         w1_lay.addStretch(1)
-        w1_title = QLabel("SCAN TO CONNECT")
+        w1_title = QLabel("ESCANEIE PARA CONECTAR")
         w1_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         w1_title.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
         w1_title.setStyleSheet("color: #ffffff; letter-spacing: 2px;")
         w1_lay.addWidget(w1_title)
         w1_lay.addSpacing(16)
-        
+
         w1_qr_row = QHBoxLayout()
         w1_qr_row.addStretch(1)
         self._onb_qr_label = QLabel()
@@ -11887,23 +13198,23 @@ class BrahmaConnectDevicesPage(QFrame):
         w1_qr_row.addWidget(self._onb_qr_label)
         w1_qr_row.addStretch(1)
         w1_lay.addLayout(w1_qr_row)
-        
+
         w1_lay.addSpacing(16)
         self._onb_code_lbl = QLabel("------")
         self._onb_code_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._onb_code_lbl.setFont(QFont("Consolas", 18, QFont.Weight.Black))
         self._onb_code_lbl.setStyleSheet("color: #ffb300; letter-spacing: 6px;")
         w1_lay.addWidget(self._onb_code_lbl)
-        
-        self._onb_status_lbl = QLabel("WAITING FOR CONNECTION")
+
+        self._onb_status_lbl = QLabel("AGUARDANDO CONEXÃO")
         self._onb_status_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._onb_status_lbl.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
         self._onb_status_lbl.setStyleSheet("color: rgba(255,255,255,0.5); letter-spacing: 1px;")
         w1_lay.addWidget(self._onb_status_lbl)
-        
+
         w1_ctrl = QHBoxLayout()
         w1_ctrl.addStretch(1)
-        w1_ref = QPushButton("Refresh Code")
+        w1_ref = QPushButton("Atualizar Código")
         w1_ref.setCursor(Qt.CursorShape.PointingHandCursor)
         w1_ref.setFixedSize(120, 32)
         w1_ref.setStyleSheet("""
@@ -11916,12 +13227,12 @@ class BrahmaConnectDevicesPage(QFrame):
         w1_lay.addLayout(w1_ctrl)
         w1_lay.addStretch(1)
         self._wizard_stack.addWidget(w1)
-        
+
         # Wizard State 2: Success
         w2 = QWidget()
         w2_lay = QVBoxLayout(w2)
         w2_lay.addStretch(1)
-        self._onb_success_title = QLabel("DEVICE CONNECTED")
+        self._onb_success_title = QLabel("DISPOSITIVO CONECTADO")
         self._onb_success_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._onb_success_title.setFont(QFont("Segoe UI", 16, QFont.Weight.Black))
         self._onb_success_title.setStyleSheet("color: #35ff75; letter-spacing: 2px;")
@@ -11933,12 +13244,12 @@ class BrahmaConnectDevicesPage(QFrame):
         w2_lay.addWidget(self._onb_success_name)
         w2_lay.addStretch(1)
         self._wizard_stack.addWidget(w2)
-        
+
         add_lay.addWidget(self._wizard_stack)
         self._main_stack.addWidget(self._add_device_page)
-        
+
         root.addWidget(self._main_stack)
-        
+
         self._onboarding_timer = QTimer(self)
         self._onboarding_timer.timeout.connect(self._tick_onboarding)
         self._onboarding_offer = {}
@@ -11966,7 +13277,7 @@ class BrahmaConnectDevicesPage(QFrame):
         if service is None:
             self._onboarding_offer = {}
             self._onb_code_lbl.setText("------")
-            self._onb_status_lbl.setText("GATEWAY UNAVAILABLE")
+            self._onb_status_lbl.setText("GATEWAY INDISPONÍVEL")
             return
         try:
             import io
@@ -11975,8 +13286,8 @@ class BrahmaConnectDevicesPage(QFrame):
             self._onboarding_offer = dict(service.create_pairing_offer(device_name="Brahma Connect", platform="gateway"))
             code = str(self._onboarding_offer.get("pairing_code") or "------")
             self._onb_code_lbl.setText(code)
-            self._onb_status_lbl.setText("WAITING FOR CONNECTION")
-            
+            self._onb_status_lbl.setText("AGUARDANDO CONEXÃO")
+
             payload = self._onboarding_offer
             text = json.dumps(payload, sort_keys=True, ensure_ascii=False)
             if qrcode is not None:
@@ -11997,25 +13308,25 @@ class BrahmaConnectDevicesPage(QFrame):
                 )
             else:
                 self._onb_qr_label.setText(text)
-                
+
             self._tick_onboarding()
         except Exception as exc:
             self._onboarding_offer = {}
             self._onb_code_lbl.setText("------")
-            self._onb_status_lbl.setText(f"ERROR: {exc}")
+            self._onb_status_lbl.setText(f"ERRO: {exc}")
 
     def _tick_onboarding(self):
         if self._wizard_stack.currentIndex() != 1:
             return
-        
+
         expires = self._onboarding_offer.get("expires")
         try:
             remaining = max(0, int(expires))
             if remaining <= 0 and self._onboarding_offer:
-                self._onb_status_lbl.setText("CODE EXPIRED. REFRESH TO CONTINUE.")
+                self._onb_status_lbl.setText("CÓDIGO EXPIRADO. ATUALIZE PARA CONTINUAR.")
         except Exception:
             pass
-            
+
         service = self._service_obj()
         if service and self._onboarding_offer:
             devices = service.list_devices()
@@ -12031,7 +13342,7 @@ class BrahmaConnectDevicesPage(QFrame):
     def _trigger_onboarding_success(self):
         self._wizard_stack.setCurrentIndex(2)
         dev = self._connected_device
-        self._onb_success_name.setText(str(dev.get("name", "Device")).upper())
+        self._onb_success_name.setText(str(dev.get("name", "Dispositivo")).upper())
         QTimer.singleShot(2000, lambda: self.refresh(force=True))
 
     def _cancel_onboarding(self):
@@ -12082,11 +13393,11 @@ class BrahmaConnectDevicesPage(QFrame):
         service = self._service_obj()
         if service is None:
             return
-            
+
         devices = service.list_devices()
         port = getattr(service, "port", 8765)
-        self._gateway_meta.setText(f"Port: {port}  ┬╖  Devices: {len(devices)}")
-        
+        self._gateway_meta.setText(f"Porta: {port}  ┬╖  Dispositivos: {len(devices)}")
+
         # If we are in Add Device or Detail page, keep it there
         if self._main_stack.currentIndex() not in (0,) and not force:
             pass # Keep current index unless forced to reset
@@ -12096,11 +13407,11 @@ class BrahmaConnectDevicesPage(QFrame):
         else:
             self._main_stack.setCurrentIndex(0)
             self._overview_stack.setCurrentIndex(0) # Grid state
-            
+
         # Rebuild grid
         self._clear_layout(self._grid)
         self._cards.clear()
-        
+
         if devices:
             cols = 4
             for i, dev in enumerate(devices):
@@ -12144,7 +13455,7 @@ class BrahmaConnectDevicesPage(QFrame):
         QTimer.singleShot(200, lambda: self.refresh(force=True))
 
     def _rename_device(self, device_id: str, current_name: str):
-        new_name, ok = QInputDialog.getText(self, "Rename Device", "New name:", text=current_name)
+        new_name, ok = QInputDialog.getText(self, "Renomear Dispositivo", "Novo nome:", text=current_name)
         if ok and new_name.strip():
             service = self._service_obj()
             if service:
@@ -12156,18 +13467,18 @@ class BrahmaConnectDevicesPage(QFrame):
             self.refresh(force=True)
 
     def _set_device_pin(self, device_id: str):
-        pin, ok = QInputDialog.getText(self, "Set Device PIN", "Enter device PIN:", QLineEdit.EchoMode.Password)
+        pin, ok = QInputDialog.getText(self, "Definir PIN do Dispositivo", "Digite o PIN do dispositivo:", QLineEdit.EchoMode.Password)
         if ok and pin.strip():
             try:
                 settings = {}
                 if APP_SETTINGS_FILE.exists():
                     with open(APP_SETTINGS_FILE, "r", encoding="utf-8") as f:
                         settings = json.load(f)
-                
+
                 device_pins = settings.get("device_pins", {})
                 device_pins[device_id] = pin.strip()
                 settings["device_pins"] = device_pins
-                
+
                 with open(APP_SETTINGS_FILE, "w", encoding="utf-8") as f:
                     json.dump(settings, f, indent=4)
             except Exception as e:
@@ -12204,10 +13515,17 @@ class _RootShim:
 
 class BrahmaUI:
     def __init__(self, face_path: str, size=None, *, show_immediately: bool = True):
+        # QtWebEngine (the 3D reactor orb background) requires shared OpenGL
+        # contexts to be enabled BEFORE the QApplication is constructed. Without
+        # it the import fails and the orb background silently never appears.
+        try:
+            QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
+        except Exception:
+            pass
         self._app = QApplication.instance() or QApplication(sys.argv)
         self._app.setStyle("Fusion")
         self._app.setQuitOnLastWindowClosed(False)
-        self._app.setApplicationDisplayName("Brahma Echo")
+        self._app.setApplicationDisplayName("ULTRON")
         self._app.setWindowIcon(self._make_app_icon())
         try:
             current_store = workspace_store()
@@ -12241,8 +13559,8 @@ class BrahmaUI:
         self._control_panel: LauncherControlPanel | None = None
         self._boot_overlay: BootSequenceOverlay | None = None
         self._app_settings_cache: dict | None = None
-        self._launcher.single_clicked.connect(self._toggle_command_bar)
-        self._launcher.double_clicked.connect(self._show_control_panel)
+        self._launcher.single_clicked.connect(self._toggle_workspace_sidebar)
+        self._launcher.double_clicked.connect(self._on_launcher_double_clicked)
         self._launcher.action_requested.connect(self._handle_launcher_action)
         self._launcher.position_changed.connect(self._save_launcher_position)
         self._command_bar.submitted.connect(self._submit_command)
@@ -12254,9 +13572,17 @@ class BrahmaUI:
         self._workspace_sidebar.mic_requested.connect(self._toggle_mute)
         self._workspace_sidebar.close_requested.connect(self._close_workspace_sidebar)
         self._win.minimized.connect(self._on_minimized)
+        self._win.restored.connect(self._on_restored)
         self._win._state_sig.connect(self._sync_launcher_state)
+        self._win._audio_level_sig.connect(self._launcher.set_audio_level)
+        try:
+            from core.clipboard_sentry import ClipboardSentry
+            self._clip_sentry = ClipboardSentry(callback=self._on_clipboard_actionable)
+            self._clip_sentry.start()
+        except Exception:
+            pass
         self._tray = QSystemTrayIcon(self._make_app_icon(), self._app)
-        self._tray.setToolTip("Brahma Echo")
+        self._tray.setToolTip("ULTRON")
         self._tray.activated.connect(self._on_tray_activated)
         self._tray.setContextMenu(self._build_tray_menu())
         self._tray.show()
@@ -12271,11 +13597,9 @@ class BrahmaUI:
         launcher_pos = self._load_app_settings().get("launcher_pos")
         if isinstance(launcher_pos, (list, tuple)) and len(launcher_pos) == 2:
             try:
-                self._launcher.show_at(int(launcher_pos[0]), int(launcher_pos[1]))
+                self._launcher.move(int(launcher_pos[0]), int(launcher_pos[1]))
             except Exception:
-                self._launcher.show_at()
-        else:
-            self._launcher.show_at()
+                pass
         if bool(self._load_app_settings().get("show_workspace_on_startup", False)):
             self._workspace_sidebar.show_workspace(animate=False)
         else:
@@ -12283,7 +13607,10 @@ class BrahmaUI:
         self.set_dashboard_page(getattr(self._win, "_current_page", "dashboard") == "dashboard")
         self._apply_developer_mode_ui()
         if show_immediately:
+            self._launcher.hide()
             self.show_main()
+        else:
+            self._show_floating_icon()
         self.root = _RootShim(self._app)
 
     def _make_app_icon(self) -> QIcon:
@@ -12293,31 +13620,25 @@ class BrahmaUI:
         self._win.set_brahma_connect_service(service)
 
 
-    
+
 
     def show_main(self):
         try:
+            self._win.setWindowState(
+                (self._win.windowState() & ~Qt.WindowState.WindowMinimized) | Qt.WindowState.WindowActive
+            )
             self._win.showNormal()
         except Exception:
             self._win.show()
         self._win.raise_()
         self._win.activateWindow()
-        if self._launcher.isVisible():
-            try:
-                self._launcher.raise_()
-                self._launcher.activateWindow()
-            except Exception:
-                pass
+        self._launcher.hide()
 
     def set_dashboard_page(self, enabled: bool):
         try:
-            if enabled:
-                if not self._launcher.isVisible():
-                    self._show_floating_icon()
-            else:
+            if not enabled:
                 self._command_bar.hide()
                 self._workspace_sidebar.hide_workspace(animate=False)
-                self._launcher.hide()
         except Exception:
             pass
 
@@ -12373,12 +13694,10 @@ class BrahmaUI:
                 if enabled:
                     workspace_text = workspace or "No folder selected"
                     self._win._developer_status_lbl.setText(
-                        f"Developer mode is on ΓÇó {workspace_text}"
+                        f"Developer mode is on • {workspace_text}"
                     )
-                    self._win._developer_card.show()
-                    self._win._developer_card.raise_()
-                else:
-                    self._win._developer_card.hide()
+                # Keep legacy card permanently hidden; modern UI integrates status inside settings
+                self._win._developer_card.hide()
         except Exception:
             pass
 
@@ -12449,7 +13768,7 @@ class BrahmaUI:
         if hasattr(self, "_discord_stop_btn"):
             self._discord_stop_btn.setEnabled(True)
         if hasattr(self, "_discord_save_btn"):
-            self._discord_save_btn.setText("Save Settings")
+            self._discord_save_btn.setText("Salvar Configurações")
 
     def _startup_animation_enabled(self) -> bool:
         if platform.system() != "Windows":
@@ -12471,13 +13790,13 @@ class BrahmaUI:
         if not hasattr(self, "_startup_anim_btn"):
             return
         if platform.system() != "Windows":
-            self._startup_anim_btn.setText("Startup Animation (Windows only)")
+            self._startup_anim_btn.setText("Animação de Inicialização (apenas Windows)")
             self._startup_anim_btn.setEnabled(False)
             return
         if self._startup_animation_enabled():
-            self._startup_anim_btn.setText("Disable Startup Animation")
+            self._startup_anim_btn.setText("Desativar Animação de Inicialização")
         else:
-            self._startup_anim_btn.setText("Enable Startup Animation")
+            self._startup_anim_btn.setText("Ativar Animação de Inicialização")
 
     def _toggle_startup_animation(self):
         if platform.system() != "Windows":
@@ -12489,7 +13808,7 @@ class BrahmaUI:
             self._log.append_log(f"SYS: Startup animation {state}.")
 
     def _should_play_boot_sequence(self) -> bool:
-        return True
+        return False
 
     def _mark_boot_sequence_played(self):
         try:
@@ -12501,34 +13820,16 @@ class BrahmaUI:
             pass
 
     def play_boot_sequence(self, finished_callback=None):
-        if self._boot_overlay is not None:
+        self._mark_boot_sequence_played()
+        try:
+            self.show_main()
+        except Exception:
+            pass
+        if finished_callback:
             try:
-                self._boot_overlay.deleteLater()
+                finished_callback()
             except Exception:
                 pass
-            self._boot_overlay = None
-        self.hide_main()
-        overlay = BootSequenceOverlay()
-        self._boot_overlay = overlay
-
-        device_name = platform.node() or os.environ.get("COMPUTERNAME") or "DEVICE"
-
-        def _done():
-            self._mark_boot_sequence_played()
-            try:
-                self.show_main()
-            finally:
-                if self._boot_overlay is not None:
-                    try:
-                        self._boot_overlay.deleteLater()
-                    except Exception:
-                        pass
-                    self._boot_overlay = None
-                if finished_callback:
-                    finished_callback()
-
-        overlay.finished.connect(_done)
-        overlay.start(device_name=device_name, greeting_name="Suryaansh")
 
     # Thread-safe helpers for driving the boot overlay from background threads
     def boot_add_step(self, text: str):
@@ -12574,17 +13875,17 @@ class BrahmaUI:
             }}
         """)
 
-        open_app_action = menu.addAction("Open App")
-        open_action = menu.addAction("Open Workspace")
-        close_action = menu.addAction("Close Workspace")
-        startup_action = menu.addAction("Show Workspace On Startup")
+        open_app_action = menu.addAction("Abrir App")
+        open_action = menu.addAction("Abrir Área de Trabalho")
+        close_action = menu.addAction("Fechar Área de Trabalho")
+        startup_action = menu.addAction("Mostrar Área de Trabalho ao Iniciar")
         startup_action.setCheckable(True)
         startup_action.setChecked(bool(self._load_app_settings().get("show_workspace_on_startup", False)))
-        show_icon_action = menu.addAction("Show Floating Icon")
-        hide_icon_action = menu.addAction("Hide Floating Icon")
+        show_icon_action = menu.addAction("Mostrar Ícone Flutuante")
+        hide_icon_action = menu.addAction("Ocultar Ícone Flutuante")
         menu.addSeparator()
-        restart_action = menu.addAction("Restart")
-        quit_action = menu.addAction("Quit")
+        restart_action = menu.addAction("Reiniciar")
+        quit_action = menu.addAction("Sair")
 
         open_app_action.triggered.connect(self.show_main)
         open_action.triggered.connect(self._show_workspace_sidebar)
@@ -12598,14 +13899,33 @@ class BrahmaUI:
 
     def _on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
-            self._toggle_command_bar()
+            self._toggle_workspace_sidebar()
         elif reason == QSystemTrayIcon.ActivationReason.DoubleClick:
-            self._show_control_panel()
+            self.show_main()
 
     def _on_minimized(self):
-        if self._launcher.isVisible():
-            self._launcher.raise_()
         self._command_bar.hide()
+        self._show_floating_icon()
+
+    def _on_restored(self):
+        self._launcher.hide()
+
+    def _on_launcher_double_clicked(self):
+        self._workspace_sidebar.hide_workspace(animate=False)
+        self.show_main()
+
+    def _on_clipboard_actionable(self, category: str, content: str):
+        label = {
+            "error_traceback": "Traceback/Error copied — want an explanation?",
+            "json_data": "JSON copied — format/validate?",
+            "sql_query": "SQL Query copied — optimize/review?",
+            "code_snippet": "Code snippet copied — review?",
+        }.get(category, "Clipboard item copied")
+        self._workspace_sidebar.record_chat_event({
+            "role": "system",
+            "text": f"💡 {label}",
+            "source": "clipboard",
+        })
 
     def _toggle_command_bar(self):
         if self._command_bar.isVisible():
@@ -12614,18 +13934,21 @@ class BrahmaUI:
             self._command_bar.show_near(self._launcher)
 
     def _toggle_workspace_sidebar(self):
-        if self._workspace_sidebar.isVisible():
+        if self._workspace_sidebar.isVisible() and not self._workspace_sidebar.is_collapsed():
             self._close_workspace_sidebar()
         else:
             self._show_workspace_sidebar()
 
     def _show_workspace_sidebar(self):
         self._workspace_sidebar.show_workspace()
-        self._launcher.hide()
+        self._workspace_sidebar.focus_input()
+        if self._launcher.isVisible():
+            self._launcher.raise_()
 
     def _close_workspace_sidebar(self):
         self._workspace_sidebar.hide_workspace()
-        self._show_floating_icon()
+        if self._launcher.isVisible():
+            self._launcher.raise_()
 
     def _show_floating_icon(self):
         launcher_pos = self._load_app_settings().get("launcher_pos")
@@ -12772,8 +14095,8 @@ class BrahmaUI:
 
     def _open_app(self):
         self._command_bar.hide()
-        self._launcher.show_at()
-        self._win.show_app()
+        self._workspace_sidebar.hide_workspace(animate=False)
+        self.show_main()
 
     @property
     def muted(self) -> bool:
@@ -12830,8 +14153,23 @@ class BrahmaUI:
     def set_state(self, state: str):
         self._win._state_sig.emit(state)
 
+    def set_audio_level(self, level: float):
+        self._win.set_audio_level(level)
+
     def write_log(self, text: str):
         self._win._log_sig.emit(text)
+
+    def show_confirm(self, title: str, detail: str = ""):
+        self.w.show_confirm(title, detail)
+
+    def hide_confirm(self):
+        self.w.hide_confirm()
+
+    def show_memory_inspector(self):
+        self.w.show_memory_inspector()
+
+    def hide_memory_inspector(self):
+        self.w.hide_memory_inspector()
 
     def show_daily_briefing(self, text: str):
         self._win.show_daily_briefing(text)
@@ -12904,16 +14242,76 @@ class BrahmaUI:
             payload["source"] = source or "local"
         self._win._task_workspace_sig.emit(payload)
 
-    def finish_task_workspace(self, result: str, status: str = "Task completed.", percent: int = 100):
+    def finish_task_workspace(self, result: str, status: str = "Tarefa concluída.", percent: int = 100):
         self._win._task_workspace_sig.emit({
             "action": "finish",
             "result": result or "Done.",
-            "status": status or "Task completed.",
+            "status": status or "Tarefa concluída.",
             "percent": percent,
         })
 
     def clear_task_workspace(self):
         self._win._task_workspace_sig.emit({"action": "clear"})
+
+    def show_hud_operation(self, title: str, step: str, sources: list = None, tool: str = None, **kwargs):
+        """Displays live operation telemetry on the right HUD wing."""
+        if hasattr(self, "_win") and hasattr(self._win, "_hud_operation_sig"):
+            payload = {
+                "title": title,
+                "step": step,
+                "sources": sources or [],
+                "tool": tool or ""
+            }
+            payload.update(kwargs)
+            self._win._hud_operation_sig.emit(payload)
+
+    def show_hud_deliverable(self, title: str, summary: str = "", bullets: list = None,
+                             file_path: str = None, kind: str = "result", actions: list = None, data: dict = None, **kwargs):
+        """Displays final results or file deliverables on the left HUD wing."""
+        if hasattr(self, "_win") and hasattr(self._win, "_hud_deliverable_sig"):
+            payload = {
+                "title": title,
+                "summary": summary or "",
+                "bullets": bullets or [],
+                "file_path": file_path or "",
+                "kind": kind or "result",
+                "actions": actions or [],
+                "data": data or {}
+            }
+            payload.update(kwargs)
+            self._win._hud_deliverable_sig.emit(payload)
+
+    def show_content(self, title: str, body: str):
+        """Universal rich content presenter. Automatically routes to the Brahma Holographic Left Deliverable Wing."""
+        import re
+        file_path = None
+        m = re.search(r'([A-Za-z]:\\[^\s"\'<>`\r\n]+\.(?:pdf|docx|xlsx|pptx|png|jpg|mp4|py|html|json|txt))', body)
+        if m:
+            cand = Path(m.group(1).strip())
+            if cand.exists():
+                file_path = str(cand.resolve())
+        if not file_path:
+            m2 = re.search(r'([^\s"\'<>`\r\n]+\.(?:pdf|docx|xlsx|pptx|png|jpg|mp4|py|html|json|txt))', body)
+            if m2:
+                cand2 = Path(m2.group(1).strip())
+                if cand2.exists():
+                    file_path = str(cand2.resolve())
+
+        bullets = []
+        for line in body.splitlines():
+            line_str = line.strip()
+            if (line_str.startswith(("-", "*", "•", ">")) or line_str.startswith(tuple("123456789."))) and len(line_str) > 2:
+                clean_bullet = line_str.lstrip("-*•>0123456789. ").strip()
+                if clean_bullet and not clean_bullet.startswith("#"):
+                    bullets.append(clean_bullet)
+
+        self.show_hud_deliverable(
+            title=title,
+            summary=body[:220] if not bullets else "",
+            bullets=bullets[:5],
+            file_path=file_path,
+            kind="deliverable"
+        )
 
     def wait_for_api_key(self):
         while not self._win._ready:
@@ -12925,8 +14323,6 @@ class BrahmaUI:
     def stop_speaking(self):
         if not self.muted:
             self.set_state("LISTENING")
-
-
 
 
 

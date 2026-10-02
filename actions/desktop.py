@@ -77,7 +77,7 @@ def _build_sandbox() -> dict:
 
 def _execute_generated_code(code: str, player=None) -> str:
     if not code or code.strip() == "UNSAFE":
-        return "This action cannot be performed safely."
+        return "Esta ação não pode ser executada com segurança."
 
     # Kod temizleme
     if code.startswith("```"):
@@ -257,7 +257,7 @@ def get_current_wallpaper() -> str:
                     capture_output=True, text=True
                 )
                 return f"Current wallpaper: {result.stdout.strip()}"
-            return "Wallpaper path retrieval not supported for this desktop environment."
+            return "A obtenção do caminho do papel de parede não é suportada neste ambiente de desktop."
 
     except Exception as e:
         return f"Could not get wallpaper: {e}"
@@ -282,46 +282,8 @@ _SKIP_EXTENSIONS = {
 
 
 def organize_desktop(mode: str = "by_type") -> str:
-    desktop       = _get_desktop()
-    skip_exts     = _SKIP_EXTENSIONS.get(_OS, set())
-    moved, skipped = [], []
-
-    for item in desktop.iterdir():
-        if item.is_dir() or item.name.startswith("."):
-            continue
-        if item.suffix.lower() in skip_exts:
-            continue
-
-        if mode == "by_date":
-            mtime       = datetime.fromtimestamp(item.stat().st_mtime)
-            folder_name = mtime.strftime("%Y-%m")
-        else:
-            ext         = item.suffix.lower()
-            folder_name = "Others"
-            for folder, exts in FILE_TYPE_MAP.items():
-                if ext in exts:
-                    folder_name = folder
-                    break
-
-        target_dir = desktop / folder_name
-        target_dir.mkdir(exist_ok=True)
-        new_path = target_dir / item.name
-
-        if new_path.exists():
-            skipped.append(item.name)
-            continue
-
-        shutil.move(str(item), str(new_path))
-        moved.append(f"{item.name} → {folder_name}/")
-
-    result = f"Desktop organized ({mode}): {len(moved)} files moved."
-    if moved:
-        result += "\n" + "\n".join(moved[:8])
-        if len(moved) > 8:
-            result += f"\n... and {len(moved) - 8} more."
-    if skipped:
-        result += f"\n{len(skipped)} file(s) skipped (name conflict)."
-    return result
+    from actions.desktop_organizer_mcp import get_organizer_engine
+    return get_organizer_engine().organize(target="desktop", mode=mode)
 
 
 def list_desktop() -> str:
@@ -350,24 +312,8 @@ def list_desktop() -> str:
 
 
 def clean_desktop() -> str:
-    desktop     = _get_desktop()
-    skip_exts   = _SKIP_EXTENSIONS.get(_OS, set())
-    today       = datetime.now().strftime("%Y-%m-%d")
-    archive_dir = desktop / f"Desktop Archive {today}"
-    archive_dir.mkdir(exist_ok=True)
-
-    moved = 0
-    for item in desktop.iterdir():
-        if item.is_dir() or item.name.startswith("."):
-            continue
-        if item.suffix.lower() in skip_exts:
-            continue
-        new_path = archive_dir / item.name
-        if not new_path.exists():
-            shutil.move(str(item), str(new_path))
-            moved += 1
-
-    return f"Desktop cleaned: {moved} files archived to '{archive_dir.name}'."
+    from actions.desktop_organizer_mcp import get_organizer_engine
+    return get_organizer_engine().clean_empty_folders(target="desktop")
 
 
 def get_desktop_stats() -> str:
@@ -422,11 +368,27 @@ def desktop_control(
         elif action == "current_wallpaper":
             return get_current_wallpaper()
 
-        elif action == "organize":
+        elif action in ("organize", "organize_desktop"):
             return organize_desktop(params.get("mode", "by_type"))
 
-        elif action == "clean":
+        elif action in ("preview", "preview_organize", "dry_run", "dryrun", "inspect"):
+            from actions.desktop_organizer_mcp import get_organizer_engine
+            return get_organizer_engine().preview(target="desktop", mode=params.get("mode", "by_type"))
+
+        elif action in ("clean", "clean_empty_folders", "clean_empty"):
             return clean_desktop()
+
+        elif action in ("undo", "rollback", "revert"):
+            from actions.desktop_organizer_mcp import get_organizer_engine
+            return get_organizer_engine().undo()
+
+        elif action in ("find_duplicates", "duplicates", "dupes"):
+            from actions.desktop_organizer_mcp import get_organizer_engine
+            return get_organizer_engine().find_duplicates(target="desktop")
+
+        elif action in ("archive_old", "archive"):
+            from actions.desktop_organizer_mcp import get_organizer_engine
+            return get_organizer_engine().archive_old(target="desktop", days=int(params.get("days", 30)))
 
         elif action == "list":
             return list_desktop()
@@ -437,7 +399,7 @@ def desktop_control(
         elif action == "task" or task:
             actual_task = task or params.get("description", "")
             if not actual_task:
-                return "Please describe what you want to do on the desktop."
+                return "Por favor, descreva o que você quer fazer na área de trabalho."
 
             print(f"[Desktop] Asking Gemini: {actual_task}")
             if player:
@@ -450,7 +412,7 @@ def desktop_control(
             if action:
                 code = _ask_gemini_for_desktop_action(action)
                 return _execute_generated_code(code, player=player)
-            return "No action or task specified."
+            return "Nenhuma ação ou tarefa especificada."
 
     except Exception as e:
         print(f"[Desktop] Error: {e}")

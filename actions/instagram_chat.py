@@ -44,48 +44,20 @@ CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 SESSION_PATH = BASE_DIR / "config" / "ig_session.json"
 
 def set_ig_prompt_callback(callback):
-    """
-    callback should take (thread_id: str, username: str, message: str, is_auto: bool)
-    If is_auto is True, it returns the AI response string directly.
-    If False, it prompts the user locally and returns None.
-    """
-    global _reply_callback
-    _reply_callback = callback
+    from actions.instagram_mcp import set_ig_prompt_callback as _set
+    return _set(callback)
 
 def add_auto_thread(thread_id):
-    _auto_threads.add(thread_id)
-    ig_log(f"[InstagramChat] Thread {thread_id} added to auto mode.")
+    from actions.instagram_mcp import add_auto_thread as _add
+    return _add(thread_id)
 
 def send_direct_reply(thread_id, text):
-    if _client:
-        try:
-            _client.direct_send(text, thread_ids=[thread_id])
-            ig_log(f"[InstagramChat] Sent manual reply to {thread_id}: {text[:40]}...")
-        except Exception as e:
-            ig_log(f"[InstagramChat] Error sending manual reply: {e}")
+    from actions.instagram_mcp import send_direct_reply as _send
+    return _send(thread_id, text)
 
 def get_recent_messages(amount=5) -> str:
-    """Returns a formatted string of the most recent messages for the AI to read to the user."""
-    if not _client:
-        return "Error: Instagram daemon is not running or client is not initialized."
-    try:
-        threads = _client.direct_threads(amount=amount)
-        if not threads:
-            return "You have no recent messages."
-            
-        result = []
-        for thread in threads:
-            latest_msg = thread.messages[0] if thread.messages else None
-            if latest_msg:
-                sender = thread.users[0].username if thread.users else "Unknown"
-                # Check if the last message was sent by us or them
-                if str(latest_msg.user_id) == str(_client.user_id):
-                    result.append(f"- You replied to {sender}: \"{latest_msg.text}\"")
-                else:
-                    result.append(f"- {sender} said: \"{latest_msg.text}\"")
-        return "\n".join(result)
-    except Exception as e:
-        return f"Error fetching messages: {e}"
+    from actions.instagram_mcp import get_recent_messages as _get
+    return _get(amount)
 
 def _load_credentials():
     try:
@@ -168,20 +140,9 @@ def _instagram_loop():
         time.sleep(POLL_INTERVAL)
 
 def start_daemon():
-    global _thread, _running
-    ig_log("[InstagramChat] start_daemon() was invoked!")
-    if not INSTAGRAPI_AVAILABLE:
-        ig_log("[InstagramChat] instagrapi not installed. Run 'pip install instagrapi'")
-        return
-        
-    if _running:
-        ig_log("[InstagramChat] Daemon is already running.")
-        return
-        
-    _running = True
-    _thread = threading.Thread(target=_instagram_loop, daemon=True)
-    _thread.start()
+    from actions.instagram_mcp import start_daemon as _start
+    return _start()
 
 def stop_daemon():
-    global _running
-    _running = False
+    from actions.instagram_mcp import stop_daemon as _stop
+    return _stop()

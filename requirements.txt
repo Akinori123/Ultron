@@ -6,6 +6,7 @@ requests
 python-kasa
 beautifulsoup4
 duckduckgo-search
+ddgs
 playwright          
 pyautogui
 pyperclip
@@ -16,6 +17,8 @@ mediapipe
 mss
 Pillow
 psutil
+wmi
+pywin32
 comtypes
 pycaw               
 instagrapi
@@ -35,4 +38,5 @@ cryptography
 qrcode[pil]
 python-multipart
 PyQt6
+PyQt6-WebEngine
 edge-tts

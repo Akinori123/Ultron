@@ -261,7 +261,7 @@ def _scrape_trending(region: str = "TR", max_results: int = 8) -> list[dict]:
 def _handle_play(parameters: dict, player) -> str:
     query = parameters.get("query", "").strip()
     if not query:
-        return "Please tell me what you'd like to watch, sir."
+        return "Por favor, diga o que você gostaria de assistir, senhor."
 
     if player:
         player.write_log(f"[YouTube] Searching: {query}")
@@ -282,7 +282,7 @@ def _handle_play(parameters: dict, player) -> str:
         f"&sp={_YT_VIDEO_FILTER}"
     )
     _open_url(fallback_url)
-    return f"Opened YouTube search for: {query} (manual selection required)"
+    return f"Busca do YouTube aberta para: {query} (seleção manual necessária)"
 
 
 def _handle_summarize(parameters: dict, player, speak) -> str:
@@ -293,23 +293,23 @@ def _handle_summarize(parameters: dict, player, speak) -> str:
     if not url:
         return "No URL provided, sir. Summary cancelled."
     if not _is_valid_youtube_url(url):
-        return "That doesn't appear to be a valid YouTube URL, sir."
+        return "Esse não parece ser um URL válido do YouTube, senhor."
 
     video_id = _extract_video_id(url)
     if not video_id:
-        return "Could not extract video ID from that URL, sir."
+        return "Não foi possível extrair o ID do vídeo desse URL, senhor."
 
     if player:
         player.write_log(f"[YouTube] Summarizing: {url}")
     if speak:
-        speak("Fetching the transcript now, sir. One moment.")
+        speak("Buscando a transcrição agora, senhor. Um momento.")
 
     transcript = _get_transcript(video_id)
     if not transcript:
-        return "I couldn't retrieve a transcript for that video, sir."
+        return "Não consegui obter uma transcrição para esse vídeo, senhor."
 
     if speak:
-        speak("Transcript retrieved. Generating summary now.")
+        speak("Transcrição obtida. Gerando o resumo agora.")
 
     try:
         summary = _summarize_with_gemini(transcript, url)
@@ -321,7 +321,7 @@ def _handle_summarize(parameters: dict, player, speak) -> str:
 
     if parameters.get("save", False):
         saved_path = _save_summary(summary, url)
-        return f"Summary complete and saved to Desktop: {saved_path}"
+        return f"Resumo concluído e salvo na Área de Trabalho: {saved_path}"
 
     return summary
 
@@ -331,7 +331,7 @@ def _handle_get_info(parameters: dict, player, speak) -> str:
     if not url:
         url = _ask_for_url("Please paste the YouTube video URL:")
     if not url or not _is_valid_youtube_url(url):
-        return "Please provide a valid YouTube URL, sir."
+        return "Por favor, forneça um URL válido do YouTube, senhor."
 
     video_id = _extract_video_id(url)
     if not video_id:
@@ -352,7 +352,7 @@ def _handle_get_info(parameters: dict, player, speak) -> str:
     result = "\n".join(lines)
 
     if speak:
-        speak(f"Here's the video info, sir. {result.replace(chr(10), '. ')}")
+        speak(f"Aqui estão as informações do vídeo, senhor. {result.replace(chr(10), '. ')}")
 
     return result
 

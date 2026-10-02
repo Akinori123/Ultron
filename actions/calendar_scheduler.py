@@ -146,7 +146,7 @@ def calendar_scheduler(
 
     if action in ("add", "add_event", "create", "new"):
         if not title:
-            return "Please provide a title or name for the calendar event."
+            return "Por favor, forneça um título ou nome para o evento da agenda."
 
         new_event = {
             "id": str(uuid.uuid4())[:8],
@@ -176,7 +176,7 @@ def calendar_scheduler(
         upcoming = [e for e in events if e.get("date", "") >= now_date]
 
         if not upcoming:
-            return "You have no upcoming events on your calendar."
+            return "Você não tem eventos futuros na sua agenda."
 
         lines = [f"📅 Upcoming Events ({len(upcoming)}):"]
         for ev in upcoming[:8]:
@@ -201,7 +201,7 @@ def calendar_scheduler(
 
     elif action in ("delete", "delete_event", "remove", "cancel"):
         if not event_id and not title:
-            return "Please specify the event title or ID to delete."
+            return "Por favor, especifique o título ou ID do evento a excluir."
 
         orig_count = len(events)
         if event_id:
@@ -211,7 +211,7 @@ def calendar_scheduler(
 
         if len(events) < orig_count:
             _save_events(events)
-            return "Event removed from calendar."
+            return "Evento removido da agenda."
         else:
             return "Could not find a matching event to remove."
 
@@ -248,5 +248,5 @@ def calendar_scheduler(
 
 
 def run(parameters: dict, player=None, session_memory=None) -> str:
-    """Plugin wrapper for Mark-LI architecture."""
+    """Plugin wrapper for Brahma architecture."""
     return calendar_scheduler(parameters, player=player, session_memory=session_memory)

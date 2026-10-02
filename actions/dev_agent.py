@@ -14,7 +14,7 @@ def get_base_dir():
 
 BASE_DIR         = get_base_dir()
 API_CONFIG_PATH  = BASE_DIR / "config" / "api_keys.json"
-PROJECTS_DIR     = Path.home() / "Desktop" / "JarvisProjects"
+PROJECTS_DIR     = Path.home() / "Desktop" / "BrahmaProjects"
 MAX_FIX_ATTEMPTS = 5
 MODEL_PLANNER    = "gemini-flash-latest"
 MODEL_WRITER     = "gemini-flash-latest"
@@ -251,7 +251,7 @@ def _install_dependencies(dependencies: list[str], project_dir: Path) -> str:
             print(f"[DevAgent] ✓ Already installed: {pkg_name}")
 
     if not to_install:
-        return f"All dependencies already installed: {', '.join(dependencies)}"
+        return f"Todas as dependências já estão instaladas: {', '.join(dependencies)}"
 
     print(f"[DevAgent] 📦 Installing: {to_install}")
     try:
@@ -262,7 +262,7 @@ def _install_dependencies(dependencies: list[str], project_dir: Path) -> str:
             timeout=120, cwd=str(project_dir)
         )
         if result.returncode == 0:
-            return f"Installed: {', '.join(to_install)}"
+            return f"Instalado: {', '.join(to_install)}"
         return f"Install warning (non-fatal): {result.stderr[:200]}"
     except subprocess.TimeoutExpired:
         return "Dependency install timed out (non-fatal)."
@@ -314,7 +314,7 @@ def _run_project(run_command: str, project_dir: Path, timeout: int = 30) -> str:
         if stderr:
             combined_parts.append(f"STDERR:\n{stderr}")
 
-        return "\n\n".join(combined_parts) if combined_parts else "Ran with no output."
+        return "\n\n".join(combined_parts) if combined_parts else "Executado sem saída."
 
     except subprocess.TimeoutExpired:
         return f"Timed out after {timeout}s — long-running app (server/GUI) is likely working."
@@ -452,7 +452,7 @@ def _build_project(
     try:
         plan = _plan_project(description, language)
     except RateLimitError:
-        msg = "Rate limit reached, sir. Please try again in a moment."
+        msg = "Limite de requisições atingido, senhor. Tente novamente em um instante."
         if speak: speak(msg)
         return msg
     except ValueError as e:
@@ -460,7 +460,7 @@ def _build_project(
         if speak: speak(msg)
         return msg
 
-    proj_name    = project_name or plan.get("project_name", "jarvis_project")
+    proj_name    = project_name or plan.get("project_name", "brahma_project")
     proj_name    = re.sub(r"[^\w\-]", "_", proj_name)
     project_dir  = PROJECTS_DIR / proj_name
     project_dir.mkdir(parents=True, exist_ok=True)
@@ -509,7 +509,7 @@ def _build_project(
                 break
 
     if not file_codes:
-        msg = "I could not write any project files, sir."
+        msg = "Não consegui escrever nenhum arquivo do projeto, senhor."
         if speak: speak(msg)
         return msg
 
@@ -562,7 +562,7 @@ def _build_project(
             file_codes.update(updated)
             time.sleep(1)
         except RateLimitError:
-            msg = "Rate limit reached during fix. Project saved, check it manually in VSCode."
+            msg = "Limite de requisições atingido durante a correção. Projeto salvo, verifique manualmente no VSCode."
             if speak: speak(msg)
             return msg
         except Exception as e:
@@ -590,7 +590,7 @@ def dev_agent(
     timeout      = int(p.get("timeout", 30))
 
     if not description:
-        return "Please describe the project you want me to build, sir."
+        return "Por favor, descreva o projeto que você quer que eu construa, senhor."
 
     return _build_project(
         description  = description,

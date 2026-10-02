@@ -49,7 +49,7 @@ def _resolve_output_path(output_path: str | None, title: str, ext: str, fallback
 def _open_file(path: Path) -> None:
     try:
         if os.name == "nt":
-            os.startfile(str(path))  # type: ignore[attr-defined]
+            subprocess.Popen(["cmd.exe", "/c", "start", "", str(path)], shell=True)
         elif sys.platform == "darwin":
             subprocess.Popen(["open", str(path)])
         else:
@@ -68,7 +68,7 @@ def _gemini_client():
     import google.generativeai as genai
 
     genai.configure(api_key=_get_api_key())
-    return genai.GenerativeModel("gemini-2.5-flash")
+    return genai.GenerativeModel("gemini-3.6-flash")
 
 
 def _import_docx():
@@ -372,11 +372,11 @@ def word_document(parameters: dict, player=None, speak=None) -> str:
 
     source_path = Path(file_path_str) if file_path_str else None
     if source_path and source_path.suffix.lower() == ".doc":
-        return "Legacy .doc files are not supported directly. Please convert the file to .docx first."
+        return "Arquivos .doc antigos não são suportados diretamente. Converta o arquivo para .docx primeiro."
 
     if action in {"open", "open_file", "launch"}:
         if not source_path:
-            return "Please provide file_path for the DOCX file to open."
+            return "Por favor, forneça file_path do arquivo DOCX a abrir."
         if not source_path.exists():
             return f"File not found: {source_path}"
         _open_file(source_path)
@@ -389,7 +389,7 @@ def word_document(parameters: dict, player=None, speak=None) -> str:
         try:
             doc = _load_doc(source_path)
             text = _extract_doc_text(doc)
-            return text[:8000] if text else "The document appears to be empty."
+            return text[:8000] if text else "O documento parece estar vazio."
         except Exception as e:
             return f"Read failed: {e}"
 
@@ -398,7 +398,7 @@ def word_document(parameters: dict, player=None, speak=None) -> str:
             doc = _load_doc(source_path)
             text = _extract_doc_text(doc)
             if not text.strip():
-                return "The document appears to be empty."
+                return "O documento parece estar vazio."
             out = _resolve_output_path(output_path_str, title=source_path.stem, ext=".txt", fallback_name=source_path.stem)
             out = out.with_suffix(".txt")
             out.write_text(text, encoding="utf-8")
@@ -411,7 +411,7 @@ def word_document(parameters: dict, player=None, speak=None) -> str:
             doc = _load_doc(source_path)
             text = _extract_doc_text(doc)
             if not text.strip():
-                return "The document appears to be empty."
+                return "O documento parece estar vazio."
             model = _gemini_client()
             prompt = (
                 "Summarize this Word document concisely and clearly:\n\n"
@@ -487,14 +487,14 @@ def word_document(parameters: dict, player=None, speak=None) -> str:
             if action in {"add_heading"}:
                 heading = (params.get("heading") or params.get("text") or params.get("content") or "").strip()
                 if not heading:
-                    return "Please provide a heading to add."
+                    return "Por favor, forneça um título para adicionar."
                 level = int(params.get("level") or 1)
                 doc.add_heading(heading, level=max(1, min(level, 3)))
 
             if action in {"add_bullets"}:
                 items = _normalize_list(params.get("bullets") or params.get("items") or params.get("content"))
                 if not items:
-                    return "Please provide bullet items."
+                    return "Por favor, forneça itens com marcadores."
                 _append_bullets(doc, items)
 
             if action in {"append", "add", "edit"}:

@@ -21,18 +21,39 @@ def _get_api_key() -> str:
 
 def _gemini_search(query: str) -> str:
     from google import genai
+    # Google Search grounding is the real news engine: it reaches every major
+    # Brazilian and world outlet. Ask explicitly for recent, sourced headlines
+    # in Portuguese so we never answer "I couldn't find specific headlines".
+    today = __import__("datetime").datetime.now().strftime("%d/%m/%Y")
+    prompt = (
+        f"Você é um pesquisador de notícias em tempo real. Hoje é {today}.\n"
+        f"Pesquise na web AGORA e traga as notícias mais RECENTES e específicas sobre: {query}\n\n"
+        "Regras:\n"
+        "- Use a Busca do Google para encontrar matérias reais dos principais portais "
+        "(G1, UOL, R7, CNN Brasil, Folha, Estadão, BBC Brasil, Reuters, AP, etc.), brasileiros e internacionais.\n"
+        "- Traga manchetes CONCRETAS, com nomes, datas, números e o que aconteceu. Nunca diga apenas que 'há cobertura'.\n"
+        "- Se o assunto for recente, priorize as últimas 24-72 horas.\n"
+        "- Traga no mínimo 4 a 6 notícias distintas.\n"
+        "- Responda TODO o conteúdo em português do Brasil, traduzindo qualquer fonte estrangeira.\n"
+        "- Ao final, liste as fontes (nome do portal + link)."
+    )
 
-    client   = genai.Client(api_key=_get_api_key())
+    client = genai.Client(api_key=_get_api_key())
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=query,
+        model="gemini-3.6-flash",
+        contents=prompt,
         config={"tools": [{"google_search": {}}]},
     )
 
     text = ""
-    for part in response.candidates[0].content.parts:
-        if hasattr(part, "text") and part.text:
-            text += part.text
+    try:
+        for part in response.candidates[0].content.parts:
+            if hasattr(part, "text") and part.text:
+                text += part.text
+    except Exception:
+        pass
+    if not text:
+        text = (getattr(response, "text", "") or "")
 
     text = text.strip()
     if not text:
@@ -65,9 +86,9 @@ def _ddg_search(query: str, max_results: int = 6) -> list[dict]:
 
 def _format_ddg(query: str, results: list[dict]) -> str:
     if not results:
-        return f"No results found for: {query}"
+        return f"Nenhum resultado encontrado para: {query}"
 
-    lines = [f"Search results for: {query}\n"]
+    lines = [f"Resultados da busca para: {query}\n"]
     for i, r in enumerate(results, 1):
         if r.get("title"):   lines.append(f"{i}. {r['title']}")
         if r.get("snippet"): lines.append(f"   {r['snippet']}")
@@ -93,7 +114,7 @@ def _compare(items: list[str], aspect: str) -> str:
         except Exception:
             all_results[item] = []
 
-    lines = [f"Comparison — {aspect.upper()}", "─" * 40]
+    lines = [f"Comparação — {aspect.upper()}", "─" * 40]
     for item in items:
         lines.append(f"\n▸ {item}")
         for r in all_results.get(item, [])[:2]:
@@ -114,7 +135,7 @@ def web_search(
     aspect = params.get("aspect", "general").strip() or "general"
 
     if not query and not items:
-        return "Please provide a search query, sir."
+        return "Por favor, forneça um termo de busca, senhor."
 
     if items and mode != "compare":
         mode = "compare"
@@ -137,7 +158,7 @@ def web_search(
                 except Exception:
                     all_results[item] = []
 
-            lines = [f"Comparison — {aspect.upper()}", "─" * 40]
+            lines = [f"Comparação — {aspect.upper()}", "─" * 40]
             for item in items or ([query] if query else []):
                 lines.append(f"\n▸ {item}")
                 for r in all_results.get(item, [])[:2]:
@@ -145,26 +166,42 @@ def web_search(
                         lines.append(f"  • {r['snippet']}")
             return "\n".join(lines).strip()
 
+    # Primary: Gemini + Google Search grounding. It reaches every major Brazilian
+    # and world outlet and returns concrete, dated headlines. DuckDuckGo is only a
+    # fallback — it is far weaker and was the reason news searches came back empty.
+    try:
+        result = _gemini_search(query)
+        if result and result.strip():
+            if player and hasattr(player, "show_hud_deliverable"):
+                try:
+                    bullets = [ln.strip() for ln in result.splitlines() if len(ln.strip()) > 15][:5]
+                    player.show_hud_deliverable(f"BUSCA: {query[:25].upper()}", bullets=bullets, kind="search")
+                except Exception:
+                    pass
+            print("[WebSearch] Gemini search OK.")
+            return result
+        print("[WebSearch] Gemini returned empty, trying DDG...")
+    except Exception as e:
+        print(f"[WebSearch] Gemini search failed ({e}) - trying DDG...")
+
     try:
         results = _ddg_search(query)
         if results:
+            if player and hasattr(player, "show_hud_operation"):
+                try:
+                    sources = [r.get("url") or r.get("title") for r in results[:4] if r.get("url") or r.get("title")]
+                    player.show_hud_operation("WEB INTELLIGENCE", f"Retrieved {len(results)} sources for '{query[:30]}'", sources=sources, tool="SEARCH")
+                except Exception:
+                    pass
             result = _format_ddg(query, results)
+            if player and hasattr(player, "show_hud_deliverable"):
+                try:
+                    bullets = [r.get("title") for r in results[:4] if r.get("title")]
+                    player.show_hud_deliverable(f"BUSCA: {query[:25].upper()}", bullets=bullets, kind="search")
+                except Exception:
+                    pass
             print(f"[WebSearch] DDG OK: {len(results)} result(s).")
             return result
-        print("[WebSearch] DDG returned no results, trying Gemini...")
+        return f"Nenhum resultado encontrado para: {query}"
     except Exception as e:
-        print(f"[WebSearch] DDG search failed ({e}) - trying Gemini...")
-        try:
-            result = _gemini_search(query)
-            print("[WebSearch] Gemini search OK.")
-            return result
-        except Exception as gemini_error:
-            print(f"[WebSearch] Gemini search failed ({gemini_error})")
-            return f"Search failed, sir: {gemini_error}"
-
-    try:
-        result = _gemini_search(query)
-        print("[WebSearch] Gemini search OK.")
-        return result
-    except Exception:
-        return _format_ddg(query, results)
+        return f"Falha na busca: {e}"

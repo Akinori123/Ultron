@@ -4,6 +4,7 @@ import concurrent.futures
 import platform
 import shutil
 import subprocess
+import os
 from pathlib import Path
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
@@ -302,7 +303,7 @@ class _BrowserThread:
         if not self._pages:
             await self._get_page()
         if not self._pages:
-            return "No open tabs."
+            return "Nenhuma aba aberta."
         idx = max(1, index) - 1
         if idx >= len(self._pages):
             return f"Tab {index} does not exist."
@@ -321,14 +322,14 @@ class _BrowserThread:
         if not self._pages and self._page:
             self._pages = [self._page]
         if not self._pages:
-            return "No tabs open."
+            return "Nenhuma aba aberta."
         rows = []
         for i, page in enumerate(self._pages, 1):
             if page.is_closed():
                 continue
             title = await page.title() if page.url else ""
             rows.append(f"{i}. {title or 'Untitled'} | {page.url or 'about:blank'}")
-        return "\n".join(rows) if rows else "No open tabs."
+        return "\n".join(rows) if rows else "Nenhuma aba aberta."
 
     async def _back(self) -> str:
         page = await self._get_page()
@@ -388,7 +389,7 @@ class _BrowserThread:
                 return f"Clicked: {selector}"
             return "No selector or text provided."
         except PlaywrightTimeout:
-            return "Element not found or not clickable."
+            return "Elemento não encontrado ou não clicável."
         except Exception as e:
             return f"Click error: {e}"
 
@@ -489,7 +490,7 @@ class _BrowserThread:
             except Exception:
                 continue
 
-        return f"Could not find input: '{description}'"
+        return f"Não foi possível encontrar o campo: '{description}'"
 
     async def _close_browser(self) -> str:
         if self._browser:
@@ -530,109 +531,236 @@ def browser_control(
     session_memory=None
 ) -> str:
     """
-    Browser controller — auto-detects and uses system default browser.
-    Always reuses the existing browser window/page; never opens incognito.
+    Complete browser automation powered by Microsoft Playwright MCP (@playwright/mcp),
+    with automatic failover to the built-in Playwright thread.
 
     parameters:
         action      : go_to | navigate | search | click | type | scroll | fill_form |
                       smart_click | smart_type | get_text | press | back | forward |
-                      refresh | open_tab | new_tab | switch_tab | list_tabs | close
-        url         : URL for go_to
+                      refresh | open_tab | new_tab | switch_tab | list_tabs | close |
+                      snapshot | find | hover | evaluate | run_code | screenshot |
+                      wait_for | select_option | dialog | upload | console | network
+        url         : URL for go_to / navigate
         query       : search query
         engine      : google | bing | duckduckgo (default: google)
-        selector    : CSS selector for click/type
-        text        : text to click or type
+        selector    : CSS selector for click/type/hover/select
+        element     : Snapshot element reference (e.g. 'e2')
+        text        : text to click, type, or wait for
         description : element description for smart_click/smart_type
         direction   : up | down for scroll
         amount      : scroll amount in pixels (default: 500)
-        key         : key name for press (e.g. Enter, Escape, Tab)
-        fields      : {selector: value} dict for fill_form
-        clear_first : bool, clear input before typing (default: True)
+        key         : key name for press (e.g. Enter, Escape, Tab, Backspace)
+        fields      : {selector: value} dict or list of fields for fill_form
+        expression  : JavaScript expression for evaluate
+        code        : Playwright code snippet for run_code
+        path        : output path for screenshot
         tab         : 1-based tab index for switch_tab
+        time_ms     : milliseconds to wait
     """
-    _ensure_started()
+    import time
+    from actions.playwright_mcp_client import get_playwright_mcp_client
 
     action = (parameters or {}).get("action", "").lower().strip()
     result = "Unknown action."
 
+    # Try Microsoft Playwright MCP first
     try:
+        mcp = get_playwright_mcp_client()
+
         if action in {"go_to", "navigate"}:
-            result = _bt.run(_bt._go_to(parameters.get("url", "")))
+            url = parameters.get("url", "").strip()
+            if not url and parameters.get("query"):
+                return browser_control({**parameters, "action": "search"}, response, player, session_memory)
+            result = mcp.navigate(url)
 
         elif action == "search":
-            result = _bt.run(_bt._search(
-                parameters.get("query", ""),
-                parameters.get("engine", "google"),
-            ))
+            query = parameters.get("query", "").strip()
+            engine = parameters.get("engine", "google").lower()
+            engines = {
+                "google":     f"https://www.google.com/search?q={query.replace(' ', '+')}",
+                "bing":       f"https://www.bing.com/search?q={query.replace(' ', '+')}",
+                "duckduckgo": f"https://duckduckgo.com/?q={query.replace(' ', '+')}",
+            }
+            url = engines.get(engine, engines["google"])
+            result = mcp.navigate(url)
 
-        elif action == "click":
-            result = _bt.run(_bt._click(
-                selector=parameters.get("selector"),
-                text=parameters.get("text"),
-            ))
+        elif action in {"click", "smart_click"}:
+            element = parameters.get("element")
+            selector = parameters.get("selector")
+            text = parameters.get("text") or parameters.get("description")
+            if not element and not selector and text:
+                selector = f"text={text}"
+            result = mcp.click(element=element, selector=selector)
 
-        elif action == "type":
-            result = _bt.run(_bt._type(
-                selector=parameters.get("selector"),
-                text=parameters.get("text", ""),
-                clear_first=parameters.get("clear_first", True),
-            ))
+        elif action in {"hover", "smart_hover"}:
+            element = parameters.get("element")
+            selector = parameters.get("selector")
+            text = parameters.get("text") or parameters.get("description")
+            if not element and not selector and text:
+                selector = f"text={text}"
+            result = mcp.hover(element=element, selector=selector)
 
-        elif action == "scroll":
-            result = _bt.run(_bt._scroll(
-                direction=parameters.get("direction", "down"),
-                amount=parameters.get("amount", 500),
-            ))
-
-        elif action == "fill_form":
-            result = _bt.run(_bt._fill_form(parameters.get("fields", {})))
-
-        elif action == "smart_click":
-            result = _bt.run(_bt._smart_click(parameters.get("description", "")))
-
-        elif action == "smart_type":
-            result = _bt.run(_bt._smart_type(
-                parameters.get("description", ""),
-                parameters.get("text", ""),
-            ))
-
-        elif action == "get_text":
-            result = _bt.run(_bt._get_text())
+        elif action in {"type", "smart_type"}:
+            element = parameters.get("element")
+            selector = parameters.get("selector")
+            text = str(parameters.get("text", ""))
+            desc = parameters.get("description")
+            if not element and not selector and desc:
+                selector = f"input[placeholder*='{desc}'], [aria-label*='{desc}'], textarea"
+            result = mcp.type_text(text=text, element=element, selector=selector)
 
         elif action == "press":
-            result = _bt.run(_bt._press(parameters.get("key", "Enter")))
+            result = mcp.press_key(parameters.get("key", "Enter"))
+
+        elif action == "scroll":
+            direction = parameters.get("direction", "down")
+            amount = int(parameters.get("amount", 500))
+            y = amount if direction == "down" else -amount
+            result = mcp.evaluate(f"window.scrollBy(0, {y}); 'Scrolled {direction}'")
+
+        elif action in {"snapshot", "inspect"}:
+            result = mcp.snapshot()
+
+        elif action == "find":
+            query = parameters.get("query") or parameters.get("text") or ""
+            result = mcp.find(query)
+
+        elif action == "get_text":
+            result = mcp.evaluate("document.body ? document.body.innerText.substring(0, 4000) : ''")
+            if not result or result == "''":
+                result = mcp.snapshot()
+
+        elif action in {"evaluate", "eval"}:
+            expr = parameters.get("expression") or parameters.get("script") or "document.title"
+            result = mcp.evaluate(expr)
+
+        elif action in {"run_code", "execute"}:
+            code = parameters.get("code") or parameters.get("snippet") or ""
+            result = mcp.run_code_unsafe(code)
+
+        elif action in {"screenshot", "take_screenshot"}:
+            out_dir = Path.home() / "Desktop" / "BrahmaAI"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            custom_path = parameters.get("path")
+            if not custom_path:
+                custom_path = str(out_dir / f"browser_screenshot_{int(time.time())}.png")
+            result = mcp.take_screenshot(custom_path)
+
+        elif action == "fill_form":
+            raw_fields = parameters.get("fields", {})
+            fields_list = []
+            if isinstance(raw_fields, dict):
+                for k, v in raw_fields.items():
+                    fields_list.append({"element": k, "value": str(v)})
+            elif isinstance(raw_fields, list):
+                fields_list = raw_fields
+            result = mcp.fill_form(fields_list)
+
+        elif action == "select_option":
+            vals = parameters.get("values") or [parameters.get("value")]
+            result = mcp.select_option(
+                values=[str(v) for v in vals if v],
+                element=parameters.get("element"),
+                selector=parameters.get("selector")
+            )
+
+        elif action in {"tabs", "list_tabs"}:
+            result = mcp.tabs(action="list")
 
         elif action in {"open_tab", "new_tab"}:
-            result = _bt.run(_bt._new_tab(parameters.get("url")))
+            mcp.tabs(action="new")
+            url = parameters.get("url")
+            if url:
+                result = mcp.navigate(url)
+            else:
+                result = "Opened new tab."
 
         elif action == "switch_tab":
-            result = _bt.run(_bt._switch_tab(int(parameters.get("tab", 1))))
-
-        elif action == "list_tabs":
-            result = _bt.run(_bt._list_tabs())
+            idx = int(parameters.get("tab", 1))
+            result = mcp.tabs(action="select", index=idx)
 
         elif action == "back":
-            result = _bt.run(_bt._back())
+            result = mcp.navigate_back()
 
         elif action == "forward":
-            result = _bt.run(_bt._forward())
+            result = mcp.evaluate("window.history.forward(); 'Forward navigated'")
 
         elif action in {"refresh", "reload"}:
-            result = _bt.run(_bt._reload())
+            result = mcp.evaluate("window.location.reload(); 'Page reloaded'")
+
+        elif action in {"wait_for", "wait"}:
+            text = parameters.get("text")
+            t_ms = parameters.get("time_ms") or parameters.get("time")
+            result = mcp.wait_for(text=text, time_ms=int(t_ms) if t_ms else 2000)
+
+        elif action in {"dialog", "handle_dialog"}:
+            accept = parameters.get("accept", True)
+            p_text = parameters.get("prompt_text")
+            result = mcp.handle_dialog(accept=accept, prompt_text=p_text)
+
+        elif action in {"upload", "file_upload"}:
+            paths = parameters.get("paths") or [parameters.get("path")]
+            paths = [str(p) for p in paths if p]
+            result = mcp.file_upload(
+                paths=paths,
+                element=parameters.get("element"),
+                selector=parameters.get("selector")
+            )
+
+        elif action == "console":
+            result = mcp.console_messages()
+
+        elif action == "network":
+            result = mcp.network_requests()
 
         elif action == "close":
-            result = _bt.run(_bt._close_browser())
+            result = mcp.close()
 
         else:
             result = f"Unknown action: {action}"
 
-    except concurrent.futures.TimeoutError:
-        result = "Browser action timed out."
-    except Exception as e:
-        result = f"Browser error: {e}"
+    except Exception as mcp_err:
+        _log(f"[Browser] ⚠️ MCP server issue ({mcp_err}) — falling back to native browser thread")
+        # Legacy Fallback
+        try:
+            _ensure_started()
+            if action in {"go_to", "navigate"}:
+                result = _bt.run(_bt._go_to(parameters.get("url", "")))
+            elif action == "search":
+                result = _bt.run(_bt._search(parameters.get("query", ""), parameters.get("engine", "google")))
+            elif action == "click":
+                result = _bt.run(_bt._click(selector=parameters.get("selector"), text=parameters.get("text")))
+            elif action == "type":
+                result = _bt.run(_bt._type(selector=parameters.get("selector"), text=parameters.get("text", "")))
+            elif action == "scroll":
+                result = _bt.run(_bt._scroll(direction=parameters.get("direction", "down"), amount=parameters.get("amount", 500)))
+            elif action == "fill_form":
+                result = _bt.run(_bt._fill_form(parameters.get("fields", {})))
+            elif action == "get_text":
+                result = _bt.run(_bt._get_text())
+            elif action == "press":
+                result = _bt.run(_bt._press(parameters.get("key", "Enter")))
+            elif action in {"open_tab", "new_tab"}:
+                result = _bt.run(_bt._new_tab(parameters.get("url")))
+            elif action == "switch_tab":
+                result = _bt.run(_bt._switch_tab(int(parameters.get("tab", 1))))
+            elif action == "list_tabs":
+                result = _bt.run(_bt._list_tabs())
+            elif action == "back":
+                result = _bt.run(_bt._back())
+            elif action in {"refresh", "reload"}:
+                result = _bt.run(_bt._reload())
+            elif action == "close":
+                result = _bt.run(_bt._close_browser())
+            else:
+                result = f"Legacy fallback could not handle action: {action}"
+        except Exception as leg_err:
+            result = f"Browser error: {leg_err}"
 
-    _log(f"[Browser] {result[:80]}")
-    if player:
-        player.write_log(f"[browser] {result[:60]}")
+    # Safe log printing without Windows charmap crashes
+    safe_res = str(result).encode("ascii", "replace").decode("ascii")
+    _log(f"[Browser] {safe_res[:100]}")
+    if player and hasattr(player, "write_log"):
+        player.write_log(f"[browser] {safe_res[:80]}")
 
     return result

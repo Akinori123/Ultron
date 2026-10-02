@@ -14,7 +14,7 @@ def process_clipboard(parameters: dict | None = None, player=None) -> str:
         content = (content or "").strip()
         
         if not content:
-            return "The clipboard is empty or does not contain text."
+            return "A área de transferência está vazia ou não contém texto."
             
         if player:
             player.write_log("SYS: Read clipboard contents.")
